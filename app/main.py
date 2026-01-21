@@ -57,6 +57,14 @@ async def startup_event():
         else:
             logger.warning("Qubrid API key not set. STT will fail if Qubrid is selected.")
     
+    # Log TTS provider configuration
+    logger.info(f"TTS Provider configured: {settings.tts_provider}")
+    if settings.tts_provider.lower() == "gemini":
+        if settings.gemini_api_key:
+            logger.info(f"Gemini API key configured (model: {settings.tts_gemini_model}, voice: {settings.tts_gemini_voice})")
+        else:
+            logger.warning("Gemini API key not set. TTS will fail if Gemini is selected.")
+    
     # Initialize database
     try:
         init_db()

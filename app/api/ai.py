@@ -93,9 +93,18 @@ async def text_chat(
         # Generate AI reply
         ai_response = generate_reply(request.message, history)
         
-        # Generate TTS audio
+        # Generate TTS audio - combine reply_text and correction if correction exists
         reply_text_for_tts = ai_response["reply_text"]
-        audio_url = text_to_speech(reply_text_for_tts)
+        correction_text = ai_response.get("correction", "").strip()
+        
+        if correction_text:
+            # Combine reply and correction with a natural pause
+            # Using period and ellipsis for a clear pause between reply and correction
+            combined_text = f"{reply_text_for_tts}. ... {correction_text}"
+        else:
+            combined_text = reply_text_for_tts
+        
+        audio_url = text_to_speech(combined_text)
         
         # Save message to database
         message = Message(
@@ -159,9 +168,18 @@ async def voice_chat(
         # Generate AI reply (same as text chat)
         ai_response = generate_reply(transcribed_text, history)
         
-        # Generate TTS audio
+        # Generate TTS audio - combine reply_text and correction if correction exists
         reply_text_for_tts = ai_response["reply_text"]
-        audio_url = text_to_speech(reply_text_for_tts)
+        correction_text = ai_response.get("correction", "").strip()
+        
+        if correction_text:
+            # Combine reply and correction with a natural pause
+            # Using period and ellipsis for a clear pause between reply and correction
+            combined_text = f"{reply_text_for_tts}. ... {correction_text}"
+        else:
+            combined_text = reply_text_for_tts
+        
+        audio_url = text_to_speech(combined_text)
         
         # Save message to database
         message = Message(

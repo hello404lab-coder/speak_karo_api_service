@@ -11,6 +11,7 @@ class Settings(BaseSettings):
     whisper_api_key: Optional[str] = None  # Can use OpenAI for Whisper
     tts_api_key: Optional[str] = None  # Can use OpenAI for TTS
     qubrid_api_key: Optional[str] = None  # Optional - set via QUBRID_API_KEY env var
+    gemini_api_key: Optional[str] = None  # Optional - set via GEMINI_API_KEY env var
     
     # Database
     database_url: str = "postgresql://user:password@localhost:5432/english_practice"
@@ -43,9 +44,12 @@ class Settings(BaseSettings):
     stt_provider: str = "qubrid"  # Options: "openai" or "qubrid"
     
     # TTS Settings
+    tts_provider: str = "gemini"  # Options: "openai" or "gemini"
     tts_model: str = "tts-1"
     tts_voice: str = "alloy"
     tts_speed: float = 0.9  # Slower speaking rate
+    tts_gemini_model: str = "gemini-2.5-flash-preview-tts"  # Gemini TTS model
+    tts_gemini_voice: str = "Kore"  # Gemini voice name
     
     # Cache TTLs
     llm_cache_ttl: int = 86400  # 24 hours
