@@ -77,7 +77,7 @@ See `.env.example` for all available configuration options. Key variables:
 
 - `APP_ENV`: `dev` or `prod` — controls GPU usage, cache defaults, and strictness (see DEV vs PROD below).
 - `GEMINI_API_KEY`: Google Gemini API key; **required when APP_ENV=prod**.
-- `DATABASE_URL`: PostgreSQL connection string.
+- `DATABASE_URL`: PostgreSQL or SQLite connection URL. For local dev without PostgreSQL, set `DATABASE_URL=sqlite:///./data/english_practice.sqlite` and run `alembic upgrade head` to create the file and tables.
 - `REDIS_URL`: Redis connection string (optional; cache degrades gracefully if unavailable).
 - `CACHE_ENABLED`: Override cache; in prod defaults to true when unset.
 - `LLM_TIMEOUT_SECONDS`, `STT_TIMEOUT_SECONDS`, `TTS_TIMEOUT_SECONDS`: Timeouts for inference (defaults 60, 30, 45).
