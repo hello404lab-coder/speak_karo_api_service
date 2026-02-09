@@ -22,8 +22,11 @@ class Settings(BaseSettings):
     # API Keys
     gemini_api_key: Optional[str] = None  # Required for LLM; required in prod (validated at startup)
     
-    # Database
-    database_url: str = "postgresql://user:password@localhost:5432/english_practice"
+    # Database: PostgreSQL (postgresql://user:pass@host:5432/db) or SQLite (sqlite:///./data/english_practice.sqlite or sqlite:///:memory:)
+    database_url: str = Field(
+        default="postgresql://user:password@localhost:5432/english_practice",
+        description="DATABASE_URL: PostgreSQL or SQLite connection URL",
+    )
     
     # Redis
     redis_url: str = "redis://localhost:6379/0"
