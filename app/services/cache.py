@@ -21,16 +21,18 @@ except Exception as e:
 def get(key: str) -> Optional[str]:
     """
     Get value from cache.
-    
+
     Args:
         key: Cache key
-    
+
     Returns:
-        Cached value or None
+        Cached value or None (also None when cache is disabled)
     """
+    if not settings.cache_enabled:
+        return None
     if not redis_available or not redis_client:
         return None
-    
+
     try:
         return redis_client.get(key)
     except Exception as e:
@@ -41,15 +43,17 @@ def get(key: str) -> Optional[str]:
 def set(key: str, value: str, ttl: int) -> None:
     """
     Set value in cache with TTL.
-    
+
     Args:
         key: Cache key
         value: Value to cache
         ttl: Time to live in seconds
     """
+    if not settings.cache_enabled:
+        return
     if not redis_available or not redis_client:
         return
-    
+
     try:
         redis_client.setex(key, ttl, value)
     except Exception as e:

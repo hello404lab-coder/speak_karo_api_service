@@ -1,16 +1,19 @@
 fastapi==0.128.0
 uvicorn[standard]==0.40.0
+gunicorn==23.0.0
 pydantic==2.12.5
 pydantic-settings==2.12.0
 sqlalchemy==2.0.45
 psycopg2-binary==2.9.11
 redis==7.1.0
-openai==2.15.0
 python-multipart==0.0.21
 pytest==9.0.2
-httpx==0.28.1
-requests==2.32.5
 boto3==1.42.31
 alembic==1.18.1
 google-genai==1.59.0
 pydub==0.25.1
+faster-whisper==1.2.1
+# TTS: Chatterbox-Turbo (English) - https://huggingface.co/ResembleAI/chatterbox-turbo
+chatterbox-tts
+# IndicF5 TTS for Indic languages (hi, ml, ta). Install with: pip install git+https://github.com/ai4bharat/IndicF5.git
+# vocos  # dependency of IndicF5

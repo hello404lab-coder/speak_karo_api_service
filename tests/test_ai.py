@@ -7,6 +7,21 @@ from app.main import app
 client = TestClient(app)
 
 
+@patch('app.services.tts._generate_presigned_url')
+@patch('app.services.tts.get')
+def test_text_to_speech_cache_hit_s3_returns_presigned_url(mock_get, mock_presigned):
+    """When cache returns s3: key, text_to_speech returns a fresh presigned URL."""
+    from app.services.tts import text_to_speech
+
+    mock_get.return_value = "s3:audio/abc123.mp3"
+    mock_presigned.return_value = "https://bucket.s3.region.amazonaws.com/audio/abc123.mp3?X-Amz-..."
+
+    result = text_to_speech("Hello world", "en")
+
+    mock_presigned.assert_called_once_with("audio/abc123.mp3")
+    assert result == "https://bucket.s3.region.amazonaws.com/audio/abc123.mp3?X-Amz-..."
+
+
 def test_health_check():
     """Test health check endpoint."""
     response = client.get("/health")

@@ -1,20 +1,29 @@
-"""AI chat endpoints."""
+"""AI chat endpoints. Sync inference (LLM, STT, TTS) runs in thread pool with timeouts."""
+import asyncio
 import logging
 import uuid
 from datetime import date
 from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
 from sqlalchemy.orm import Session
+from app.core.config import settings
 from app.database import get_db
 from app.schemas.ai import TextChatRequest, AIChatResponse
-from app.services.llm import generate_reply
-from app.services.stt import transcribe_audio
-from app.services.tts import text_to_speech
+from app.services.llm import generate_reply, init_llm_client
+from app.services.stt import transcribe_audio, init_stt_models
+from app.services.tts import text_to_speech, init_tts_models
+from app.utils.language import get_response_language
 from app.models.usage import Conversation, Message, Usage
 
 logger = logging.getLogger(__name__)
 
+# User-safe message for timeout (no stack traces or internal detail)
+TIMEOUT_MESSAGE = "Request took too long. Please try again."
+
 router = APIRouter()
+
+# Max time for init-models (first-time load can be slow)
+INIT_MODELS_TIMEOUT_SECONDS = 30000
 
 
 def get_or_create_conversation(user_id: str, conversation_id: Optional[str], db: Session) -> Conversation:
@@ -75,6 +84,35 @@ def update_usage_stats(user_id: str, db: Session, duration_seconds: float = 0.0)
     db.commit()
 
 
+def _run_init_models_sync() -> dict:
+    """Run all model initializers sequentially (called from thread)."""
+    stt = init_stt_models()
+    llm = init_llm_client()
+    tts = init_tts_models()
+    return {"stt": stt, "llm": llm, "tts": tts}
+
+
+@router.post("/init-models")
+async def init_models():
+    """
+    Initialize (warm up) all models: STT, LLM client, and TTS (Turbo + IndicF5 if configured).
+    Call this after startup to avoid cold-start latency on first user request.
+    Runs in a thread with a 5-minute timeout.
+    """
+    try:
+        result = await asyncio.wait_for(
+            asyncio.to_thread(_run_init_models_sync),
+            timeout=float(INIT_MODELS_TIMEOUT_SECONDS),
+        )
+        return result
+    except asyncio.TimeoutError:
+        logger.warning("init-models timed out")
+        raise HTTPException(
+            status_code=504,
+            detail="Model initialization timed out. Try again or check server logs.",
+        )
+
+
 @router.post("/text-chat", response_model=AIChatResponse)
 async def text_chat(
     request: TextChatRequest,
@@ -89,22 +127,38 @@ async def text_chat(
         
         # Get conversation history for context
         history = get_conversation_history(conversation.id, db)
-        
-        # Generate AI reply
-        ai_response = generate_reply(request.message, history)
-        
+
+        # Response language from text (script detection; no STT)
+        response_language = get_response_language(request.message, None)
+
+        # Run sync inference in thread pool with timeouts so event loop is not blocked
+        try:
+            ai_response = await asyncio.wait_for(
+                asyncio.to_thread(generate_reply, request.message, history, response_language),
+                timeout=float(settings.llm_timeout_seconds),
+            )
+        except asyncio.TimeoutError:
+            logger.warning("LLM request timed out")
+            raise HTTPException(status_code=504, detail=TIMEOUT_MESSAGE)
+
         # Generate TTS audio - combine reply_text and correction if correction exists
         reply_text_for_tts = ai_response["reply_text"]
         correction_text = ai_response.get("correction", "").strip()
-        
+        hinglish_explanation_text = ai_response.get("hinglish_explanation", "").strip()
+
         if correction_text:
-            # Combine reply and correction with a natural pause
-            # Using period and ellipsis for a clear pause between reply and correction
-            combined_text = f"{reply_text_for_tts}. ... {correction_text}"
+            combined_text = f"{reply_text_for_tts}. ... {hinglish_explanation_text}"
         else:
             combined_text = reply_text_for_tts
-        
-        audio_url = text_to_speech(combined_text)
+
+        try:
+            audio_url = await asyncio.wait_for(
+                asyncio.to_thread(text_to_speech, combined_text, response_language),
+                timeout=float(settings.tts_timeout_seconds),
+            )
+        except asyncio.TimeoutError:
+            logger.warning("TTS request timed out")
+            raise HTTPException(status_code=504, detail=TIMEOUT_MESSAGE)
         
         # Save message to database
         message = Message(
@@ -133,6 +187,8 @@ async def text_chat(
     except ValueError as e:
         logger.error(f"Validation error: {e}")
         raise HTTPException(status_code=400, detail=str(e))
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Unexpected error in text_chat: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="An error occurred processing your request.")
@@ -143,7 +199,8 @@ async def voice_chat(
     user_id: str = Form(...),
     conversation_id: Optional[str] = Form(None),
     audio_file: UploadFile = File(...),
-    db: Session = Depends(get_db)
+    stt_mode: Optional[str] = Form(None),
+    db: Session = Depends(get_db),
 ):
     """
     Voice chat endpoint - accepts audio file and returns AI reply.
@@ -155,32 +212,59 @@ async def voice_chat(
         
         # Read audio file
         audio_bytes = await audio_file.read()
-        
-        # Transcribe audio
-        transcribed_text = transcribe_audio(audio_bytes, audio_file.filename)
-        
+
+        effective_stt_mode = stt_mode if stt_mode in ("faster_whisper_medium", "faster_whisper_large") else settings.stt_mode
+        try:
+            transcribed_text, detected_lang = await asyncio.wait_for(
+                asyncio.to_thread(
+                    transcribe_audio,
+                    audio_bytes,
+                    audio_file.filename,
+                    effective_stt_mode,
+                ),
+                timeout=float(settings.stt_timeout_seconds),
+            )
+        except asyncio.TimeoutError:
+            logger.warning("STT request timed out")
+            raise HTTPException(status_code=504, detail=TIMEOUT_MESSAGE)
+
         # Get or create conversation
         conversation = get_or_create_conversation(user_id, conversation_id, db)
-        
+
         # Get conversation history
         history = get_conversation_history(conversation.id, db)
-        
-        # Generate AI reply (same as text chat)
-        ai_response = generate_reply(transcribed_text, history)
-        
+
+        # Response language from STT + script detection (en -> Chatterbox, hi/ml/ta -> IndicF5)
+        response_language = get_response_language(transcribed_text, detected_lang)
+
+        try:
+            ai_response = await asyncio.wait_for(
+                asyncio.to_thread(generate_reply, transcribed_text, history, response_language),
+                timeout=float(settings.llm_timeout_seconds),
+            )
+        except asyncio.TimeoutError:
+            logger.warning("LLM request timed out")
+            raise HTTPException(status_code=504, detail=TIMEOUT_MESSAGE)
+
         # Generate TTS audio - combine reply_text and correction if correction exists
         reply_text_for_tts = ai_response["reply_text"]
         correction_text = ai_response.get("correction", "").strip()
-        
+        hinglish_explanation_text = ai_response.get("hinglish_explanation", "").strip()
+
         if correction_text:
-            # Combine reply and correction with a natural pause
-            # Using period and ellipsis for a clear pause between reply and correction
-            combined_text = f"{reply_text_for_tts}. ... {correction_text}"
+            combined_text = f"{reply_text_for_tts}. ... {hinglish_explanation_text}"
         else:
             combined_text = reply_text_for_tts
-        
-        audio_url = text_to_speech(combined_text)
-        
+
+        try:
+            audio_url = await asyncio.wait_for(
+                asyncio.to_thread(text_to_speech, combined_text, response_language),
+                timeout=float(settings.tts_timeout_seconds),
+            )
+        except asyncio.TimeoutError:
+            logger.warning("TTS request timed out")
+            raise HTTPException(status_code=504, detail=TIMEOUT_MESSAGE)
+
         # Save message to database
         message = Message(
             conversation_id=conversation.id,
