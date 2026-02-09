@@ -24,3 +24,9 @@ class AIChatResponse(BaseModel):
     score: int = Field(..., ge=0, le=100, description="Score out of 100")
     audio_url: str = Field(..., description="URL to TTS audio file")
     conversation_id: Optional[str] = Field(None, description="Conversation ID for this session")
+
+
+class TTSStreamRequest(BaseModel):
+    """Request schema for TTS streaming endpoint."""
+    text: str = Field(..., min_length=1, max_length=5000, description="Text to synthesize")
+    response_language: str = Field(default="en", description="Language code (en, hi, ml, ta, etc.)")

@@ -1,17 +1,24 @@
 """AI chat endpoints. Sync inference (LLM, STT, TTS) runs in thread pool with timeouts."""
 import asyncio
+import base64
+import hashlib
+import json
 import logging
+import threading
 import uuid
 from datetime import date
+from io import BytesIO
 from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
+from fastapi.responses import StreamingResponse
+from pydub import AudioSegment
 from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.database import get_db
-from app.schemas.ai import TextChatRequest, AIChatResponse
+from app.schemas.ai import TextChatRequest, AIChatResponse, TTSStreamRequest
 from app.services.llm import generate_reply, init_llm_client
 from app.services.stt import transcribe_audio, init_stt_models
-from app.services.tts import text_to_speech, init_tts_models
+from app.services.tts import text_to_speech, text_to_speech_stream, store_audio_mp3, init_tts_models
 from app.utils.language import get_response_language
 from app.models.usage import Conversation, Message, Usage
 
@@ -299,3 +306,72 @@ async def voice_chat(
     except Exception as e:
         logger.error(f"Unexpected error in voice_chat: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="An error occurred processing your request.")
+
+
+# SSE headers for streaming TTS
+SSE_HEADERS = {
+    "Cache-Control": "no-cache",
+    "Connection": "keep-alive",
+    "X-Accel-Buffering": "no",
+}
+
+
+@router.post("/tts/stream")
+async def tts_stream(request: TTSStreamRequest):
+    """
+    Stream TTS audio over Server-Sent Events (SSE).
+    Sends one or more `audio_chunk` events (base64-encoded WAV per sentence) for maximum performance,
+    then a `done` event with the full audio URL (MP3). Client can play WAV chunks as they arrive.
+    """
+    text = request.text.strip()
+    response_language = request.response_language or "en"
+    queue: asyncio.Queue = asyncio.Queue()
+    loop = asyncio.get_running_loop()
+
+    def run_tts_stream() -> None:
+        try:
+            for chunk in text_to_speech_stream(text, response_language):
+                loop.call_soon_threadsafe(queue.put_nowait, chunk)
+            loop.call_soon_threadsafe(queue.put_nowait, None)
+        except Exception as e:
+            logger.exception("TTS stream error")
+            loop.call_soon_threadsafe(queue.put_nowait, ("error", str(e)))
+
+    threading.Thread(target=run_tts_stream, daemon=True).start()
+
+    async def event_gen():
+        chunks = []
+        while True:
+            item = await queue.get()
+            if item is None:
+                break
+            if isinstance(item, tuple) and item[0] == "error":
+                yield f"event: error\ndata: {json.dumps({'error': item[1]})}\n\n"
+                return
+            chunks.append(item)
+            b64 = base64.b64encode(item).decode("ascii")
+            yield f"event: audio_chunk\ndata: {b64}\n\n"
+
+        if chunks:
+            try:
+                # Chunks are WAV (no per-chunk MP3 conversion for max performance)
+                full = AudioSegment.empty()
+                for b in chunks:
+                    full += AudioSegment.from_wav(BytesIO(b))
+                out = BytesIO()
+                full.export(out, format="mp3", bitrate="128k")
+                full_bytes = out.getvalue()
+                filename = f"{hashlib.md5(text.encode()).hexdigest()}.mp3"
+                audio_url = store_audio_mp3(full_bytes, filename)
+                yield f"event: done\ndata: {json.dumps({'audio_url': audio_url})}\n\n"
+            except Exception as e:
+                logger.exception("TTS stream concatenation error")
+                yield f"event: error\ndata: {json.dumps({'error': str(e)})}\n\n"
+        else:
+            yield f"event: done\ndata: {json.dumps({'audio_url': None})}\n\n"
+
+    return StreamingResponse(
+        event_gen(),
+        media_type="text/event-stream",
+        headers=SSE_HEADERS,
+    )
