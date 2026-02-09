@@ -32,10 +32,9 @@ def test_health_check():
 
 
 @patch('app.services.llm.generate_reply')
-@patch('app.services.tts.text_to_speech')
 @patch('app.database.get_db')
-def test_text_chat_happy_path(mock_db, mock_tts, mock_llm):
-    """Test text chat endpoint happy path."""
+def test_text_chat_happy_path(mock_db, mock_llm):
+    """Test text chat endpoint happy path; audio_url is always null (use /tts/stream for audio)."""
     # Mock database session
     from app.models.usage import Conversation, Message, Usage
     from sqlalchemy.orm import Session
@@ -60,9 +59,6 @@ def test_text_chat_happy_path(mock_db, mock_tts, mock_llm):
         "score": 85
     }
     
-    # Mock TTS
-    mock_tts.return_value = "http://localhost:8000/audio/test.mp3"
-    
     # Make request
     response = client.post(
         "/api/v1/ai/text-chat",
@@ -75,7 +71,7 @@ def test_text_chat_happy_path(mock_db, mock_tts, mock_llm):
     assert response.status_code == 200
     data = response.json()
     assert "reply_text" in data
-    assert "audio_url" in data
+    assert data["audio_url"] is None
     assert "score" in data
 
 
@@ -101,9 +97,8 @@ def test_text_chat_invalid_input():
 
 @patch('app.services.stt.transcribe_audio')
 @patch('app.services.llm.generate_reply')
-@patch('app.services.tts.text_to_speech')
 @patch('app.database.get_db')
-def test_voice_chat_invalid_file(mock_db, mock_tts, mock_llm, mock_stt):
+def test_voice_chat_invalid_file(mock_db, mock_llm, mock_stt):
     """Test voice chat with invalid file."""
     # Mock database
     from sqlalchemy.orm import Session
