@@ -269,6 +269,15 @@ def _get_turbo_model():
             device = get_infer_device()
             _turbo_device = device
 
+            # Both Turbo and ChatterboxTTS use perth.PerthImplicitWatermarker(); in some envs it is None (resemble-ai/chatterbox#198). Patch once before loading either.
+            try:
+                import perth
+                if perth.PerthImplicitWatermarker is None and getattr(perth, "DummyWatermarker", None) is not None:
+                    perth.PerthImplicitWatermarker = perth.DummyWatermarker
+                    logger.debug("Patched perth.PerthImplicitWatermarker to DummyWatermarker")
+            except Exception:
+                pass
+
             # Prefer ChatterboxTurboTTS (chatterbox.tts_turbo); PyPI package may only have chatterbox.tts
             try:
                 from chatterbox.tts_turbo import ChatterboxTurboTTS
