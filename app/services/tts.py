@@ -7,7 +7,7 @@ import struct
 import threading
 from io import BytesIO
 from pathlib import Path
-from typing import Optional
+from typing import Iterator, Optional
 import numpy as np
 import soundfile as sf
 from pydub import AudioSegment
@@ -393,7 +393,7 @@ def _tts_with_indicf5(text: str, indic_lang: str) -> bytes:
         indic_lang: Language code (hi, ml, ta, etc.)
 
     Returns:
-        MP3 bytes
+        WAV bytes (caller converts to MP3 for storage when needed).
 
     Raises:
         ValueError: If ref not found or generation fails
@@ -436,7 +436,9 @@ def _tts_with_indicf5(text: str, indic_lang: str) -> bytes:
     sf.write(wav_buffer, audio, sample_rate if sample_rate else 24000, format="WAV")
     wav_buffer.seek(0)
     wav_bytes = wav_buffer.getvalue()
-    return _convert_wav_to_mp3(wav_bytes)
+    # Direct WAV return for max performance (streaming path uses this; no MP3 conversion).
+    # return _convert_wav_to_mp3(wav_bytes)  # uncomment for MP3 output in this path
+    return wav_bytes
 
 
 def _resolve_audio_prompt_path() -> Optional[str]:
@@ -464,7 +466,7 @@ def _tts_with_turbo(text: str) -> bytes:
     Requires a reference audio clip for voice cloning (tts_audio_prompt_path).
 
     Returns:
-        Audio bytes (MP3 format, converted from WAV)
+        Audio bytes (WAV format; caller converts to MP3 for storage when needed).
     """
     try:
         import torch
@@ -508,7 +510,9 @@ def _tts_with_turbo(text: str) -> bytes:
         wav_buffer.seek(0)
         wav_bytes = wav_buffer.getvalue()
 
-        return _convert_wav_to_mp3(wav_bytes)
+        # Direct WAV return for max performance (streaming path uses this; no MP3 conversion).
+        # return _convert_wav_to_mp3(wav_bytes)  # uncomment for MP3 output in this path
+        return wav_bytes
 
     except ImportError as e:
         logger.error(f"Chatterbox-Turbo dependencies not installed: {e}")
@@ -520,6 +524,70 @@ def _tts_with_turbo(text: str) -> bytes:
     except Exception as e:
         logger.error(f"Chatterbox-Turbo error: {e}", exc_info=True)
         raise ValueError("Could not generate audio. Please try again.")
+
+
+def _split_sentences(text: str) -> list[str]:
+    """Split text into sentences for streaming TTS. Keeps trailing punctuation with sentence."""
+    if not text or not text.strip():
+        return []
+    # Split on sentence boundaries (after . ! ?) followed by space; keep " ... " as part of previous
+    parts = re.split(r"(?<=[.!?])\s+", text.strip())
+    return [p.strip() for p in parts if p.strip()]
+
+
+def _generate_tts_bytes(text: str, response_language: str = "en") -> bytes:
+    """
+    Generate TTS audio bytes for the given text without storing or using URL cache.
+    Used for streaming: returns raw WAV bytes (no MP3 conversion for maximum performance).
+    """
+    use_indicf5 = response_language != "en"
+    if use_indicf5:
+        ref = _get_indicf5_ref(response_language)
+        model, _, _ = _get_indicf5_model()
+        if ref and model is not None:
+            try:
+                with _inference_lock:
+                    return _tts_with_indicf5(text, response_language)
+            except ValueError:
+                raise
+            except Exception as e:
+                logger.warning(f"IndicF5 generation failed: {e}. Falling back to Chatterbox-Turbo.")
+        use_indicf5 = False
+    if not use_indicf5:
+        with _inference_lock:
+            return _tts_with_turbo(text)
+    raise ValueError("Something went wrong generating audio. Please try again.")
+
+
+def text_to_speech_stream(text: str, response_language: str = "en") -> Iterator[bytes]:
+    """
+    Generate TTS audio in chunks (one WAV chunk per sentence) for streaming over SSE.
+    Yields raw WAV bytes for each sentence (no MP3 conversion for max performance).
+    Caller concatenates and converts to MP3 once for final storage if needed.
+    """
+    sentences = _split_sentences(text)
+    if not sentences:
+        # No sentence boundary: treat whole text as one chunk
+        if text.strip():
+            yield _generate_tts_bytes(text.strip(), response_language)
+        return
+    for sentence in sentences:
+        if not sentence.strip():
+            continue
+        yield _generate_tts_bytes(sentence, response_language)
+
+
+def store_audio_mp3(audio_bytes: bytes, filename: str) -> str:
+    """
+    Store MP3 bytes to local or S3 and return the playback URL.
+    Used after concatenating streamed TTS chunks.
+    """
+    s3_key = _store_audio_cloud(audio_bytes, filename)
+    if s3_key:
+        presigned = _generate_presigned_url(s3_key)
+        if presigned:
+            return presigned
+    return _store_audio_local(audio_bytes, filename)
 
 
 def text_to_speech(text: str, response_language: str = "en") -> str:
@@ -558,6 +626,7 @@ def text_to_speech(text: str, response_language: str = "en") -> str:
             try:
                 with _inference_lock:
                     audio_bytes = _tts_with_indicf5(text, response_language)
+                audio_bytes = _convert_wav_to_mp3(audio_bytes)
                 filename = f"{response_language}_{hashlib.md5(text.encode()).hexdigest()}.mp3"
                 s3_key = _store_audio_cloud(audio_bytes, filename)
                 if s3_key:
@@ -581,6 +650,7 @@ def text_to_speech(text: str, response_language: str = "en") -> str:
         try:
             with _inference_lock:
                 audio_bytes = _tts_with_turbo(text)
+            audio_bytes = _convert_wav_to_mp3(audio_bytes)
             filename = f"{hashlib.md5(text.encode()).hexdigest()}.mp3"
             s3_key = _store_audio_cloud(audio_bytes, filename)
             if s3_key:
