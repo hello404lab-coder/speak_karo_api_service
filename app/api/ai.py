@@ -18,7 +18,7 @@ from app.database import get_db
 from app.schemas.ai import TextChatRequest, AIChatResponse, TTSStreamRequest
 from app.services.llm import generate_reply, init_llm_client
 from app.services.stt import transcribe_audio, init_stt_models
-from app.services.tts import text_to_speech, text_to_speech_stream, store_audio_mp3, init_tts_models
+from app.services.tts import text_to_speech_stream, store_audio_mp3, init_tts_models
 from app.utils.language import get_response_language
 from app.models.usage import Conversation, Message, Usage
 
@@ -148,25 +148,6 @@ async def text_chat(
             logger.warning("LLM request timed out")
             raise HTTPException(status_code=504, detail=TIMEOUT_MESSAGE)
 
-        # Generate TTS audio - combine reply_text and correction if correction exists
-        reply_text_for_tts = ai_response["reply_text"]
-        correction_text = ai_response.get("correction", "").strip()
-        hinglish_explanation_text = ai_response.get("hinglish_explanation", "").strip()
-
-        if correction_text:
-            combined_text = f"{reply_text_for_tts}. ... {hinglish_explanation_text}"
-        else:
-            combined_text = reply_text_for_tts
-
-        try:
-            audio_url = await asyncio.wait_for(
-                asyncio.to_thread(text_to_speech, combined_text, response_language),
-                timeout=float(settings.tts_timeout_seconds),
-            )
-        except asyncio.TimeoutError:
-            logger.warning("TTS request timed out")
-            raise HTTPException(status_code=504, detail=TIMEOUT_MESSAGE)
-        
         # Save message to database
         message = Message(
             conversation_id=conversation.id,
@@ -187,7 +168,7 @@ async def text_chat(
             correction=ai_response.get("correction", ""),
             hinglish_explanation=ai_response.get("hinglish_explanation", ""),
             score=ai_response.get("score", 75),
-            audio_url=audio_url,
+            audio_url=None,
             conversation_id=conversation.id
         )
         
@@ -253,25 +234,6 @@ async def voice_chat(
             logger.warning("LLM request timed out")
             raise HTTPException(status_code=504, detail=TIMEOUT_MESSAGE)
 
-        # Generate TTS audio - combine reply_text and correction if correction exists
-        reply_text_for_tts = ai_response["reply_text"]
-        correction_text = ai_response.get("correction", "").strip()
-        hinglish_explanation_text = ai_response.get("hinglish_explanation", "").strip()
-
-        if correction_text:
-            combined_text = f"{reply_text_for_tts}. ... {hinglish_explanation_text}"
-        else:
-            combined_text = reply_text_for_tts
-
-        try:
-            audio_url = await asyncio.wait_for(
-                asyncio.to_thread(text_to_speech, combined_text, response_language),
-                timeout=float(settings.tts_timeout_seconds),
-            )
-        except asyncio.TimeoutError:
-            logger.warning("TTS request timed out")
-            raise HTTPException(status_code=504, detail=TIMEOUT_MESSAGE)
-
         # Save message to database
         message = Message(
             conversation_id=conversation.id,
@@ -284,17 +246,14 @@ async def voice_chat(
         db.add(message)
         db.commit()
         
-        # Update usage stats (estimate duration from audio)
-        # Rough estimate: 1 second per 10 bytes (very rough)
-        estimated_duration = len(audio_bytes) / 10000.0
-        update_usage_stats(user_id, db, estimated_duration)
+        update_usage_stats(user_id, db, 0.0)
         
         return AIChatResponse(
             reply_text=ai_response["reply_text"],
             correction=ai_response.get("correction", ""),
             hinglish_explanation=ai_response.get("hinglish_explanation", ""),
             score=ai_response.get("score", 75),
-            audio_url=audio_url,
+            audio_url=None,
             conversation_id=conversation.id
         )
         
@@ -316,12 +275,30 @@ SSE_HEADERS = {
 }
 
 
+def _concat_wav_chunks_and_store(chunks: list[bytes], text: str) -> tuple[Optional[str], Optional[str]]:
+    """Sync helper: concatenate WAV chunks, export to MP3, store. Returns (audio_url, error_message)."""
+    try:
+        full = AudioSegment.empty()
+        for b in chunks:
+            full += AudioSegment.from_wav(BytesIO(b))
+        out = BytesIO()
+        full.export(out, format="mp3", bitrate="128k")
+        full_bytes = out.getvalue()
+        filename = f"{hashlib.md5(text.encode()).hexdigest()}.mp3"
+        audio_url = store_audio_mp3(full_bytes, filename)
+        return (audio_url, None)
+    except Exception as e:
+        logger.exception("TTS stream concatenation error")
+        return (None, str(e))
+
+
 @router.post("/tts/stream")
 async def tts_stream(request: TTSStreamRequest):
     """
     Stream TTS audio over Server-Sent Events (SSE).
-    Sends one or more `audio_chunk` events (base64-encoded WAV per sentence) for maximum performance,
-    then a `done` event with the full audio URL (MP3). Client can play WAV chunks as they arrive.
+    Sends one or more `audio_chunk` events (base64-encoded WAV per sentence) for maximum performance.
+    Then sends `done` immediately (audio_url may be null; saving_in_background true).
+    Stitching and saving the full MP3 run in the background; when ready, sends `audio_ready` with the URL.
     """
     text = request.text.strip()
     response_language = request.response_language or "en"
@@ -352,21 +329,14 @@ async def tts_stream(request: TTSStreamRequest):
             b64 = base64.b64encode(item).decode("ascii")
             yield f"event: audio_chunk\ndata: {b64}\n\n"
 
+        # Emit done immediately; do not block on stitch/save
         if chunks:
-            try:
-                # Chunks are WAV (no per-chunk MP3 conversion for max performance)
-                full = AudioSegment.empty()
-                for b in chunks:
-                    full += AudioSegment.from_wav(BytesIO(b))
-                out = BytesIO()
-                full.export(out, format="mp3", bitrate="128k")
-                full_bytes = out.getvalue()
-                filename = f"{hashlib.md5(text.encode()).hexdigest()}.mp3"
-                audio_url = store_audio_mp3(full_bytes, filename)
-                yield f"event: done\ndata: {json.dumps({'audio_url': audio_url})}\n\n"
-            except Exception as e:
-                logger.exception("TTS stream concatenation error")
-                yield f"event: error\ndata: {json.dumps({'error': str(e)})}\n\n"
+            yield f"event: done\ndata: {json.dumps({'audio_url': None, 'saving_in_background': True})}\n\n"
+            audio_url, err = await asyncio.to_thread(_concat_wav_chunks_and_store, chunks, text)
+            if err:
+                yield f"event: error\ndata: {json.dumps({'error': err})}\n\n"
+            else:
+                yield f"event: audio_ready\ndata: {json.dumps({'audio_url': audio_url})}\n\n"
         else:
             yield f"event: done\ndata: {json.dumps({'audio_url': None})}\n\n"
 

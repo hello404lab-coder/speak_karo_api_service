@@ -22,7 +22,10 @@ class AIChatResponse(BaseModel):
     correction: str = Field(..., description="One correction (if any)")
     hinglish_explanation: str = Field(..., description="Explanation in Hinglish")
     score: int = Field(..., ge=0, le=100, description="Score out of 100")
-    audio_url: str = Field(..., description="URL to TTS audio file")
+    audio_url: Optional[str] = Field(
+        None,
+        description="Always null in chat response. Get the audio URL from the audio_ready SSE event when calling POST /api/ai/tts/stream.",
+    )
     conversation_id: Optional[str] = Field(None, description="Conversation ID for this session")
 
 

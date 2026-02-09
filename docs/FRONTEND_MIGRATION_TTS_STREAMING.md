@@ -1,15 +1,14 @@
 # Frontend migration: TTS from single URL to streaming (SSE)
 
-This guide describes how to move your frontend from the **old** TTS flow (single `audio_url` in the chat response) to the **new** streaming TTS flow over Server-Sent Events (SSE) for lower time-to-first-audio and better perceived performance.
+This guide describes how to use the streaming TTS flow over Server-Sent Events (SSE) for lower time-to-first-audio and better perceived performance.
 
 ---
 
-## Old way (still supported)
+## Chat response: no audio URL
 
-### How it works
+**`POST /api/ai/text-chat`** and **`POST /api/ai/voice-chat`** return only text and metadata. **`audio_url` is always `null`** in that response. The backend does not generate audio in the chat endpoints.
 
-- You call **`POST /api/ai/text-chat`** or **`POST /api/ai/voice-chat`**.
-- The response is JSON with a single **`audio_url`** pointing to the full TTS file (MP3):
+You get:
 
 ```json
 {
@@ -17,35 +16,12 @@ This guide describes how to move your frontend from the **old** TTS flow (single
   "correction": "...",
   "hinglish_explanation": "...",
   "score": 75,
-  "audio_url": "http://localhost:8000/audio/abc123.mp3",
+  "audio_url": null,
   "conversation_id": "uuid-..."
 }
 ```
 
-### Frontend usage (old)
-
-```javascript
-// 1. Send message
-const res = await fetch('/api/ai/text-chat', {
-  method: 'POST',
-  headers: { 'Content-Type': 'application/json' },
-  body: JSON.stringify({
-    user_id: 'user-1',
-    message: 'Hello',
-    conversation_id: null,
-  }),
-});
-const data = await res.json();
-
-// 2. Show text
-document.getElementById('reply').textContent = data.reply_text;
-
-// 3. Play audio from single URL (full file must be ready)
-const audio = new Audio(data.audio_url);
-audio.play();
-```
-
-**Limitation:** The user waits for the entire TTS file to be generated and stored before playback can start.
+**To get audio:** Call **`POST /api/ai/tts/stream`** with the reply text (and optional `response_language`). **`audio_url` will always be `null` in the initial chat response**; it is **only** provided via the **`audio_ready`** SSE event from the streaming endpoint, after the full MP3 has been stitched and saved.
 
 ---
 
@@ -56,11 +32,12 @@ audio.play();
 - You still use **text-chat** or **voice-chat** to get the AI reply and metadata.
 - For TTS, you **optionally** call **`POST /api/ai/tts/stream`** with the text (and language) you want to speak.
 - The response is a **Server-Sent Events** stream:
-  - **`audio_chunk`** events: base64-encoded **WAV** audio (one chunk per sentence). You can decode and play each chunk as it arrives.
-  - **`done`** event: JSON with **`audio_url`** for the full file (MP3), if you want to store or replay the whole thing.
+  - **`audio_chunk`** events: base64-encoded **WAV** audio (one chunk per sentence). Decode and play each chunk as it arrives.
+  - **`done`** event: Sent **immediately** after the last chunk. Data is `{ "audio_url": null, "saving_in_background": true }` when the server is stitching and saving the full MP3 in the background. Use this to know streaming is complete; do not expect a URL here.
+  - **`audio_ready`** event: Sent when the full MP3 has been stitched and saved. Data is `{ "audio_url": "..." }`. Use this URL for "replay" or saving the full file.
   - **`error`** event: JSON with **`error`** message on failure.
 
-Streaming uses **WAV** chunks for performance; only the final stored file is MP3.
+Streaming uses **WAV** chunks for performance; the full file is stitched and saved in the background, then delivered via **`audio_ready`**.
 
 ### Endpoint
 
@@ -76,20 +53,21 @@ Streaming uses **WAV** chunks for performance; only the final stored file is MP3
 | Event        | Data (after `data: `) | Meaning |
 |-------------|------------------------|--------|
 | `audio_chunk` | Base64 string          | One WAV audio chunk (one sentence). Decode and append/play. |
-| `done`        | JSON `{ "audio_url": "..." \| null }` | Stream finished. Optional full MP3 URL. |
+| `done`        | JSON `{ "audio_url": null, "saving_in_background": true }` or `{ "audio_url": null }` | Stream finished; sent immediately after last chunk. No URL here when saving in background. |
+| `audio_ready`  | JSON `{ "audio_url": "..." }` | Full MP3 stitched and saved. Use this for replay or download. |
 | `error`       | JSON `{ "error": "message" }` | Something went wrong. |
 
 ---
 
 ## Frontend migration steps
 
-### 1. Keep existing chat flow
+### 1. Chat returns text only; audio_url is always null
 
-Continue calling **text-chat** or **voice-chat** as today. You still get **`reply_text`**, **`correction`**, **`hinglish_explanation`**, **`score`**, **`conversation_id`**, and **`audio_url`**. You can keep using **`audio_url`** as fallback or for “replay full answer.”
+Call **text-chat** or **voice-chat** as usual. You get **`reply_text`**, **`correction`**, **`hinglish_explanation`**, **`score`**, and **`conversation_id`**. **`audio_url` is always `null`** in this response. Do not use it for playback.
 
-### 2. Add streaming TTS when you want faster playback
+### 2. Get audio by calling the streaming endpoint
 
-After you have the reply text (and optionally correction/explanation), call the streaming endpoint with the same text you would have sent to TTS:
+After you have the reply text (and optionally correction/explanation), call **`POST /api/ai/tts/stream`** with that text to generate and stream audio. The **audio URL is only provided in the `audio_ready` SSE event** from this endpoint, not in the initial chat response.
 
 ```javascript
 // Build the same string the backend would use for TTS (reply + optional explanation)
@@ -118,7 +96,7 @@ You can use **`EventSource`** only for GET requests. For POST + SSE you must rea
 **Example: parse SSE from a fetch stream**
 
 ```javascript
-async function consumeTtsStream(response, onChunk, onDone, onError) {
+async function consumeTtsStream(response, onChunk, onDone, onAudioReady, onError) {
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let buffer = '';
@@ -142,6 +120,12 @@ async function consumeTtsStream(response, onChunk, onDone, onError) {
             onDone(JSON.parse(data));
           } catch (_) {
             onDone({ audio_url: null });
+          }
+        } else if (eventType === 'audio_ready') {
+          try {
+            onAudioReady(JSON.parse(data));
+          } catch (_) {
+            onAudioReady({ audio_url: null });
           }
         } else if (eventType === 'error') {
           try {
@@ -212,29 +196,32 @@ await consumeTtsStream(
   response,
   (base64Wav) => queueChunk(base64Wav),
   (payload) => {
+    // done: streaming finished (payload.audio_url is null; saving_in_background may be true)
+    console.log('Stream done, saving in background:', payload.saving_in_background);
+  },
+  (payload) => {
+    // audio_ready: full MP3 URL for replay
     console.log('Full audio URL (for replay):', payload.audio_url);
   },
   (err) => console.error('TTS stream error:', err)
 );
 ```
 
-### 6. Fallback to old `audio_url`
+### 6. Fallback and replay URL
 
-If you still get **`audio_url`** from text-chat/voice-chat, you can:
+- **Replay URL:** Use the **`audio_ready`** event's **`audio_url`** for replay or download. Do not rely on **`done`** for a URL; it is sent immediately and may have `audio_url: null` and `saving_in_background: true`.
+- If you still get **`audio_url`** from text-chat/voice-chat, use that as fallback when streaming is disabled, or prefer **`audio_ready`** when using the stream.
 
-- Prefer streaming for “play as soon as possible” and use **`audio_url`** only for “replay” or if streaming is disabled.
-- Or ignore **`audio_url`** when using streaming and use the **`done`** event’s **`audio_url`** for replay (same value in practice).
 
 ---
 
 ## Summary
 
-| Aspect | Old way | New way (streaming) |
-|--------|---------|----------------------|
-| **Endpoint** | Same chat endpoints | `POST /api/ai/tts/stream` with `{ text, response_language }` |
-| **Response** | JSON with `audio_url` | SSE stream |
-| **Audio format** | MP3 at `audio_url` | Chunks: **WAV** (base64). Final file: MP3 at `done.audio_url` |
-| **Playback** | `new Audio(audio_url)` after full file | Decode base64 WAV and play chunks as they arrive (e.g. Web Audio API) |
-| **When to use** | Simple, no stream handling | Lower latency, start playback after first sentence |
+| Aspect | Chat response | TTS stream |
+|--------|----------------|------------|
+| **Endpoint** | `POST /api/ai/text-chat` or `voice-chat` | `POST /api/ai/tts/stream` with `{ text, response_language }` |
+| **Response** | JSON with text and metadata; **`audio_url` is always `null`** | SSE stream: `audio_chunk` → `done` → `audio_ready` (with URL) |
+| **Audio URL** | Not provided | Only in **`audio_ready`** event after background stitch |
+| **Playback** | N/A | Decode base64 WAV chunks and play as they arrive; use `audio_ready` URL for replay |
 
-You can migrate gradually: keep the old flow and add the new streaming path only where you want faster time-to-first-audio.
+The initial chat response never includes an audio URL; the client must call `/tts/stream` and use the **`audio_ready`** SSE event to get the replay URL.
