@@ -38,9 +38,7 @@ ENV/
 .env.local
 
 # Audio storage
-audio_storage/
 *.mp3
-*.wav
 
 # Database
 *.db

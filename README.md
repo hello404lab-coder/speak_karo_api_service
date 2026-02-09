@@ -17,9 +17,11 @@ A FastAPI backend service for an AI-powered English speaking practice app focuse
 
 - Python 3.11
 - FastAPI
-- OpenAI (LLM, Whisper STT, TTS)
+- Google Gemini (LLM)
+- faster-whisper (STT)
+- Chatterbox-Turbo / IndicF5 (TTS)
 - PostgreSQL
-- Redis
+- Redis (optional)
 - Docker
 
 ## Setup
@@ -29,7 +31,7 @@ A FastAPI backend service for an AI-powered English speaking practice app focuse
 - Python 3.11+
 - PostgreSQL
 - Redis (optional, for caching)
-- OpenAI API key
+- Gemini API key (required in prod)
 
 ### Local Development
 
@@ -73,10 +75,45 @@ A FastAPI backend service for an AI-powered English speaking practice app focuse
 
 See `.env.example` for all available configuration options. Key variables:
 
-- `OPENAI_API_KEY`: Your OpenAI API key (required)
-- `DATABASE_URL`: PostgreSQL connection string
-- `REDIS_URL`: Redis connection string (optional)
-- `AWS_*`: S3 credentials for cloud audio storage (optional, falls back to local)
+- `APP_ENV`: `dev` or `prod` — controls GPU usage, cache defaults, and strictness (see DEV vs PROD below).
+- `GEMINI_API_KEY`: Google Gemini API key; **required when APP_ENV=prod**.
+- `DATABASE_URL`: PostgreSQL connection string.
+- `REDIS_URL`: Redis connection string (optional; cache degrades gracefully if unavailable).
+- `CACHE_ENABLED`: Override cache; in prod defaults to true when unset.
+- `LLM_TIMEOUT_SECONDS`, `STT_TIMEOUT_SECONDS`, `TTS_TIMEOUT_SECONDS`: Timeouts for inference (defaults 60, 30, 45).
+- `AWS_*`, `S3_BUCKET_NAME`: S3 credentials and bucket for cloud audio storage (optional; when set, TTS audio is stored in S3 and the API returns **presigned GET URLs**). Falls back to local storage if unset or on error.
+- `S3_PRESIGNED_EXPIRY_SECONDS`: Expiry in seconds for presigned GET URLs (default: 3600).
+
+## DEV vs PROD
+
+The app supports two modes via `APP_ENV`:
+
+| | **DEV** (`APP_ENV=dev`) | **PROD** (`APP_ENV=prod`) |
+|---|------------------------|---------------------------|
+| **Device** | CPU only (STT/TTS) | GPU when CUDA available (e.g. RunPod RTX 3090) |
+| **Cache** | Default off | Default on (set `CACHE_ENABLED=false` to disable) |
+| **GEMINI_API_KEY** | Optional (LLM will fail without it) | **Required** — app will not start without it |
+| **Redis / S3** | Optional | Recommended for latency and scalability |
+
+**Production (e.g. RunPod):** Set `APP_ENV=prod`, provide `GEMINI_API_KEY`, and configure Redis and S3. STT uses faster-whisper large-v3 on GPU when available; TTS uses Chatterbox-Turbo and IndicF5 on GPU. All inference runs in a thread pool with configurable timeouts; slow requests return 504 with a user-safe message.
+
+### Production (RunPod) — GPU Docker and Gunicorn
+
+For RunPod (single GPU, e.g. RTX 3090), use the production Docker image and Gunicorn:
+
+- **Image:** Build with `Dockerfile.prod` (CUDA 12.x, Python 3.11, ffmpeg). No Conda.
+- **Run:** The image runs **Gunicorn** with **UvicornWorker**: `--workers 1`, `--threads 4`, `--timeout 120`. One worker avoids loading duplicate GPU models; four threads allow concurrent requests; 120s timeout covers long voice pipelines.
+- **Config:** Set `APP_ENV=prod` and required env vars (e.g. `GEMINI_API_KEY`, `DATABASE_URL`, `REDIS_URL`, S3 if used). All settings are via environment variables.
+- **GPU:** STT, Turbo TTS, and IndicF5 share a single GPU. Inference locks ensure only one STT and one TTS inference run at a time per process, avoiding OOM and keeping the app stable under concurrent voice requests.
+
+Build and run (example):
+
+```bash
+docker build -f Dockerfile.prod -t ai-english-backend:prod .
+docker run --gpus all -p 8000:8000 --env-file .env ai-english-backend:prod
+```
+
+Local dev continues to use `uvicorn app.main:app --reload` (see Setup).
 
 ## API Endpoints
 
@@ -85,6 +122,25 @@ See `.env.example` for all available configuration options. Key variables:
 ```bash
 GET /health
 ```
+
+### Initialize Models (warmup)
+
+Load all models (STT, LLM client, TTS) so the first user request does not hit cold-start latency. Optional; call after deployment or before traffic.
+
+```bash
+POST /api/v1/ai/init-models
+```
+
+**Response (200):**
+```json
+{
+  "stt": {"status": "loaded", "mode": "faster_whisper_large"},
+  "llm": {"status": "loaded"},
+  "tts": {"turbo": "loaded", "indicf5": "loaded"}
+}
+```
+
+Returns 504 if initialization exceeds 5 minutes.
 
 ### Text Chat
 
@@ -172,15 +228,46 @@ pytest tests/
 
 ## Docker
 
-Build and run with Docker:
+- **Dev (CPU):** `Dockerfile` — uvicorn, no GPU. Use for local or CI.
+- **Prod (GPU/RunPod):** `Dockerfile.prod` — CUDA 12.x, Gunicorn (workers=1, threads=4, timeout=120). See "Production (RunPod)" above.
+
+Inside a container, `localhost` is the container itself, not your host machine. So if Postgres and Redis run on the host (or in other containers with published ports), the app must not use `localhost` for `DATABASE_URL` / `REDIS_URL` when it runs in Docker.
+
+### Option A: Run app in Docker, Postgres/Redis on host (or other containers)
+
+Use the host’s address from inside Docker:
+
+- **Docker Desktop (Mac/Windows):** use `host.docker.internal` as the hostname.
+
+Override the URLs when running the container:
 
 ```bash
-# Build image
 docker build -t ai-english-backend .
-
-# Run container
-docker run -p 8000:8000 --env-file .env ai-english-backend
+docker run -p 8000:8000 --env-file .env \
+  -e DATABASE_URL="postgresql://user:password@host.docker.internal:5432/english_practice" \
+  -e REDIS_URL="redis://host.docker.internal:6379/0" \
+  ai-english-backend
 ```
+
+Replace `user`, `password`, and `english_practice` with your real DB credentials. Ensure Postgres and Redis are listening on 5432 and 6379 (and that those ports are exposed if they run in other containers).
+
+### Option B: Run everything with Docker Compose (recommended)
+
+Run the backend, Postgres, and Redis in the same Docker network so the app can use service names:
+
+```bash
+docker compose up --build
+```
+
+Compose uses `docker-compose.yml`, which starts Postgres and Redis and sets `DATABASE_URL` and `REDIS_URL` to `postgres` and `redis` (so no `localhost` inside the app). Your `.env` is still loaded for `GEMINI_API_KEY`, etc. Default DB credentials in Compose are `user` / `password` / `english_practice`; adjust in `docker-compose.yml` if needed.
+
+After first start, run migrations against the Compose Postgres (from your host, with port 5432 published):
+
+```bash
+alembic upgrade head
+```
+
+When S3 is configured via environment variables (`AWS_*`, `S3_BUCKET_NAME`), generated TTS audio is stored in S3 and the API returns presigned GET URLs in `audio_url` (expiry set by `S3_PRESIGNED_EXPIRY_SECONDS`). The frontend uses the same `audio_url` field; no frontend change is required.
 
 ## Project Structure
 
@@ -194,10 +281,11 @@ backend/
 │   ├── models/              # Database models
 │   ├── schemas/             # Pydantic schemas
 │   ├── database.py          # DB connection
-│   └── utils/               # Utilities
+│   └── utils/               # Utilities (audio, language, device)
 ├── tests/                   # Tests
 ├── requirements.txt         # Dependencies
 ├── Dockerfile              # Docker configuration
+├── docker-compose.yml      # App + Postgres + Redis on same network
 └── README.md               # This file
 ```
 

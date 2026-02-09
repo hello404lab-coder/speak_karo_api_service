@@ -1,0 +1,625 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Voice Chat Test - AI English Practice</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            padding: 20px;
+        }
+
+        .container {
+            background: white;
+            border-radius: 20px;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+            max-width: 600px;
+            width: 100%;
+            padding: 40px;
+        }
+
+        h1 {
+            color: #333;
+            margin-bottom: 10px;
+            text-align: center;
+        }
+
+        .subtitle {
+            color: #666;
+            text-align: center;
+            margin-bottom: 30px;
+            font-size: 14px;
+        }
+
+        .input-group {
+            margin-bottom: 20px;
+        }
+
+        label {
+            display: block;
+            margin-bottom: 8px;
+            color: #333;
+            font-weight: 500;
+            font-size: 14px;
+        }
+
+        input[type="text"] {
+            width: 100%;
+            padding: 12px;
+            border: 2px solid #e0e0e0;
+            border-radius: 8px;
+            font-size: 14px;
+            transition: border-color 0.3s;
+        }
+
+        input[type="text"]:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+
+        .recording-section {
+            margin: 30px 0;
+        }
+
+        .record-button {
+            width: 100%;
+            padding: 16px;
+            font-size: 16px;
+            font-weight: 600;
+            border: none;
+            border-radius: 10px;
+            cursor: pointer;
+            transition: all 0.3s;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 10px;
+        }
+
+        .record-button.record {
+            background: #ff4757;
+            color: white;
+        }
+
+        .record-button.record:hover {
+            background: #ff3838;
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(255, 71, 87, 0.4);
+        }
+
+        .record-button.stop {
+            background: #2ed573;
+            color: white;
+        }
+
+        .record-button.stop:hover {
+            background: #26d467;
+        }
+
+        .record-button:disabled {
+            background: #ccc;
+            cursor: not-allowed;
+            transform: none;
+        }
+
+        .recording-indicator {
+            display: none;
+            text-align: center;
+            margin-top: 15px;
+            color: #ff4757;
+            font-weight: 500;
+        }
+
+        .recording-indicator.active {
+            display: block;
+            animation: pulse 1.5s infinite;
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+
+        .audio-preview {
+            margin-top: 20px;
+            display: none;
+        }
+
+        .audio-preview.active {
+            display: block;
+        }
+
+        .audio-preview audio {
+            width: 100%;
+            margin-top: 10px;
+        }
+
+        .response-section {
+            margin-top: 30px;
+            padding: 20px;
+            background: #f8f9fa;
+            border-radius: 10px;
+            display: none;
+        }
+
+        .response-section.active {
+            display: block;
+        }
+
+        .response-item {
+            margin-bottom: 15px;
+        }
+
+        .response-item:last-child {
+            margin-bottom: 0;
+        }
+
+        .response-label {
+            font-weight: 600;
+            color: #333;
+            margin-bottom: 5px;
+            font-size: 13px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .response-value {
+            color: #555;
+            line-height: 1.6;
+            font-size: 14px;
+        }
+
+        .score {
+            display: inline-block;
+            padding: 4px 12px;
+            background: #667eea;
+            color: white;
+            border-radius: 20px;
+            font-weight: 600;
+        }
+
+        .loading {
+            text-align: center;
+            padding: 20px;
+            color: #667eea;
+            display: none;
+        }
+
+        .loading.active {
+            display: block;
+        }
+
+        .error {
+            background: #ffebee;
+            color: #c62828;
+            padding: 15px;
+            border-radius: 8px;
+            margin-top: 20px;
+            display: none;
+        }
+
+        .error.active {
+            display: block;
+        }
+
+        .spinner {
+            border: 3px solid #f3f3f3;
+            border-top: 3px solid #667eea;
+            border-radius: 50%;
+            width: 30px;
+            height: 30px;
+            animation: spin 1s linear infinite;
+            display: inline-block;
+            margin-right: 10px;
+        }
+
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🎤 Voice Chat Test</h1>
+        <p class="subtitle">Record your voice and get AI feedback</p>
+
+        <div class="input-group">
+            <label for="userId">User ID</label>
+            <input type="text" id="userId" placeholder="Enter your user ID" value="test-user-123">
+        </div>
+
+        <div class="input-group">
+            <label for="conversationId">Conversation ID (Optional)</label>
+            <input type="text" id="conversationId" placeholder="Leave empty for new conversation">
+        </div>
+
+        <div class="recording-section">
+            <button id="recordButton" class="record-button record">
+                <span>🎤</span>
+                <span>Start Recording</span>
+            </button>
+            <div id="recordingIndicator" class="recording-indicator">
+                🔴 Recording... Click "Stop Recording" when done
+            </div>
+            <div id="audioPreview" class="audio-preview">
+                <label>Your Recording:</label>
+                <audio id="previewAudio" controls></audio>
+            </div>
+        </div>
+
+        <div id="loading" class="loading">
+            <div class="spinner"></div>
+            <span id="loadingText">Processing your audio...</span>
+        </div>
+
+        <div id="error" class="error"></div>
+
+        <div id="responseSection" class="response-section">
+            <div class="response-item">
+                <div class="response-label">Reply</div>
+                <div class="response-value" id="replyText"></div>
+            </div>
+            <div class="response-item" id="correctionItem" style="display: none;">
+                <div class="response-label">Correction</div>
+                <div class="response-value" id="correctionText"></div>
+            </div>
+            <div class="response-item" id="explanationItem" style="display: none;">
+                <div class="response-label">Explanation</div>
+                <div class="response-value" id="explanationText"></div>
+            </div>
+            <div class="response-item">
+                <div class="response-label">Score</div>
+                <div class="response-value">
+                    <span class="score" id="scoreValue">0</span>
+                </div>
+            </div>
+            <div class="response-item">
+                <div class="response-label">AI Response Audio</div>
+                <audio id="responseAudio" controls style="width: 100%; margin-top: 10px;"></audio>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const API_BASE_URL = 'http://localhost:8000/api/v1/ai';
+        
+        let mediaRecorder;
+        let audioChunks = [];
+        let isRecording = false;
+
+        const recordButton = document.getElementById('recordButton');
+        const recordingIndicator = document.getElementById('recordingIndicator');
+        const audioPreview = document.getElementById('audioPreview');
+        const previewAudio = document.getElementById('previewAudio');
+        const loading = document.getElementById('loading');
+        const error = document.getElementById('error');
+        const responseSection = document.getElementById('responseSection');
+        const responseAudio = document.getElementById('responseAudio');
+
+        // Initialize
+        recordButton.addEventListener('click', function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            toggleRecording();
+        });
+
+        // Prevent form submission if there's a form
+        document.addEventListener('submit', function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            return false;
+        });
+
+        async function toggleRecording() {
+            if (!isRecording) {
+                await startRecording();
+            } else {
+                stopRecording();
+            }
+        }
+
+        async function startRecording() {
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                mediaRecorder = new MediaRecorder(stream, {
+                    mimeType: 'audio/webm;codecs=opus'
+                });
+
+                audioChunks = [];
+                
+                mediaRecorder.ondataavailable = (event) => {
+                    if (event.data.size > 0) {
+                        audioChunks.push(event.data);
+                    }
+                };
+
+                mediaRecorder.onstop = () => {
+                    const audioBlob = new Blob(audioChunks, { type: 'audio/webm' });
+                    const audioUrl = URL.createObjectURL(audioBlob);
+                    previewAudio.src = audioUrl;
+                    audioPreview.classList.add('active');
+                    
+                    // Convert and send
+                    convertAndSendAudio(audioBlob);
+                };
+
+                mediaRecorder.start();
+                isRecording = true;
+                recordButton.innerHTML = '<span>⏹️</span><span>Stop Recording</span>';
+                recordButton.classList.remove('record');
+                recordButton.classList.add('stop');
+                recordingIndicator.classList.add('active');
+                
+            } catch (err) {
+                console.error('Error accessing microphone:', err);
+                showError('Could not access microphone. Please check permissions.');
+            }
+        }
+
+        function stopRecording() {
+            if (mediaRecorder && isRecording) {
+                mediaRecorder.stop();
+                mediaRecorder.stream.getTracks().forEach(track => track.stop());
+                isRecording = false;
+                recordButton.innerHTML = '<span>🎤</span><span>Start Recording</span>';
+                recordButton.classList.remove('stop');
+                recordButton.classList.add('record');
+                recordButton.disabled = true;
+                recordingIndicator.classList.remove('active');
+            }
+        }
+
+        async function convertAndSendAudio(audioBlob) {
+            try {
+                loading.classList.add('active');
+                document.getElementById('loadingText').textContent = 'Converting audio...';
+                error.classList.remove('active');
+                responseSection.classList.remove('active');
+
+                console.log('Converting audio to WAV...');
+                // Convert WebM to WAV
+                const wavBlob = await convertToWav(audioBlob);
+                console.log('WAV conversion complete, size:', wavBlob.size);
+                
+                document.getElementById('loadingText').textContent = 'Sending to API...';
+                // Send to API
+                await sendToAPI(wavBlob);
+                
+            } catch (err) {
+                console.error('Error processing audio:', err);
+                showError('Error processing audio: ' + (err.message || err.toString()));
+                recordButton.disabled = false;
+                loading.classList.remove('active');
+            }
+        }
+
+        async function convertToWav(audioBlob) {
+            return new Promise((resolve, reject) => {
+                const reader = new FileReader();
+                reader.onload = async () => {
+                    try {
+                        const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                        const arrayBuffer = reader.result;
+                        const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
+                        
+                        // Convert to WAV
+                        const wav = audioBufferToWav(audioBuffer);
+                        const wavBlob = new Blob([wav], { type: 'audio/wav' });
+                        resolve(wavBlob);
+                    } catch (err) {
+                        reject(err);
+                    }
+                };
+                reader.onerror = reject;
+                reader.readAsArrayBuffer(audioBlob);
+            });
+        }
+
+        function audioBufferToWav(buffer) {
+            const length = buffer.length;
+            const numberOfChannels = buffer.numberOfChannels;
+            const sampleRate = buffer.sampleRate;
+            const bytesPerSample = 2;
+            const blockAlign = numberOfChannels * bytesPerSample;
+            const byteRate = sampleRate * blockAlign;
+            const dataSize = length * blockAlign;
+            const bufferSize = 44 + dataSize;
+            
+            const arrayBuffer = new ArrayBuffer(bufferSize);
+            const view = new DataView(arrayBuffer);
+            const samples = [];
+            
+            // WAV header
+            const writeString = (offset, string) => {
+                for (let i = 0; i < string.length; i++) {
+                    view.setUint8(offset + i, string.charCodeAt(i));
+                }
+            };
+            
+            writeString(0, 'RIFF');
+            view.setUint32(4, bufferSize - 8, true);
+            writeString(8, 'WAVE');
+            writeString(12, 'fmt ');
+            view.setUint32(16, 16, true); // fmt chunk size
+            view.setUint16(20, 1, true); // audio format (PCM)
+            view.setUint16(22, numberOfChannels, true);
+            view.setUint32(24, sampleRate, true);
+            view.setUint32(28, byteRate, true);
+            view.setUint16(32, blockAlign, true);
+            view.setUint16(34, 16, true); // bits per sample
+            writeString(36, 'data');
+            view.setUint32(40, dataSize, true);
+            
+            // Convert audio data
+            let offset = 44;
+            for (let i = 0; i < length; i++) {
+                for (let channel = 0; channel < numberOfChannels; channel++) {
+                    const sample = Math.max(-1, Math.min(1, buffer.getChannelData(channel)[i]));
+                    view.setInt16(offset, sample < 0 ? sample * 0x8000 : sample * 0x7FFF, true);
+                    offset += 2;
+                }
+            }
+            
+            return arrayBuffer;
+        }
+
+        async function sendToAPI(wavBlob) {
+            const userId = document.getElementById('userId').value.trim();
+            const conversationId = document.getElementById('conversationId').value.trim();
+            
+            if (!userId) {
+                throw new Error('User ID is required');
+            }
+
+            try {
+                const formData = new FormData();
+                formData.append('user_id', userId);
+                formData.append('audio_file', wavBlob, 'recording.wav');
+                if (conversationId) {
+                    formData.append('conversation_id', conversationId);
+                }
+
+                console.log('Sending request to API...');
+                const response = await fetch(`${API_BASE_URL}/voice-chat`, {
+                    method: 'POST',
+                    body: formData
+                });
+
+                console.log('Response status:', response.status);
+
+                if (!response.ok) {
+                    const errorData = await response.json().catch(() => ({ detail: 'Unknown error' }));
+                    throw new Error(errorData.detail || `HTTP ${response.status}`);
+                }
+
+                const responseText = await response.text();
+                console.log('Response text:', responseText);
+                
+                let data;
+                try {
+                    data = JSON.parse(responseText);
+                } catch (parseError) {
+                    console.error('Failed to parse JSON:', parseError);
+                    throw new Error('Invalid JSON response from server');
+                }
+                
+                console.log('Parsed response data:', data);
+                
+                if (!data) {
+                    throw new Error('Empty response from server');
+                }
+                
+                displayResponse(data);
+                recordButton.disabled = false;
+            } catch (err) {
+                console.error('Error in sendToAPI:', err);
+                throw err;
+            }
+        }
+
+        function displayResponse(data) {
+            try {
+                console.log('Displaying response:', data);
+                
+                document.getElementById('replyText').textContent = data.reply_text || 'No reply';
+                document.getElementById('scoreValue').textContent = data.score || 0;
+                
+                // Show correction if available
+                if (data.correction && data.correction.trim()) {
+                    document.getElementById('correctionText').textContent = data.correction;
+                    document.getElementById('correctionItem').style.display = 'block';
+                } else {
+                    document.getElementById('correctionItem').style.display = 'none';
+                }
+                
+                // Show explanation if available
+                if (data.hinglish_explanation && data.hinglish_explanation.trim()) {
+                    document.getElementById('explanationText').textContent = data.hinglish_explanation;
+                    document.getElementById('explanationItem').style.display = 'block';
+                } else {
+                    document.getElementById('explanationItem').style.display = 'none';
+                }
+                
+                // Set audio URL
+                if (data.audio_url) {
+                    // Handle both relative and absolute URLs
+                    let audioUrl = data.audio_url;
+                    if (audioUrl.startsWith('/')) {
+                        // Relative URL - prepend base URL
+                        audioUrl = window.location.origin + audioUrl;
+                    }
+                    responseAudio.src = audioUrl;
+                    responseAudio.load(); // Force reload
+                    
+                    // Handle audio load errors
+                    responseAudio.onerror = function() {
+                        console.error('Error loading audio:', audioUrl);
+                        showError('Could not load audio response. URL: ' + audioUrl);
+                    };
+                    
+                    responseAudio.onloadeddata = function() {
+                        console.log('Audio loaded successfully');
+                    };
+                }
+                
+                // Update conversation ID if provided
+                if (data.conversation_id) {
+                    document.getElementById('conversationId').value = data.conversation_id;
+                }
+                
+                responseSection.classList.add('active');
+                loading.classList.remove('active');
+                
+                // Scroll to response section
+                responseSection.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+                
+                console.log('Response displayed successfully');
+            } catch (err) {
+                console.error('Error displaying response:', err);
+                showError('Error displaying response: ' + err.message);
+            }
+        }
+
+        function showError(message) {
+            error.textContent = message;
+            error.classList.add('active');
+            loading.classList.remove('active');
+            console.error('Error:', message);
+        }
+
+        // Prevent any accidental page reloads
+        window.addEventListener('beforeunload', function(e) {
+            if (isRecording || loading.classList.contains('active')) {
+                e.preventDefault();
+                e.returnValue = '';
+            }
+        });
+
+        // Global error handler
+        window.addEventListener('error', function(e) {
+            console.error('Global error:', e.error);
+            showError('An unexpected error occurred: ' + (e.error?.message || 'Unknown error'));
+        });
+
+        // Unhandled promise rejection handler
+        window.addEventListener('unhandledrejection', function(e) {
+            console.error('Unhandled promise rejection:', e.reason);
+            showError('An error occurred: ' + (e.reason?.message || e.reason || 'Unknown error'));
+            e.preventDefault();
+        });
+    </script>
+</body>
+</html>

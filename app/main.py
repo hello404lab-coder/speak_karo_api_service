@@ -1,9 +1,12 @@
 """FastAPI application entry point."""
 import logging
+from pathlib import Path
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, FileResponse
+
 from app.core.config import settings
 from app.database import init_db
 from app.api.ai import router as ai_router
@@ -37,25 +40,56 @@ import os
 os.makedirs(settings.audio_storage_path, exist_ok=True)
 app.mount("/audio", StaticFiles(directory=settings.audio_storage_path), name="audio")
 
+# Serve test page
+@app.get("/test")
+async def test_page():
+    """Serve the voice chat test page."""
+    backend_dir = Path(__file__).resolve().parents[1]  # .../backend
+    file_path = backend_dir / "test_voice_chat.html"
+    return FileResponse(str(file_path))
+
 
 @app.on_event("startup")
 async def startup_event():
     """Initialize services on startup."""
     logger.info("Starting up AI English Practice Backend...")
+    logger.info(f"APP_ENV={settings.app_env} (is_prod={settings.is_prod})")
     
-    # Check OpenAI API key
-    if not settings.openai_api_key:
-        logger.warning("OPENAI_API_KEY not set. AI features will not work. Set it in .env file.")
+    # Prod: require Gemini API key (fail fast)
+    if settings.is_prod and not settings.gemini_api_key:
+        raise RuntimeError("GEMINI_API_KEY is required when APP_ENV=prod. Set it in .env or environment.")
+    if not settings.gemini_api_key:
+        logger.warning("GEMINI_API_KEY not set. LLM features will not work. Set it in .env file.")
     else:
-        logger.info("OpenAI API key configured")
+        logger.info("Gemini API key configured")
     
-    # Log STT provider configuration
-    logger.info(f"STT Provider configured: {settings.stt_provider}")
-    if settings.stt_provider.lower() == "qubrid":
-        if settings.qubrid_api_key:
-            logger.info("Qubrid API key configured")
-        else:
-            logger.warning("Qubrid API key not set. STT will fail if Qubrid is selected.")
+    # Log inference device (lazy; may import torch)
+    try:
+        from app.utils.device import get_infer_device
+        logger.info(f"Infer device: {get_infer_device()}")
+    except Exception as e:
+        logger.warning(f"Could not resolve infer device: {e}")
+    
+    # Log STT configuration
+    if settings.stt_mode == "faster_whisper_large":
+        logger.info("STT: faster_whisper_large (Systran/faster-whisper-large-v3, local)")
+    else:
+        logger.info(f"STT: faster_whisper_medium (model: {settings.stt_faster_whisper_model_size}, CPU, int8)")
+    
+    # Log LLM configuration
+    if settings.gemini_api_key:
+        logger.info(f"LLM: Gemini (model: {settings.llm_model})")
+    else:
+        logger.warning("Gemini API key not set. LLM will fail.")
+    
+    # Log TTS configuration (dual: English -> Chatterbox-Turbo, Indic -> IndicF5)
+    audio_prompt_info = f"voice cloning: {settings.tts_audio_prompt_path}" if settings.tts_audio_prompt_path else "not set (required for Turbo)"
+    logger.info(f"TTS: English -> Chatterbox-Turbo ({audio_prompt_info})")
+    indicf5_dir = getattr(settings, "tts_indicf5_ref_audio_dir", None)
+    if indicf5_dir:
+        logger.info(f"TTS: Indic (hi/ml/ta/...) -> IndicF5 (ref_audio_dir: {indicf5_dir}, speed: {getattr(settings, 'tts_indicf5_speed', 0.9)})")
+    else:
+        logger.info("TTS: Indic (hi/ml/ta/...) -> Chatterbox-Turbo fallback (IndicF5 ref dir not set)")
     
     # Initialize database
     try:
@@ -64,15 +98,19 @@ async def startup_event():
     except Exception as e:
         logger.error(f"Database initialization failed: {e}")
     
-    # Test Redis connection
-    try:
-        from app.services.cache import redis_available
-        if redis_available:
-            logger.info("Redis cache available")
-        else:
-            logger.warning("Redis cache not available, continuing without cache")
-    except Exception as e:
-        logger.warning(f"Redis check failed: {e}")
+    # Cache and Redis
+    cache_enabled = settings.cache_enabled
+    if cache_enabled:
+        try:
+            from app.services.cache import redis_available
+            if redis_available:
+                logger.info("Cache enabled (Redis available)")
+            else:
+                logger.warning("Cache enabled but Redis not available, continuing without cache")
+        except Exception as e:
+            logger.warning(f"Redis check failed: {e}")
+    else:
+        logger.info("Cache disabled (CACHE_ENABLED=false)")
 
 
 @app.on_event("shutdown")

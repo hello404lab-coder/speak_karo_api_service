@@ -1,0 +1,44 @@
+# Production RunPod image: CUDA 12.x, Python 3.11, single GPU shared by STT and TTS.
+# Run with Gunicorn: workers=1 (no duplicate GPU models), threads=4 (concurrency), timeout=120s (voice pipeline).
+FROM nvidia/cuda:12.1.0-runtime-ubuntu22.04
+
+WORKDIR /app
+
+# System deps: Python 3.11 (deadsnakes), ffmpeg, build deps for Python wheels. No Conda.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    software-properties-common \
+    ffmpeg \
+    gcc \
+    g++ \
+    git \
+    curl \
+    && add-apt-repository -y ppa:deadsnakes/ppa \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends python3.11 python3.11-venv python3.11-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Pip for Python 3.11
+RUN curl -sS https://bootstrap.pypa.io/get-pip.py | python3.11
+
+# Python dependencies (numpy first for chatterbox-tts build)
+COPY requirements.txt .
+RUN python3.11 -m pip install --no-cache-dir "numpy<1.26.0,>=1.24.0"
+RUN python3.11 -m pip install --no-cache-dir -r requirements.txt
+RUN python3.11 -m pip install --no-cache-dir git+https://github.com/ai4bharat/IndicF5.git
+
+# Application
+COPY app/ ./app/
+COPY test_voice_chat.html ./
+RUN mkdir -p /app/audio_storage
+COPY audio_storage/ /app/audio_storage/
+ENV AUDIO_STORAGE_PATH=/app/audio_storage
+
+# Non-root user
+RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /app
+USER appuser
+
+EXPOSE 8000
+
+# Gunicorn + UvicornWorker: workers=1 (single process, no duplicate models on GPU),
+# threads=4 (concurrency within process), timeout=120s (long voice requests).
+CMD ["python3.11", "-m", "gunicorn", "app.main:app", "-k", "uvicorn.workers.UvicornWorker", "-b", "0.0.0.0:8000", "--workers", "1", "--threads", "4", "--timeout", "120"]
