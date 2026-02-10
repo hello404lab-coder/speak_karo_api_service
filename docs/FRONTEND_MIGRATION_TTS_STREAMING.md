@@ -57,6 +57,8 @@ Streaming uses **WAV** chunks for performance; the full file is stitched and sav
 | `audio_ready`  | JSON `{ "audio_url": "..." }` | Full MP3 stitched and saved. Use this for replay or download. |
 | `error`       | JSON `{ "error": "message" }` | Something went wrong. |
 
+Chunk payloads are base64-encoded WAV (sample rate from the engine, typically 24 kHz for Chatterbox-Turbo). For a single continuous WAV or raw PCM stream, a separate endpoint and `media_type` would be used.
+
 ---
 
 ## Frontend migration steps
