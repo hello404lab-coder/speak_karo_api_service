@@ -20,7 +20,7 @@ from app.database import get_db
 from app.schemas.ai import TextChatRequest, AIChatResponse, TTSStreamRequest
 from app.services.llm import generate_reply, stream_gemini_tokens, init_llm_client
 from app.services.stt import transcribe_audio, init_stt_models
-from app.services.tts import text_to_speech_stream, store_audio_mp3, generate_tts_bytes, init_tts_models
+from app.services.tts import text_to_speech_stream, store_audio_mp3, generate_tts_bytes, feed_tts_stream_to_queue, init_tts_models
 from app.utils.language import get_response_language
 from app.models.usage import Conversation, Message, Usage
 
@@ -482,25 +482,20 @@ async def chat_stream(
 async def tts_stream(request: TTSStreamRequest):
     """
     Stream TTS audio over Server-Sent Events (SSE).
-    Sends one or more `audio_chunk` events (base64-encoded WAV per sentence) for maximum performance.
-    Then sends `done` immediately (audio_url may be null; saving_in_background true).
-    Stitching and saving the full MP3 run in the background; when ready, sends `audio_ready` with the URL.
+    Producer (thread): feed_tts_stream_to_queue puts WAV bytes per sentence, then None (sentinel).
+    Consumer (async gen): yields event: audio_chunk (base64 WAV, typically 24 kHz) until sentinel,
+    then event: done and event: audio_ready. media_type is text/event-stream.
     """
     text = request.text.strip()
     response_language = request.response_language or "en"
     queue: asyncio.Queue = asyncio.Queue()
     loop = asyncio.get_running_loop()
 
-    def run_tts_stream() -> None:
-        try:
-            for chunk in text_to_speech_stream(text, response_language):
-                loop.call_soon_threadsafe(queue.put_nowait, chunk)
-            loop.call_soon_threadsafe(queue.put_nowait, None)
-        except Exception as e:
-            logger.exception("TTS stream error")
-            loop.call_soon_threadsafe(queue.put_nowait, ("error", str(e)))
-
-    threading.Thread(target=run_tts_stream, daemon=True).start()
+    threading.Thread(
+        target=feed_tts_stream_to_queue,
+        args=(queue, text, response_language, loop),
+        daemon=True,
+    ).start()
 
     async def event_gen():
         chunks = []
@@ -515,7 +510,6 @@ async def tts_stream(request: TTSStreamRequest):
             b64 = base64.b64encode(item).decode("ascii")
             yield f"event: audio_chunk\ndata: {b64}\n\n"
 
-        # Emit done immediately; do not block on stitch/save
         if chunks:
             yield f"event: done\ndata: {json.dumps({'audio_url': None, 'saving_in_background': True})}\n\n"
             audio_url, err = await asyncio.to_thread(_concat_wav_chunks_and_store, chunks, text)
