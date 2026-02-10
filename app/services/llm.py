@@ -136,6 +136,7 @@ def stream_gemini_tokens(
         contents = _convert_messages_to_gemini_format(messages)
         safety_settings = _build_safety_settings()
         config_dict = {
+            "thinking_config": genai.types.ThinkingConfig(thinking_budget=0),
             "system_instruction": system_instruction,
             "max_output_tokens": settings.llm_max_tokens,
             "temperature": settings.llm_temperature,
@@ -213,6 +214,7 @@ def generate_reply(
         
         # Build config with optional safety settings
         config_dict = {
+            "thinking_config": genai.types.ThinkingConfig(thinking_budget=0),
             "system_instruction": system_instruction,
             "max_output_tokens": settings.llm_max_tokens,
             "temperature": settings.llm_temperature,

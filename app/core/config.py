@@ -54,8 +54,8 @@ class Settings(BaseSettings):
     
     # LLM Settings
     llm_model: str = "gemini-2.5-flash"  # Gemini model for LLM (fast and efficient)
-    llm_max_tokens: int = 400  # Increased for complete responses (Gemini 2.5 Flash supports up to 65,536)
-    llm_temperature: float = 0.4
+    llm_max_tokens: int = 200  # Increased for complete responses (Gemini 2.5 Flash supports up to 65,536)
+    llm_temperature: float = 0.2
     
     # STT Settings
     stt_mode: Literal["faster_whisper_medium", "faster_whisper_large"] = "faster_whisper_large"  # Env: STT_MODE
