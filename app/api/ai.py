@@ -4,6 +4,7 @@ import base64
 import hashlib
 import json
 import logging
+import re
 import threading
 import uuid
 from datetime import date
@@ -14,11 +15,12 @@ from fastapi.responses import StreamingResponse
 from pydub import AudioSegment
 from sqlalchemy.orm import Session
 from app.core.config import settings
+from app.core.prompts import parse_llm_response
 from app.database import get_db
 from app.schemas.ai import TextChatRequest, AIChatResponse, TTSStreamRequest
-from app.services.llm import generate_reply, init_llm_client
+from app.services.llm import generate_reply, stream_gemini_tokens, init_llm_client
 from app.services.stt import transcribe_audio, init_stt_models
-from app.services.tts import text_to_speech_stream, store_audio_mp3, init_tts_models
+from app.services.tts import text_to_speech_stream, store_audio_mp3, generate_tts_bytes, init_tts_models
 from app.utils.language import get_response_language
 from app.models.usage import Conversation, Message, Usage
 
@@ -267,6 +269,9 @@ async def voice_chat(
         raise HTTPException(status_code=500, detail="An error occurred processing your request.")
 
 
+# Heartbeat interval for chat/stream SSE (keep connection alive during long LLM pauses)
+SSE_HEARTBEAT_SECONDS = 0.5
+
 # SSE headers for streaming TTS
 SSE_HEADERS = {
     "Cache-Control": "no-cache",
@@ -290,6 +295,187 @@ def _concat_wav_chunks_and_store(chunks: list[bytes], text: str) -> tuple[Option
     except Exception as e:
         logger.exception("TTS stream concatenation error")
         return (None, str(e))
+
+
+def _is_section_header(line: str) -> bool:
+    """True if line starts with correction/hinglish/explanation (reply-only TTS boundary)."""
+    lower = line.strip().lower()
+    if not lower:
+        return False
+    return (
+        lower.startswith("correction") or
+        lower.startswith("hinglish") or
+        lower.startswith("explanation") or
+        lower.startswith("**correction") or
+        lower.startswith("**hinglish") or
+        lower.startswith("**explanation")
+    )
+
+
+@router.post("/chat/stream")
+async def chat_stream(
+    request: TextChatRequest,
+    db: Session = Depends(get_db),
+):
+    """
+    Sentence-level pipelined chat: stream Gemini tokens, buffer into sentences, TTS per sentence.
+    SSE: text_chunk (sentence for display), audio_chunk (WAV), then done, then audio_ready.
+    Reply-only TTS (stops at Correction/Hinglish). Heartbeat every 500ms when waiting for next event.
+    """
+    user_id = request.user_id
+    message = request.message.strip()
+    conversation_id = request.conversation_id
+    conversation = get_or_create_conversation(user_id, conversation_id, db)
+    history = get_conversation_history(conversation.id, db)
+    response_language = get_response_language(message, None)
+
+    token_queue: asyncio.Queue = asyncio.Queue()
+    sentence_queue: asyncio.Queue = asyncio.Queue()
+    main_queue: asyncio.Queue = asyncio.Queue()
+    loop = asyncio.get_running_loop()
+
+    def gemini_producer() -> None:
+        try:
+            for token in stream_gemini_tokens(message, history, response_language):
+                loop.call_soon_threadsafe(token_queue.put_nowait, token)
+            loop.call_soon_threadsafe(token_queue.put_nowait, None)
+        except Exception as e:
+            logger.exception("Gemini stream error")
+            loop.call_soon_threadsafe(main_queue.put_nowait, ("error", str(e)))
+
+    async def buffer_consumer() -> None:
+        buffer = ""
+        in_reply = True
+        full_reply_text_parts = []
+        try:
+            while True:
+                try:
+                    token = await asyncio.wait_for(token_queue.get(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    continue
+                if token is None:
+                    break
+                full_reply_text_parts.append(token)
+                buffer += token
+                while True:
+                    idx = -1
+                    for sep in (".", "!", "?", "\n"):
+                        i = buffer.find(sep)
+                        if i >= 0 and (idx < 0 or i < idx):
+                            idx = i
+                    if idx < 0:
+                        break
+                    sentence = buffer[: idx + 1].strip()
+                    buffer = buffer[idx + 1 :].lstrip()
+                    if not sentence:
+                        continue
+                    for line in sentence.split("\n"):
+                        if _is_section_header(line.strip()):
+                            in_reply = False
+                            break
+                    if in_reply and sentence:
+                        main_queue.put_nowait(("text", sentence))
+                        sentence_queue.put_nowait(sentence)
+            if buffer.strip() and in_reply:
+                sent = buffer.strip()
+                main_queue.put_nowait(("text", sent))
+                sentence_queue.put_nowait(sent)
+            full_reply_text = "".join(full_reply_text_parts)
+            main_queue.put_nowait(("full_text", full_reply_text))
+            sentence_queue.put_nowait(None)
+        except Exception as e:
+            logger.exception("Buffer consumer error")
+            main_queue.put_nowait(("error", str(e)))
+            sentence_queue.put_nowait(None)
+
+    async def tts_worker() -> None:
+        try:
+            while True:
+                sentence = await sentence_queue.get()
+                if sentence is None:
+                    main_queue.put_nowait(("end", None))
+                    return
+                try:
+                    wav_bytes = await asyncio.to_thread(generate_tts_bytes, sentence, response_language)
+                    main_queue.put_nowait(("audio", wav_bytes))
+                except Exception as e:
+                    logger.exception("TTS worker error")
+                    main_queue.put_nowait(("error", str(e)))
+                    return
+        except Exception as e:
+            logger.exception("TTS worker error")
+            main_queue.put_nowait(("error", str(e)))
+
+    threading.Thread(target=gemini_producer, daemon=True).start()
+    buffer_task = asyncio.create_task(buffer_consumer())
+    tts_task = asyncio.create_task(tts_worker())
+
+    audio_chunks_collected: list[bytes] = []
+    full_reply_text = ""
+
+    async def event_gen():
+        nonlocal full_reply_text
+        try:
+            while True:
+                try:
+                    item = await asyncio.wait_for(main_queue.get(), timeout=SSE_HEARTBEAT_SECONDS)
+                except asyncio.TimeoutError:
+                    yield ": keep-alive\n\n"
+                    continue
+                if item[0] == "error":
+                    yield f"event: error\ndata: {json.dumps({'error': item[1]})}\n\n"
+                    return
+                if item[0] == "end":
+                    break
+                if item[0] == "text":
+                    yield f"event: text_chunk\ndata: {json.dumps({'text': item[1]})}\n\n"
+                elif item[0] == "audio":
+                    audio_chunks_collected.append(item[1])
+                    b64 = base64.b64encode(item[1]).decode("ascii")
+                    yield f"event: audio_chunk\ndata: {b64}\n\n"
+                elif item[0] == "full_text":
+                    full_reply_text = item[1] or ""
+
+            await asyncio.gather(buffer_task, tts_task)
+        except Exception as e:
+            logger.exception("chat/stream event_gen error")
+            yield f"event: error\ndata: {json.dumps({'error': str(e)})}\n\n"
+            return
+
+        if audio_chunks_collected:
+            yield f"event: done\ndata: {json.dumps({'audio_url': None, 'saving_in_background': True})}\n\n"
+            audio_url, err = await asyncio.to_thread(
+                _concat_wav_chunks_and_store, audio_chunks_collected, full_reply_text
+            )
+            if err:
+                yield f"event: error\ndata: {json.dumps({'error': err})}\n\n"
+            else:
+                yield f"event: audio_ready\ndata: {json.dumps({'audio_url': audio_url})}\n\n"
+        else:
+            yield f"event: done\ndata: {json.dumps({'audio_url': None})}\n\n"
+
+        if full_reply_text:
+            try:
+                parsed = parse_llm_response(full_reply_text)
+                msg = Message(
+                    conversation_id=conversation.id,
+                    user_message=message,
+                    ai_reply=parsed.get("reply_text", ""),
+                    correction=parsed.get("correction", ""),
+                    hinglish_explanation=parsed.get("hinglish_explanation", ""),
+                    score=parsed.get("score", 75),
+                )
+                db.add(msg)
+                db.commit()
+                update_usage_stats(user_id, db, 0.0)
+            except Exception as e:
+                logger.exception("chat/stream save message error: %s", e)
+
+    return StreamingResponse(
+        event_gen(),
+        media_type="text/event-stream",
+        headers=SSE_HEADERS,
+    )
 
 
 @router.post("/tts/stream")

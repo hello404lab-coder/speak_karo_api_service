@@ -2,7 +2,7 @@
 import hashlib
 import json
 import logging
-from typing import List, Dict, Optional
+from typing import Iterator, List, Dict, Optional
 from google import genai
 from google.genai import types
 from app.core.config import settings
@@ -93,6 +93,76 @@ def _generate_cache_key(
     return f"llm:{hashlib.md5(context.encode()).hexdigest()}"
 
 
+def _build_safety_settings():
+    """Build safety settings for Gemini (block only HIGH). Returns None if types not found."""
+    try:
+        SafetySetting = getattr(types, "SafetySetting", None)
+        HarmCategory = getattr(types, "HarmCategory", None)
+        HarmBlockThreshold = getattr(types, "HarmBlockThreshold", None)
+        if SafetySetting is None:
+            SafetySetting = getattr(genai, "SafetySetting", None)
+            HarmCategory = getattr(genai, "HarmCategory", None)
+            HarmBlockThreshold = getattr(genai, "HarmBlockThreshold", None)
+        if SafetySetting and HarmCategory and HarmBlockThreshold:
+            return [
+                SafetySetting(category=HarmCategory.HARM_CATEGORY_HARASSMENT, threshold=HarmBlockThreshold.BLOCK_ONLY_HIGH),
+                SafetySetting(category=HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold=HarmBlockThreshold.BLOCK_ONLY_HIGH),
+                SafetySetting(category=HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold=HarmBlockThreshold.BLOCK_ONLY_HIGH),
+                SafetySetting(category=HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold=HarmBlockThreshold.BLOCK_ONLY_HIGH),
+            ]
+    except Exception:
+        pass
+    return None
+
+
+def stream_gemini_tokens(
+    user_message: str,
+    conversation_history: List[Dict[str, str]],
+    response_language: str = "en",
+) -> Iterator[str]:
+    """
+    Stream Gemini response as text deltas (tokens). No caching.
+    Caller is responsible for sentence buffering and TTS coordination.
+    """
+    if conversation_history is None:
+        conversation_history = []
+    try:
+        client = _get_gemini_client()
+        messages = build_conversation_prompt(user_message, conversation_history, response_language)
+        system_instruction = None
+        if messages and messages[0].get("role") == "system":
+            system_instruction = messages[0].get("content", "")
+            messages = messages[1:]
+        contents = _convert_messages_to_gemini_format(messages)
+        safety_settings = _build_safety_settings()
+        config_dict = {
+            "system_instruction": system_instruction,
+            "max_output_tokens": settings.llm_max_tokens,
+            "temperature": settings.llm_temperature,
+        }
+        if safety_settings is not None:
+            config_dict["safety_settings"] = safety_settings
+        config = types.GenerateContentConfig(**config_dict)
+        logger.info("Starting Gemini stream (model=%s)", settings.llm_model)
+        for chunk in client.models.generate_content_stream(
+            model=settings.llm_model,
+            contents=contents,
+            config=config,
+        ):
+            text = getattr(chunk, "text", None)
+            if text and isinstance(text, str) and text.strip():
+                yield text
+            elif chunk.candidates and len(chunk.candidates) > 0:
+                c = chunk.candidates[0]
+                if c.content and c.content.parts:
+                    for part in c.content.parts:
+                        if hasattr(part, "text") and part.text:
+                            yield part.text
+    except Exception as e:
+        logger.exception("Gemini stream error: %s", e)
+        raise
+
+
 def generate_reply(
     user_message: str,
     conversation_history: List[Dict[str, str]] = None,
@@ -137,46 +207,9 @@ def generate_reply(
         
         logger.info(f"Calling Gemini LLM API with model: {settings.llm_model}")
         
-        # Configure safety settings to be less restrictive for educational content
-        # Block only HIGH probability unsafe content, allow MEDIUM and below
-        try:
-            # Try using types module first
-            SafetySetting = getattr(types, 'SafetySetting', None)
-            HarmCategory = getattr(types, 'HarmCategory', None)
-            HarmBlockThreshold = getattr(types, 'HarmBlockThreshold', None)
-            
-            # Fallback to genai module if types doesn't have them
-            if SafetySetting is None:
-                SafetySetting = getattr(genai, 'SafetySetting', None)
-                HarmCategory = getattr(genai, 'HarmCategory', None)
-                HarmBlockThreshold = getattr(genai, 'HarmBlockThreshold', None)
-            
-            safety_settings = None
-            if SafetySetting and HarmCategory and HarmBlockThreshold:
-                safety_settings = [
-                    SafetySetting(
-                        category=HarmCategory.HARM_CATEGORY_HARASSMENT,
-                        threshold=HarmBlockThreshold.BLOCK_ONLY_HIGH
-                    ),
-                    SafetySetting(
-                        category=HarmCategory.HARM_CATEGORY_HATE_SPEECH,
-                        threshold=HarmBlockThreshold.BLOCK_ONLY_HIGH
-                    ),
-                    SafetySetting(
-                        category=HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
-                        threshold=HarmBlockThreshold.BLOCK_ONLY_HIGH
-                    ),
-                    SafetySetting(
-                        category=HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
-                        threshold=HarmBlockThreshold.BLOCK_ONLY_HIGH
-                    ),
-                ]
-                logger.debug("Safety settings configured to block only HIGH probability content")
-            else:
-                logger.warning("SafetySetting types not found, using default safety settings")
-        except Exception as e:
-            logger.warning(f"Could not configure safety settings: {e}. Using defaults.")
-            safety_settings = None
+        safety_settings = _build_safety_settings()
+        if safety_settings is not None:
+            logger.debug("Safety settings configured to block only HIGH probability content")
         
         # Build config with optional safety settings
         config_dict = {

@@ -540,6 +540,14 @@ def _generate_tts_bytes(text: str, response_language: str = "en") -> bytes:
     Generate TTS audio bytes for the given text without storing or using URL cache.
     Used for streaming: returns raw WAV bytes (no MP3 conversion for maximum performance).
     """
+    return generate_tts_bytes(text, response_language)
+
+
+def generate_tts_bytes(text: str, response_language: str = "en") -> bytes:
+    """
+    Public entrypoint: generate TTS audio bytes for one sentence (WAV).
+    Used by the chat/stream pipeline for sentence-level TTS.
+    """
     use_indicf5 = response_language != "en"
     if use_indicf5:
         ref = _get_indicf5_ref(response_language)
