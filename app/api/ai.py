@@ -393,7 +393,7 @@ async def chat_stream(
             while True:
                 sentence = await sentence_queue.get()
                 if sentence is None:
-                    main_queue.put_nowait(("end", None))
+                    main_queue.put_nowait((None, None))
                     return
                 try:
                     wav_bytes = await asyncio.to_thread(generate_tts_bytes, sentence, response_language)
@@ -425,7 +425,7 @@ async def chat_stream(
                 if item[0] == "error":
                     yield f"event: error\ndata: {json.dumps({'error': item[1]})}\n\n"
                     return
-                if item[0] == "end":
+                if item[0] is None:
                     break
                 if item[0] == "text":
                     yield f"event: text_chunk\ndata: {json.dumps({'text': item[1]})}\n\n"
@@ -482,9 +482,9 @@ async def chat_stream(
 async def tts_stream(request: TTSStreamRequest):
     """
     Stream TTS audio over Server-Sent Events (SSE).
-    Producer (thread): feed_tts_stream_to_queue puts WAV bytes per sentence, then None (sentinel).
-    Consumer (async gen): yields event: audio_chunk (base64 WAV, typically 24 kHz) until sentinel,
-    then event: done and event: audio_ready. media_type is text/event-stream.
+    Producer (thread): feed_tts_stream_to_queue puts ("audio", chunk) per sentence, then (None, None) sentinel.
+    Consumer (async gen): yields event: audio_chunk as soon as ("audio", chunk) is received; done and audio_ready
+    only after queue is exhausted. media_type is text/event-stream.
     """
     text = request.text.strip()
     response_language = request.response_language or "en"
@@ -493,7 +493,7 @@ async def tts_stream(request: TTSStreamRequest):
 
     threading.Thread(
         target=feed_tts_stream_to_queue,
-        args=(queue, text, response_language, loop),
+        args=(text, response_language, queue, loop),
         daemon=True,
     ).start()
 
@@ -501,14 +501,15 @@ async def tts_stream(request: TTSStreamRequest):
         chunks = []
         while True:
             item = await queue.get()
-            if item is None:
+            if item == (None, None) or (isinstance(item, tuple) and item[0] is None):
                 break
             if isinstance(item, tuple) and item[0] == "error":
                 yield f"event: error\ndata: {json.dumps({'error': item[1]})}\n\n"
                 return
-            chunks.append(item)
-            b64 = base64.b64encode(item).decode("ascii")
-            yield f"event: audio_chunk\ndata: {b64}\n\n"
+            if isinstance(item, tuple) and item[0] == "audio":
+                chunks.append(item[1])
+                b64 = base64.b64encode(item[1]).decode("ascii")
+                yield f"event: audio_chunk\ndata: {b64}\n\n"
 
         if chunks:
             yield f"event: done\ndata: {json.dumps({'audio_url': None, 'saving_in_background': True})}\n\n"

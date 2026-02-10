@@ -587,21 +587,21 @@ def text_to_speech_stream(text: str, response_language: str = "en") -> Iterator[
 
 
 def feed_tts_stream_to_queue(
-    queue: asyncio.Queue,
     text: str,
     response_language: str,
+    queue: asyncio.Queue,
     loop: asyncio.AbstractEventLoop,
 ) -> None:
     """
     Producer: run text_to_speech_stream in the current thread and put each WAV chunk
-    into the queue (thread-safe via loop.call_soon_threadsafe). Puts None as sentinel
-    when done; on exception puts ("error", str(e)) so the consumer can stop.
+    into the queue (thread-safe via loop.call_soon_threadsafe). Tuple protocol:
+    ("audio", chunk) per sentence; (None, None) as sentinel when done; ("error", str(e)) on exception.
     Intended to be run from a dedicated thread; the API consumer awaits queue.get().
     """
     try:
         for chunk in text_to_speech_stream(text, response_language):
-            loop.call_soon_threadsafe(queue.put_nowait, chunk)
-        loop.call_soon_threadsafe(queue.put_nowait, None)
+            loop.call_soon_threadsafe(queue.put_nowait, ("audio", chunk))
+        loop.call_soon_threadsafe(queue.put_nowait, (None, None))
     except Exception as e:
         logger.exception("TTS stream error in feed_tts_stream_to_queue")
         loop.call_soon_threadsafe(queue.put_nowait, ("error", str(e)))
