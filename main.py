@@ -71,6 +71,9 @@ def synthesize_tts(
         model=model,
         contents=contents,
         config=types.GenerateContentConfig(
+            thinking_config=genai.types.ThinkingConfig(thinking_budget=0),
+            max_output_tokens=200,
+            temperature=0.2,
             response_modalities=["AUDIO"],
             speech_config=types.SpeechConfig(
                 voice_config=types.VoiceConfig(
