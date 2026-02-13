@@ -171,6 +171,7 @@ async def text_chat(
             hinglish_explanation=ai_response.get("hinglish_explanation", ""),
             score=ai_response.get("score", 75),
             audio_url=None,
+            response_language=response_language,
             conversation_id=conversation.id
         )
         
@@ -256,6 +257,7 @@ async def voice_chat(
             hinglish_explanation=ai_response.get("hinglish_explanation", ""),
             score=ai_response.get("score", 75),
             audio_url=None,
+            response_language=response_language,
             conversation_id=conversation.id
         )
         

@@ -1,4 +1,8 @@
 """FastAPI application entry point."""
+# Avoid "The current process just got forked, after parallelism has already been used" from tokenizers
+import os
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
 import logging
 from pathlib import Path
 
@@ -36,7 +40,6 @@ app.add_middleware(
 )
 
 # Mount static files for audio serving (local storage fallback)
-import os
 os.makedirs(settings.audio_storage_path, exist_ok=True)
 app.mount("/audio", StaticFiles(directory=settings.audio_storage_path), name="audio")
 

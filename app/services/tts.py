@@ -15,6 +15,7 @@ from pydub import AudioSegment
 from app.core.config import settings
 from app.services.cache import get, set
 from app.utils.device import get_infer_device
+from app.utils.language import _script_to_lang
 
 logger = logging.getLogger(__name__)
 
@@ -544,19 +545,31 @@ def _generate_tts_bytes(text: str, response_language: str = "en") -> bytes:
     return generate_tts_bytes(text, response_language)
 
 
+def _effective_response_language(text: str, response_language: str) -> str:
+    """
+    Use response_language when set to an Indic code; when 'en' (or default),
+    infer from text script so Indic text (e.g. Malayalam) uses IndicF5 even if client didn't send language.
+    """
+    if response_language != "en":
+        return response_language
+    inferred = _script_to_lang(text)
+    return inferred if inferred else "en"
+
+
 def generate_tts_bytes(text: str, response_language: str = "en") -> bytes:
     """
     Public entrypoint: generate TTS audio bytes for one sentence (WAV).
     Used by the chat/stream pipeline for sentence-level TTS.
     """
-    use_indicf5 = response_language != "en"
+    lang = _effective_response_language(text, response_language)
+    use_indicf5 = lang != "en"
     if use_indicf5:
-        ref = _get_indicf5_ref(response_language)
+        ref = _get_indicf5_ref(lang)
         model, _, _ = _get_indicf5_model()
         if ref and model is not None:
             try:
                 with _inference_lock:
-                    return _tts_with_indicf5(text, response_language)
+                    return _tts_with_indicf5(text, lang)
             except ValueError:
                 raise
             except Exception as e:
@@ -634,7 +647,8 @@ def text_to_speech(text: str, response_language: str = "en") -> str:
     Raises:
         ValueError: If audio generation fails
     """
-    cache_key = _generate_cache_key(text, response_language)
+    lang = _effective_response_language(text, response_language)
+    cache_key = _generate_cache_key(text, lang)
     cached = get(cache_key)
     if cached:
         logger.info("Cache hit for TTS")
@@ -647,17 +661,17 @@ def text_to_speech(text: str, response_language: str = "en") -> str:
             return presigned
         return cached
 
-    use_indicf5 = response_language != "en"
+    use_indicf5 = lang != "en"
     if use_indicf5:
-        ref = _get_indicf5_ref(response_language)
+        ref = _get_indicf5_ref(lang)
         model, _, _ = _get_indicf5_model()
         if ref and model is not None:
-            logger.info(f"Using TTS provider: IndicF5 (language: {response_language})")
+            logger.info(f"Using TTS provider: IndicF5 (language: {lang})")
             try:
                 with _inference_lock:
-                    audio_bytes = _tts_with_indicf5(text, response_language)
+                    audio_bytes = _tts_with_indicf5(text, lang)
                 audio_bytes = _convert_wav_to_mp3(audio_bytes)
-                filename = f"{response_language}_{hashlib.md5(text.encode()).hexdigest()}.mp3"
+                filename = f"{lang}_{hashlib.md5(text.encode()).hexdigest()}.mp3"
                 s3_key = _store_audio_cloud(audio_bytes, filename)
                 if s3_key:
                     presigned = _generate_presigned_url(s3_key)
@@ -672,7 +686,7 @@ def text_to_speech(text: str, response_language: str = "en") -> str:
             except Exception as e:
                 logger.warning(f"IndicF5 generation failed: {e}. Falling back to Chatterbox-Turbo.")
         else:
-            logger.warning(f"IndicF5 not configured for {response_language}. Using Chatterbox-Turbo.")
+            logger.warning(f"IndicF5 not configured for {lang}. Using Chatterbox-Turbo.")
             use_indicf5 = False
 
     if not use_indicf5:

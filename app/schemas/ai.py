@@ -26,6 +26,10 @@ class AIChatResponse(BaseModel):
         None,
         description="Always null in chat response. Get the audio URL from the audio_ready SSE event when calling POST /api/ai/tts/stream.",
     )
+    response_language: Optional[str] = Field(
+        None,
+        description="Language code for TTS (en, hi, ml, ta, etc.). Pass to POST /api/ai/tts/stream when requesting audio.",
+    )
     conversation_id: Optional[str] = Field(None, description="Conversation ID for this session")
 
 
