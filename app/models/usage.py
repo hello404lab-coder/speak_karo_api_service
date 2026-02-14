@@ -30,6 +30,8 @@ class Conversation(Base):
     user_id = Column(String, nullable=False, index=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+    # Long-term learner context (e.g. "preparing for IELTS"); injected into system instruction every turn
+    long_term_context = Column(Text, nullable=True)
     
     messages = relationship("Message", back_populates="conversation", cascade="all, delete-orphan")
     

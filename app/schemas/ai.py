@@ -8,12 +8,14 @@ class TextChatRequest(BaseModel):
     user_id: str = Field(..., description="User identifier")
     message: str = Field(..., min_length=1, max_length=1000, description="User message")
     conversation_id: Optional[str] = Field(None, description="Optional conversation ID for context")
+    learner_context: Optional[str] = Field(None, description="Optional long-term context (e.g. preparing for IELTS); stored on conversation and injected every turn")
 
 
 class VoiceChatRequest(BaseModel):
     """Request schema for voice chat endpoint."""
     user_id: str = Field(..., description="User identifier")
     conversation_id: Optional[str] = Field(None, description="Optional conversation ID for context")
+    learner_context: Optional[str] = Field(None, description="Optional long-term context (e.g. preparing for IELTS); stored on conversation and injected every turn")
 
 
 class AIChatResponse(BaseModel):

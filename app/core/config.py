@@ -56,6 +56,10 @@ class Settings(BaseSettings):
     llm_model: str = "gemini-2.5-flash"  # Gemini model for LLM (fast and efficient)
     llm_max_tokens: int = 200  # Increased for complete responses (Gemini 2.5 Flash supports up to 65,536)
     llm_temperature: float = 0.2
+    # Context: max input tokens for system + history + current message (trimming drops oldest first)
+    llm_context_token_budget: int = 16384
+    # DB layer: max exchanges to load from conversation (actual context length controlled by token budget)
+    llm_history_max_exchanges: int = 10
     
     # STT Settings
     stt_mode: Literal["faster_whisper_medium", "faster_whisper_large"] = "faster_whisper_large"  # Env: STT_MODE
@@ -63,7 +67,7 @@ class Settings(BaseSettings):
     
     # TTS Settings - Chatterbox-Turbo (English, https://huggingface.co/ResembleAI/chatterbox-turbo)
     # Device is auto-detected: cuda > mps > cpu. Requires a reference clip for voice cloning.
-    tts_audio_prompt_path: Optional[str] = "chirp3-hd-puck.wav"  # Path to ~10s reference WAV for voice cloning (required for Turbo)
+    tts_audio_prompt_path: Optional[str] = "chirp3-hd-sulafat.wav"  # Path to ~10s reference WAV for voice cloning (required for Turbo)
 
     # TTS Settings - IndicF5 (for Indic languages: hi, ml, ta)
     # Base directory containing ref WAVs (e.g. IndicF5/prompts or backend/assets/indicf5_prompts)

@@ -35,16 +35,36 @@ router = APIRouter()
 INIT_MODELS_TIMEOUT_SECONDS = 30000
 
 
-def get_or_create_conversation(user_id: str, conversation_id: Optional[str], db: Session) -> Conversation:
-    """Get existing conversation or create new one."""
+# Max length for long_term_context (append when client sends learner_context on existing conversation)
+LONG_TERM_CONTEXT_MAX_CHARS = 500
+
+
+def get_or_create_conversation(
+    user_id: str,
+    conversation_id: Optional[str],
+    db: Session,
+    learner_context: Optional[str] = None,
+) -> Conversation:
+    """Get existing conversation or create new one. Optionally set or append learner_context."""
     if conversation_id:
         conversation = db.query(Conversation).filter(Conversation.id == conversation_id).first()
         if conversation:
+            if learner_context and learner_context.strip():
+                existing = (conversation.long_term_context or "").strip()
+                if existing:
+                    new_context = (existing + "\n" + learner_context.strip()).strip()[:LONG_TERM_CONTEXT_MAX_CHARS]
+                else:
+                    new_context = learner_context.strip()[:LONG_TERM_CONTEXT_MAX_CHARS]
+                conversation.long_term_context = new_context or None
+                db.commit()
+                db.refresh(conversation)
             return conversation
-    
+
     # Create new conversation
     new_id = str(uuid.uuid4())
     conversation = Conversation(id=new_id, user_id=user_id)
+    if learner_context and learner_context.strip():
+        conversation.long_term_context = learner_context.strip()[:LONG_TERM_CONTEXT_MAX_CHARS]
     db.add(conversation)
     db.commit()
     db.refresh(conversation)
@@ -52,14 +72,15 @@ def get_or_create_conversation(user_id: str, conversation_id: Optional[str], db:
 
 
 def get_conversation_history(conversation_id: str, db: Session) -> list:
-    """Get last 5 messages from conversation for context."""
+    """Load last N exchanges from conversation (cap by count; LLM layer trims by token budget)."""
+    limit = settings.llm_history_max_exchanges
     messages = db.query(Message).filter(
         Message.conversation_id == conversation_id
-    ).order_by(Message.created_at.desc()).limit(5).all()
-    
+    ).order_by(Message.created_at.desc()).limit(limit).all()
+
     # Reverse to get chronological order
     messages.reverse()
-    
+
     history = []
     for msg in messages:
         history.append({
@@ -70,7 +91,7 @@ def get_conversation_history(conversation_id: str, db: Session) -> list:
             "role": "assistant",
             "content": msg.ai_reply
         })
-    
+
     return history
 
 
@@ -132,8 +153,10 @@ async def text_chat(
     """
     try:
         # Get or create conversation
-        conversation = get_or_create_conversation(request.user_id, request.conversation_id, db)
-        
+        conversation = get_or_create_conversation(
+            request.user_id, request.conversation_id, db, learner_context=request.learner_context
+        )
+
         # Get conversation history for context
         history = get_conversation_history(conversation.id, db)
 
@@ -143,7 +166,13 @@ async def text_chat(
         # Run sync inference in thread pool with timeouts so event loop is not blocked
         try:
             ai_response = await asyncio.wait_for(
-                asyncio.to_thread(generate_reply, request.message, history, response_language),
+                asyncio.to_thread(
+                    generate_reply,
+                    request.message,
+                    history,
+                    response_language,
+                    long_term_context=conversation.long_term_context,
+                ),
                 timeout=float(settings.llm_timeout_seconds),
             )
         except asyncio.TimeoutError:
@@ -188,6 +217,7 @@ async def text_chat(
 async def voice_chat(
     user_id: str = Form(...),
     conversation_id: Optional[str] = Form(None),
+    learner_context: Optional[str] = Form(None),
     audio_file: UploadFile = File(...),
     stt_mode: Optional[str] = Form(None),
     db: Session = Depends(get_db),
@@ -219,7 +249,9 @@ async def voice_chat(
             raise HTTPException(status_code=504, detail=TIMEOUT_MESSAGE)
 
         # Get or create conversation
-        conversation = get_or_create_conversation(user_id, conversation_id, db)
+        conversation = get_or_create_conversation(
+            user_id, conversation_id, db, learner_context=learner_context
+        )
 
         # Get conversation history
         history = get_conversation_history(conversation.id, db)
@@ -229,7 +261,13 @@ async def voice_chat(
 
         try:
             ai_response = await asyncio.wait_for(
-                asyncio.to_thread(generate_reply, transcribed_text, history, response_language),
+                asyncio.to_thread(
+                    generate_reply,
+                    transcribed_text,
+                    history,
+                    response_language,
+                    long_term_context=conversation.long_term_context,
+                ),
                 timeout=float(settings.llm_timeout_seconds),
             )
         except asyncio.TimeoutError:
@@ -326,7 +364,9 @@ async def chat_stream(
     user_id = request.user_id
     message = request.message.strip()
     conversation_id = request.conversation_id
-    conversation = get_or_create_conversation(user_id, conversation_id, db)
+    conversation = get_or_create_conversation(
+        user_id, conversation_id, db, learner_context=request.learner_context
+    )
     history = get_conversation_history(conversation.id, db)
     response_language = get_response_language(message, None)
 
@@ -337,7 +377,9 @@ async def chat_stream(
 
     def gemini_producer() -> None:
         try:
-            for token in stream_gemini_tokens(message, history, response_language):
+            for token in stream_gemini_tokens(
+                message, history, response_language, long_term_context=conversation.long_term_context
+            ):
                 loop.call_soon_threadsafe(token_queue.put_nowait, token)
             loop.call_soon_threadsafe(token_queue.put_nowait, None)
         except Exception as e:

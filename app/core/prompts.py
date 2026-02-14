@@ -1,7 +1,7 @@
 """Prompt templates for LLM interactions."""
 import json
 import re
-from typing import List, Dict
+from typing import List, Dict, Optional
 
 # Base schema for JSON output (used in system instruction)
 # Only reply_text is spoken (TTS/stream); correction is for display only.
@@ -52,24 +52,26 @@ INDIC_LANG_NAMES = {
 SYSTEM_PROMPT = SYSTEM_PROMPT_ENGLISH
 
 
-def get_system_instruction(response_language: str = "en") -> str:
-    """Returns the system string to be used in Gemini model config (system_instruction)."""
-    if response_language == "en":
-        return SYSTEM_PROMPT_ENGLISH
-    language_name = INDIC_LANG_NAMES.get(response_language, "Hindi")
-    return INDIC_PROMPT_TEMPLATE.format(
+def get_system_instruction(response_language: str = "en", long_term_context: Optional[str] = None) -> str:
+    """Returns the system string to be used in Gemini model config (system_instruction).
+    If long_term_context is provided, prepends it so the model always sees learner context.
+    """
+    base = SYSTEM_PROMPT_ENGLISH if response_language == "en" else INDIC_PROMPT_TEMPLATE.format(
         json_format=JSON_FORMAT_INSTRUCTION,
-        language_name=language_name,
+        language_name=INDIC_LANG_NAMES.get(response_language, "Hindi"),
     )
+    if long_term_context and long_term_context.strip():
+        return f"Known about this learner: {long_term_context.strip()}\n\n{base}"
+    return base
 
 
 def prepare_history(conversation_history: List[Dict[str, str]]) -> List[Dict[str, str]]:
     """
     Format history for Gemini: list of {"role": "user"|"model", "parts": [content]}.
-    Maps assistant -> model. Keeps last 6 turns for context.
+    Maps assistant -> model. No trimming here; LLM layer trims by token budget.
     """
     formatted = []
-    for msg in (conversation_history or [])[-6:]:
+    for msg in conversation_history or []:
         role = "user" if msg.get("role") == "user" else "model"
         content = msg.get("content", "")
         formatted.append({"role": role, "parts": [content]})
