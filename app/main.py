@@ -15,6 +15,11 @@ from app.core.config import settings
 from app.database import init_db
 from app.api.ai import router as ai_router
 
+import torch
+print("CUDA available inside app:", torch.cuda.is_available())
+print("CUDA device count:", torch.cuda.device_count())
+
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO if not settings.debug else logging.DEBUG,
