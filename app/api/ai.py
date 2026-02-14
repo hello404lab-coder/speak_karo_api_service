@@ -233,7 +233,8 @@ async def voice_chat(
         # Read audio file
         audio_bytes = await audio_file.read()
 
-        effective_stt_mode = stt_mode if stt_mode in ("faster_whisper_medium", "faster_whisper_large") else settings.stt_mode
+        # Use server STT_MODE (env) as single source of truth so voice-chat respects STT_MODE=openai_whisper_large_v3
+        effective_stt_mode = settings.stt_mode
         try:
             transcribed_text, detected_lang = await asyncio.wait_for(
                 asyncio.to_thread(

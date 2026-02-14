@@ -62,7 +62,7 @@ class Settings(BaseSettings):
     llm_history_max_exchanges: int = 10
     
     # STT Settings
-    stt_mode: Literal["faster_whisper_medium", "faster_whisper_large"] = "faster_whisper_large"  # Env: STT_MODE
+    stt_mode: Literal["faster_whisper_medium", "faster_whisper_large", "openai_whisper_large_v3"] = "openai_whisper_large_v3"  # Env: STT_MODE
     stt_faster_whisper_model_size: str = "medium"  # Used for faster_whisper_medium
     
     # TTS Settings - Chatterbox-Turbo (English, https://huggingface.co/ResembleAI/chatterbox-turbo)

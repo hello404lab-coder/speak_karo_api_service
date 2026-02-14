@@ -76,8 +76,12 @@ async def startup_event():
     # Log STT configuration
     if settings.stt_mode == "faster_whisper_large":
         logger.info("STT: faster_whisper_large (Systran/faster-whisper-large-v3, local)")
-    else:
+    elif settings.stt_mode == "openai_whisper_large_v3":
+        logger.info("STT: openai_whisper_large_v3 (Hugging Face Transformers, openai/whisper-large-v3)")
+    elif settings.stt_mode == "faster_whisper_medium":
         logger.info(f"STT: faster_whisper_medium (model: {settings.stt_faster_whisper_model_size}, CPU, int8)")
+    else:
+        logger.info(f"STT: {settings.stt_mode}")
     
     # Log LLM configuration
     if settings.gemini_api_key:
