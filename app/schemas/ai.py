@@ -20,8 +20,6 @@ class AIChatResponse(BaseModel):
     """Response schema for AI chat endpoints."""
     reply_text: str = Field(..., description="AI's natural reply")
     correction: str = Field(..., description="One correction (if any)")
-    hinglish_explanation: str = Field(..., description="Explanation in reply language only, no English words or quotes")
-    hinglish_explanation_show: str = Field(..., description="Explanation for frontend display; may include quoted English examples (e.g. 'Did you eat?')")
     score: int = Field(..., ge=0, le=100, description="Score out of 100")
     audio_url: Optional[str] = Field(
         None,

@@ -29,17 +29,6 @@ logger = logging.getLogger(__name__)
 # User-safe message for timeout (no stack traces or internal detail)
 TIMEOUT_MESSAGE = "Request took too long. Please try again."
 
-# Indic script pattern: when response_language is en, explanation must be English only
-_INDIC_SCRIPT_RE = re.compile(r"[\u0900-\u097F\u0D00-\u0D7F\u0B80-\u0BFF\u0C00-\u0C7F\u0C80-\u0CFF\u0980-\u09FF]")
-
-
-def _explanation_for_response(ai_response: dict, response_language: Optional[str]) -> str:
-    """When language is English, return English-only explanation; if model returned Indic text, use _show."""
-    expl = ai_response.get("hinglish_explanation", "")
-    if response_language == "en" and expl and _INDIC_SCRIPT_RE.search(expl):
-        return ai_response.get("hinglish_explanation_show", "") or expl
-    return expl
-
 router = APIRouter()
 
 # Max time for init-models (first-time load can be slow)
@@ -167,7 +156,7 @@ async def text_chat(
             user_message=request.message,
             ai_reply=ai_response["reply_text"],
             correction=ai_response.get("correction", ""),
-            hinglish_explanation=ai_response.get("hinglish_explanation", ""),
+            hinglish_explanation="",
             score=ai_response.get("score", 0)
         )
         db.add(message)
@@ -179,8 +168,6 @@ async def text_chat(
         return AIChatResponse(
             reply_text=ai_response["reply_text"],
             correction=ai_response.get("correction", ""),
-            hinglish_explanation=_explanation_for_response(ai_response, response_language),
-            hinglish_explanation_show=ai_response.get("hinglish_explanation_show", ""),
             score=ai_response.get("score", 75),
             audio_url=None,
             response_language=response_language,
@@ -255,7 +242,7 @@ async def voice_chat(
             user_message=transcribed_text,
             ai_reply=ai_response["reply_text"],
             correction=ai_response.get("correction", ""),
-            hinglish_explanation=ai_response.get("hinglish_explanation", ""),
+            hinglish_explanation="",
             score=ai_response.get("score", 0)
         )
         db.add(message)
@@ -266,8 +253,6 @@ async def voice_chat(
         return AIChatResponse(
             reply_text=ai_response["reply_text"],
             correction=ai_response.get("correction", ""),
-            hinglish_explanation=_explanation_for_response(ai_response, response_language),
-            hinglish_explanation_show=ai_response.get("hinglish_explanation_show", ""),
             score=ai_response.get("score", 75),
             audio_url=None,
             response_language=response_language,
@@ -334,7 +319,7 @@ async def chat_stream(
 ):
     """
     Sentence-level pipelined chat: stream Gemini tokens, buffer into sentences, TTS per sentence.
-    Only reply_text is streamed and sent to TTS; correction and hinglish_explanation are never spoken.
+    Only reply_text is streamed and sent to TTS; correction is never spoken.
     SSE: text_chunk (sentence for display), audio_chunk (WAV), then done, then audio_ready.
     Heartbeat every 500ms when waiting for next event.
     """
@@ -364,9 +349,9 @@ async def chat_stream(
     SENTENCE_BOUNDARIES = (".", "?", "\u0964", "\n")  # Purna Viram (।) = \u0964
 
     async def buffer_consumer() -> None:
-        # Only reply_text is streamed and sent to TTS; correction and hinglish_explanation are never pushed.
+        # Only reply_text is streamed and sent to TTS; correction is never pushed.
         buffer = ""
-        in_reply = True  # Free-form: start True so TTS gets content; JSON: set False until we see reply_text value
+        in_reply = False  # Only True after we see reply_text value (JSON) or detect free-form (no leading {)
         json_reply_started = False  # True after we strip "reply_text": " once
         full_reply_text_parts = []
         try:
@@ -380,11 +365,14 @@ async def chat_stream(
                 full_reply_text_parts.append(token)
                 buffer += token
 
-                # JSON: strip "reply_text": " prefix once so TTS never sees keys
+                # JSON: strip "reply_text": " prefix once so TTS/stream never see other keys (e.g. correction)
                 if not json_reply_started and '"reply_text": "' in buffer:
                     json_reply_started = True
                     in_reply = True
                     buffer = buffer.split('"reply_text": "')[-1]
+                # Free-form: no JSON prefix; treat as reply once we have content that doesn't look like JSON start
+                elif not json_reply_started and buffer.strip() and not buffer.strip().startswith("{"):
+                    in_reply = True
 
                 if not in_reply:
                     continue
@@ -514,7 +502,7 @@ async def chat_stream(
                     user_message=message,
                     ai_reply=parsed.get("reply_text", ""),
                     correction=parsed.get("correction", ""),
-                    hinglish_explanation=_explanation_for_response(parsed, response_language),
+                    hinglish_explanation="",
                     score=parsed.get("score", 75),
                 )
                 db.add(msg)

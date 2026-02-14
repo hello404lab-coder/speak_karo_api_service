@@ -4,14 +4,12 @@ import re
 from typing import List, Dict
 
 # Base schema for JSON output (used in system instruction)
-# Only reply_text is spoken (TTS/stream); correction and hinglish_explanation are for display only.
+# Only reply_text is spoken (TTS/stream); correction is for display only.
 JSON_FORMAT_INSTRUCTION = """
 Respond ONLY in valid JSON format with these keys:
 {
   "reply_text": "your response to the user (this is the ONLY part that will be spoken by TTS)",
   "correction": "correct English phrase or sentence (what they should say in English); empty string if no correction (display only, not spoken)",
-  "hinglish_explanation": "When replying in English: same as hinglish_explanation_show, English only. When replying in another language: same meaning but entirely in that language, no English words and no quotes.",
-  "hinglish_explanation_show": "short grammar/correction explanation for frontend display; may include quoted examples. When replying in English: English only (same as hinglish_explanation). Otherwise: in the reply language with quoted English examples allowed.",
   "score": 0-100 integer
 }
 """
@@ -25,21 +23,9 @@ RULES:
 3. If they made a mistake in English, give the correct English phrase in 'correction'. No labels.
 4. Speak naturally. End with a short question in 'reply_text' to keep them talking.
 5. Avoid filler like "Dont worry" or "Keep practicing" unless they seem discouraged.
-6. Only put spoken content in 'reply_text'. 'correction' and 'hinglish_explanation' are for on-screen reading only, never TTS.
-7. When replying in English, BOTH 'hinglish_explanation' and 'hinglish_explanation_show' must be in English only. No Hindi or any other language. Use the same text for both, or let hinglish_explanation_show include quoted English examples (e.g. 'I don't have'); hinglish_explanation must still be full English only, never Hindi."""
+6. Only put spoken content in 'reply_text'. 'correction' is for on-screen reading only, never TTS."""
 
-# Indic-only: user spoke Hindi/Malayalam/etc. -> reply in that language, but tutor ENGLISH (correction = correct English; explanation = how to say it in English, in their language)
-# INDIC_PROMPT_TEMPLATE = """You are a warm English tutor on a voice call with an Indian learner who is speaking {language_name}. Your goal is to help them practice and improve their English. You reply in {language_name} so they feel at ease, but you always teach and correct English.
-# {json_format}
-# RULES:
-# 1. In 'reply_text' respond ENTIRELY in {language_name}. No English mixing. The learner will hear this via TTS. Keep it brief and natural.
-# 2. In 'correction' give the correct way to say it IN ENGLISH (the English phrase or sentence they should use). Do not correct their {language_name}; correct or supply the English equivalent. If they said something in {language_name}, give the proper English for that idea. If they tried English and got it wrong, give the correct English.
-# 3. In 'hinglish_explanation' write entirely in {language_name} with NO English words and NO quotes (no '...'): explain how to say it in English but express everything in {language_name} (transliterate or paraphrase any English). In 'hinglish_explanation_show' write the same for frontend display; you MAY include English phrases in quotes (e.g. 'Did you eat?') in hinglish_explanation_show so the learner sees the English. Only 'reply_text' is spoken by TTS.
-# 4. Be brief but use flowing, natural sentences in 'reply_text'.
-# 5. Avoid short one-word openings. Merge the greeting into the first sentence so the voice sounds natural.
-# 6. Speak naturally. End with a short question in {language_name} in 'reply_text'.
-# 7. Avoid filler unless they seem discouraged.
-# """
+# Indic-only: user spoke Hindi/Malayalam/etc. -> reply in that language, but tutor ENGLISH (correction = correct English)
 INDIC_PROMPT_TEMPLATE = """You are a warm English tutor on a voice call with an Indian learner who is speaking {language_name}. 
 Your goal is to teach them English by bridging it from {language_name}.
 
@@ -47,14 +33,9 @@ Your goal is to teach them English by bridging it from {language_name}.
 
 RULES:
 1. FOCUS: Every response MUST teach an English phrase. If the user speaks {language_name}, your goal is to show them how to say that same thought in English.
-2. 'reply_text' (SPOKEN): Respond ENTIRELY in {language_name}. Merge greetings: "ഹലോ, നമുക്ക് ഇന്ന് പുതിയൊരു കാര്യം പഠിച്ചാലോ?".
+2. 'reply_text' (SPOKEN): Respond ENTIRELY in {language_name}. Merge greetings naturally.
 3. 'correction' (DISPLAY ONLY): Provide the correct English sentence using Latin/English characters (e.g., "How are you?").
-4. 'hinglish_explanation' (SPOKEN via TTS): This is for the learner's ears. Write ENTIRELY in {language_name} script. 
-   - CRITICAL: Never use English letters (A-Z). 
-   - If you mention an English word, TRANSLITERATE it into {language_name} script. 
-   - Example: Instead of "You can say 'Thank you'", write "നിങ്ങൾക്ക് താങ്ക് യൂ എന്ന് പറയാം".
-5. 'hinglish_explanation_show' (DISPLAY ONLY): Write the explanation for the screen. Use {language_name} but keep English phrases in quotes and English script (e.g., "നിങ്ങൾക്ക് 'Thank you' എന്ന് പറയാം").
-6. BE A TUTOR: Do not just chat. If they are correct, congratulate them and give them a slightly more advanced way to say the same thing in English.
+4. BE A TUTOR: Do not just chat. If they are correct, congratulate them and give them a slightly more advanced way to say the same thing in English.
 """
 
 # Language code to display name for prompt
@@ -122,18 +103,15 @@ def _extract_json_string_value(raw: str, key: str) -> str:
 def parse_gemini_response(response_text: str) -> Dict[str, any]:
     """
     Parse JSON from Gemini response. Handles optional markdown code fences.
-    Returns dict with reply_text, correction, hinglish_explanation, hinglish_explanation_show, score.
+    Returns dict with reply_text, correction, score.
     When full JSON parse fails (e.g. truncated stream), tries to extract fields from raw text
     so reply_text is never the raw JSON string.
     """
     clean = re.sub(r"```json\s?|\s?```", "", response_text.strip()).strip()
     try:
         data = json.loads(clean)
-        # Normalize keys (model might return "explanation" instead of "hinglish_explanation")
         reply_text = data.get("reply_text") or data.get("reply", "")
         correction = data.get("correction") or ""
-        hinglish_explanation = data.get("hinglish_explanation") or data.get("explanation") or ""
-        hinglish_explanation_show = data.get("hinglish_explanation_show") or hinglish_explanation or ""
         score = data.get("score", 70)
         if not isinstance(score, int):
             try:
@@ -144,23 +122,16 @@ def parse_gemini_response(response_text: str) -> Dict[str, any]:
         return {
             "reply_text": (reply_text or "").strip() or _extract_json_string_value(clean, "reply_text"),
             "correction": (correction or "").strip(),
-            "hinglish_explanation": (hinglish_explanation or "").strip(),
-            "hinglish_explanation_show": (hinglish_explanation_show or "").strip(),
             "score": score,
         }
     except Exception:
-        # Fallback: extract fields from raw text so we don't put raw JSON into reply_text
         reply_text = _extract_json_string_value(clean, "reply_text")
         correction = _extract_json_string_value(clean, "correction")
-        hinglish_explanation = _extract_json_string_value(clean, "hinglish_explanation")
-        hinglish_explanation_show = _extract_json_string_value(clean, "hinglish_explanation_show") or hinglish_explanation
         score_str = re.search(r'"score"\s*:\s*(\d+)', clean)
         score = int(score_str.group(1)) if score_str else 70
         score = max(0, min(100, score))
         return {
             "reply_text": reply_text.strip() or "I couldn't process that.",
             "correction": correction.strip(),
-            "hinglish_explanation": hinglish_explanation.strip(),
-            "hinglish_explanation_show": hinglish_explanation_show.strip(),
             "score": score,
         }

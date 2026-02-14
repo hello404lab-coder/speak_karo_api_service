@@ -14,7 +14,6 @@ You get:
 {
   "reply_text": "That's great! You could say...",
   "correction": "...",
-  "hinglish_explanation": "...",
   "score": 75,
   "audio_url": null,
   "conversation_id": "uuid-..."
@@ -65,23 +64,19 @@ Chunk payloads are base64-encoded WAV (sample rate from the engine, typically 24
 
 ### 1. Chat returns text only; audio_url is always null
 
-Call **text-chat** or **voice-chat** as usual. You get **`reply_text`**, **`correction`**, **`hinglish_explanation`**, **`score`**, and **`conversation_id`**. **`audio_url` is always `null`** in this response. Do not use it for playback.
+Call **text-chat** or **voice-chat** as usual. You get **`reply_text`**, **`correction`**, **`score`**, and **`conversation_id`**. **`audio_url` is always `null`** in this response. Do not use it for playback.
 
 ### 2. Get audio by calling the streaming endpoint
 
-After you have the reply text (and optionally correction/explanation), call **`POST /api/ai/tts/stream`** with that text to generate and stream audio. The **audio URL is only provided in the `audio_ready` SSE event** from this endpoint, not in the initial chat response.
+After you have the reply text, call **`POST /api/ai/tts/stream`** with **reply_text only** (do not include correction) to generate and stream audio. The **audio URL is only provided in the `audio_ready` SSE event** from this endpoint, not in the initial chat response.
 
 ```javascript
-// Build the same string the backend would use for TTS (reply + optional explanation)
-const textForTts = data.hinglish_explanation?.trim()
-  ? `${data.reply_text}. ... ${data.hinglish_explanation}`
-  : data.reply_text;
-
+// Use reply_text only for TTS (do not include correction)
 const response = await fetch('/api/ai/tts/stream', {
   method: 'POST',
   headers: { 'Content-Type': 'application/json' },
   body: JSON.stringify({
-    text: textForTts,
+    text: data.reply_text,
     response_language: 'en', // or from your app/lang detection
   }),
 });
@@ -184,9 +179,7 @@ You can also append each decoded WAV to a buffer, build a single WAV blob when t
 
 ```javascript
 // After you have data from text-chat or voice-chat
-const textForTts = data.hinglish_explanation?.trim()
-  ? `${data.reply_text}. ... ${data.hinglish_explanation}`
-  : data.reply_text;
+const textForTts = data.reply_text;
 
 const response = await fetch('/api/ai/tts/stream', {
   method: 'POST',

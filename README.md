@@ -160,7 +160,6 @@ Content-Type: application/json
 {
   "reply_text": "Hello! I understand you want to go to the market.",
   "correction": "I am go to market → I am going to the market",
-  "hinglish_explanation": "Yahan 'going' use karna chahiye kyunki yeh present continuous tense hai.",
   "score": 75,
   "audio_url": "http://localhost:8000/audio/abc123.mp3",
   "conversation_id": "conv-123"

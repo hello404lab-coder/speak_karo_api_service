@@ -161,7 +161,7 @@ def generate_reply(
         response_language: "en" for English-only, or "hi"/"ml"/"ta"/etc. for full Indic response
 
     Returns:
-        Dict with reply_text, correction, hinglish_explanation, score
+        Dict with reply_text, correction, score
     """
     if conversation_history is None:
         conversation_history = []
@@ -279,8 +279,6 @@ def generate_reply(
         return {
             "reply_text": "I'm having trouble responding right now. Please try again in a moment.",
             "correction": "",
-            "hinglish_explanation": "",
-            "hinglish_explanation_show": "",
             "score": 0
         }
     except Exception as e:
@@ -288,7 +286,5 @@ def generate_reply(
         return {
             "reply_text": "Something went wrong. Please try again.",
             "correction": "",
-            "hinglish_explanation": "",
-            "hinglish_explanation_show": "",
             "score": 0
         }

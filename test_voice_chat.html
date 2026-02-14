@@ -545,13 +545,8 @@
                     document.getElementById('correctionItem').style.display = 'none';
                 }
                 
-                // Show explanation if available
-                if (data.hinglish_explanation && data.hinglish_explanation.trim()) {
-                    document.getElementById('explanationText').textContent = data.hinglish_explanation;
-                    document.getElementById('explanationItem').style.display = 'block';
-                } else {
-                    document.getElementById('explanationItem').style.display = 'none';
-                }
+                // Explanation removed from API; hide explanation section
+                document.getElementById('explanationItem').style.display = 'none';
                 
                 // Set audio URL
                 if (data.audio_url) {
