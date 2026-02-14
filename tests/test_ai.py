@@ -56,6 +56,7 @@ def test_text_chat_happy_path(mock_db, mock_llm):
         "reply_text": "Hello! How are you today?",
         "correction": "",
         "hinglish_explanation": "",
+        "hinglish_explanation_show": "",
         "score": 85
     }
     

@@ -15,7 +15,7 @@ from fastapi.responses import StreamingResponse
 from pydub import AudioSegment
 from sqlalchemy.orm import Session
 from app.core.config import settings
-from app.core.prompts import parse_llm_response
+from app.core.prompts import parse_gemini_response
 from app.database import get_db
 from app.schemas.ai import TextChatRequest, AIChatResponse, TTSStreamRequest
 from app.services.llm import generate_reply, stream_gemini_tokens, init_llm_client
@@ -28,6 +28,17 @@ logger = logging.getLogger(__name__)
 
 # User-safe message for timeout (no stack traces or internal detail)
 TIMEOUT_MESSAGE = "Request took too long. Please try again."
+
+# Indic script pattern: when response_language is en, explanation must be English only
+_INDIC_SCRIPT_RE = re.compile(r"[\u0900-\u097F\u0D00-\u0D7F\u0B80-\u0BFF\u0C00-\u0C7F\u0C80-\u0CFF\u0980-\u09FF]")
+
+
+def _explanation_for_response(ai_response: dict, response_language: Optional[str]) -> str:
+    """When language is English, return English-only explanation; if model returned Indic text, use _show."""
+    expl = ai_response.get("hinglish_explanation", "")
+    if response_language == "en" and expl and _INDIC_SCRIPT_RE.search(expl):
+        return ai_response.get("hinglish_explanation_show", "") or expl
+    return expl
 
 router = APIRouter()
 
@@ -168,7 +179,8 @@ async def text_chat(
         return AIChatResponse(
             reply_text=ai_response["reply_text"],
             correction=ai_response.get("correction", ""),
-            hinglish_explanation=ai_response.get("hinglish_explanation", ""),
+            hinglish_explanation=_explanation_for_response(ai_response, response_language),
+            hinglish_explanation_show=ai_response.get("hinglish_explanation_show", ""),
             score=ai_response.get("score", 75),
             audio_url=None,
             response_language=response_language,
@@ -254,7 +266,8 @@ async def voice_chat(
         return AIChatResponse(
             reply_text=ai_response["reply_text"],
             correction=ai_response.get("correction", ""),
-            hinglish_explanation=ai_response.get("hinglish_explanation", ""),
+            hinglish_explanation=_explanation_for_response(ai_response, response_language),
+            hinglish_explanation_show=ai_response.get("hinglish_explanation_show", ""),
             score=ai_response.get("score", 75),
             audio_url=None,
             response_language=response_language,
@@ -321,8 +334,9 @@ async def chat_stream(
 ):
     """
     Sentence-level pipelined chat: stream Gemini tokens, buffer into sentences, TTS per sentence.
+    Only reply_text is streamed and sent to TTS; correction and hinglish_explanation are never spoken.
     SSE: text_chunk (sentence for display), audio_chunk (WAV), then done, then audio_ready.
-    Reply-only TTS (stops at Correction/Hinglish). Heartbeat every 500ms when waiting for next event.
+    Heartbeat every 500ms when waiting for next event.
     """
     user_id = request.user_id
     message = request.message.strip()
@@ -345,9 +359,15 @@ async def chat_stream(
             logger.exception("Gemini stream error")
             loop.call_soon_threadsafe(main_queue.put_nowait, ("error", str(e)))
 
+    # Minimum chars before sending a sentence to TTS (avoids single-word fragments, improves prosody)
+    MIN_SENTENCE_CHARS = 25
+    SENTENCE_BOUNDARIES = (".", "?", "\u0964", "\n")  # Purna Viram (।) = \u0964
+
     async def buffer_consumer() -> None:
+        # Only reply_text is streamed and sent to TTS; correction and hinglish_explanation are never pushed.
         buffer = ""
-        in_reply = True
+        in_reply = True  # Free-form: start True so TTS gets content; JSON: set False until we see reply_text value
+        json_reply_started = False  # True after we strip "reply_text": " once
         full_reply_text_parts = []
         try:
             while True:
@@ -359,29 +379,59 @@ async def chat_stream(
                     break
                 full_reply_text_parts.append(token)
                 buffer += token
-                while True:
-                    idx = -1
-                    for sep in (".", "!", "?", "\n"):
-                        i = buffer.find(sep)
-                        if i >= 0 and (idx < 0 or i < idx):
-                            idx = i
-                    if idx < 0:
-                        break
-                    sentence = buffer[: idx + 1].strip()
-                    buffer = buffer[idx + 1 :].lstrip()
-                    if not sentence:
-                        continue
-                    for line in sentence.split("\n"):
-                        if _is_section_header(line.strip()):
-                            in_reply = False
-                            break
-                    if in_reply and sentence:
+
+                # JSON: strip "reply_text": " prefix once so TTS never sees keys
+                if not json_reply_started and '"reply_text": "' in buffer:
+                    json_reply_started = True
+                    in_reply = True
+                    buffer = buffer.split('"reply_text": "')[-1]
+
+                if not in_reply:
+                    continue
+
+                # JSON: end of reply_text value (closing quote)
+                end_quote_idx = buffer.find('"')
+                if json_reply_started and end_quote_idx >= 0:
+                    sentence = buffer[:end_quote_idx].strip()
+                    if sentence:
                         main_queue.put_nowait(("text", sentence))
                         sentence_queue.put_nowait(sentence)
+                    in_reply = False
+                    buffer = buffer[end_quote_idx + 1 :].lstrip()
+                    continue
+
+                # Sentence boundaries: first of . ! ? । \n
+                idx = -1
+                for sep in SENTENCE_BOUNDARIES:
+                    i = buffer.find(sep)
+                    if i >= 0 and (idx < 0 or i < idx):
+                        idx = i
+                if idx >= 0:
+                    sentence = buffer[: idx + 1].strip()
+                    # Smoothness: don't send very short fragments unless we'll never get more
+                    if len(sentence) < MIN_SENTENCE_CHARS:
+                        continue
+                    # Free-form only: stop at Correction/Hinglish section headers
+                    if not json_reply_started:
+                        for line in sentence.split("\n"):
+                            if _is_section_header(line.strip()):
+                                in_reply = False
+                                break
+                        if not in_reply:
+                            continue
+                    buffer = buffer[idx + 1 :].lstrip()
+                    if sentence:
+                        main_queue.put_nowait(("text", sentence))
+                        sentence_queue.put_nowait(sentence)
+
+            # End-of-stream flush
             if buffer.strip() and in_reply:
                 sent = buffer.strip()
-                main_queue.put_nowait(("text", sent))
-                sentence_queue.put_nowait(sent)
+                if json_reply_started:
+                    sent = sent.replace('"', '').replace('}', '').strip()
+                if sent:
+                    main_queue.put_nowait(("text", sent))
+                    sentence_queue.put_nowait(sent)
             full_reply_text = "".join(full_reply_text_parts)
             main_queue.put_nowait(("full_text", full_reply_text))
             sentence_queue.put_nowait(None)
@@ -458,13 +508,13 @@ async def chat_stream(
 
         if full_reply_text:
             try:
-                parsed = parse_llm_response(full_reply_text)
+                parsed = parse_gemini_response(full_reply_text)
                 msg = Message(
                     conversation_id=conversation.id,
                     user_message=message,
                     ai_reply=parsed.get("reply_text", ""),
                     correction=parsed.get("correction", ""),
-                    hinglish_explanation=parsed.get("hinglish_explanation", ""),
+                    hinglish_explanation=_explanation_for_response(parsed, response_language),
                     score=parsed.get("score", 75),
                 )
                 db.add(msg)

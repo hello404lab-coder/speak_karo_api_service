@@ -87,7 +87,7 @@ def _generate_presigned_url(s3_key: str) -> Optional[str]:
             's3',
             aws_access_key_id=settings.aws_access_key_id,
             aws_secret_access_key=settings.aws_secret_access_key,
-            region_name=settings.aws_region or 'us-east-1'
+            region_name=settings.aws_region or 'ap-south-1'
         )
         url = s3_client.generate_presigned_url(
             'get_object',

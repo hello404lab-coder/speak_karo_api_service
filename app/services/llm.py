@@ -6,7 +6,7 @@ from typing import Iterator, List, Dict, Optional
 from google import genai
 from google.genai import types
 from app.core.config import settings
-from app.core.prompts import build_conversation_prompt, parse_llm_response
+from app.core.prompts import get_system_instruction, prepare_history, parse_gemini_response
 from app.services.cache import get_json, set_json
 
 logger = logging.getLogger(__name__)
@@ -47,40 +47,23 @@ def init_llm_client() -> dict:
         return {"status": "failed", "error": str(e)}
 
 
-def _convert_messages_to_gemini_format(messages: List[Dict[str, str]]) -> List[types.Content]:
+def _history_to_contents(history_formatted: List[Dict]) -> List[types.Content]:
     """
-    Convert chat messages to Gemini format.
-    
-    Args:
-        messages: List of message dicts with 'role' and 'content'
-    
-    Returns:
-        List of Gemini Content objects
+    Convert prepare_history() output to Gemini Content list.
+    history_formatted: list of {"role": "user"|"model", "parts": [content]}
     """
-    gemini_contents = []
-    
-    for msg in messages:
+    contents = []
+    for msg in history_formatted:
         role = msg.get("role", "user")
-        content = msg.get("content", "")
-        
-        # Gemini uses "user" and "model" roles (not "system" or "assistant")
-        if role == "system":
-            # System messages are handled via system_instruction in Gemini
-            # For now, we'll prepend it to the first user message
-            continue
-        elif role == "assistant":
-            gemini_role = "model"
-        else:
-            gemini_role = "user"
-        
-        gemini_contents.append(
+        parts = msg.get("parts", [])
+        text = parts[0] if parts else ""
+        contents.append(
             types.Content(
-                role=gemini_role,
-                parts=[types.Part.from_text(text=content)]
+                role=role,
+                parts=[types.Part.from_text(text=text)],
             )
         )
-    
-    return gemini_contents
+    return contents
 
 
 def _generate_cache_key(
@@ -122,18 +105,18 @@ def stream_gemini_tokens(
 ) -> Iterator[str]:
     """
     Stream Gemini response as text deltas (tokens). No caching.
-    Caller is responsible for sentence buffering and TTS coordination.
+    No JSON mode for stream; caller parses full reply with parse_gemini_response (tries JSON then fallback).
     """
     if conversation_history is None:
         conversation_history = []
     try:
         client = _get_gemini_client()
-        messages = build_conversation_prompt(user_message, conversation_history, response_language)
-        system_instruction = None
-        if messages and messages[0].get("role") == "system":
-            system_instruction = messages[0].get("content", "")
-            messages = messages[1:]
-        contents = _convert_messages_to_gemini_format(messages)
+        system_instruction = get_system_instruction(response_language)
+        history_formatted = prepare_history(conversation_history)
+        contents = _history_to_contents(history_formatted)
+        contents.append(
+            types.Content(role="user", parts=[types.Part.from_text(text=user_message)])
+        )
         safety_settings = _build_safety_settings()
         config_dict = {
             "thinking_config": genai.types.ThinkingConfig(thinking_budget=0),
@@ -191,39 +174,31 @@ def generate_reply(
         return cached_response
     
     try:
-        # Get Gemini client
         client = _get_gemini_client()
-        
-        # Build messages (prompt depends on response_language: English vs Indic)
-        messages = build_conversation_prompt(user_message, conversation_history, response_language)
-        
-        # Extract system prompt (first message if role is "system")
-        system_instruction = None
-        if messages and messages[0].get("role") == "system":
-            system_instruction = messages[0].get("content", "")
-            messages = messages[1:]  # Remove system message from conversation
-        
-        # Convert to Gemini format
-        contents = _convert_messages_to_gemini_format(messages)
-        
+        system_instruction = get_system_instruction(response_language)
+        history_formatted = prepare_history(conversation_history)
+        contents = _history_to_contents(history_formatted)
+        contents.append(
+            types.Content(role="user", parts=[types.Part.from_text(text=user_message)])
+        )
+
         logger.info(f"Calling Gemini LLM API with model: {settings.llm_model}")
-        
+
         safety_settings = _build_safety_settings()
         if safety_settings is not None:
             logger.debug("Safety settings configured to block only HIGH probability content")
-        
-        # Build config with optional safety settings
+
         config_dict = {
             "thinking_config": genai.types.ThinkingConfig(thinking_budget=0),
             "system_instruction": system_instruction,
+            "response_mime_type": "application/json",
             "max_output_tokens": settings.llm_max_tokens,
             "temperature": settings.llm_temperature,
         }
         if safety_settings is not None:
             config_dict["safety_settings"] = safety_settings
-        
-        # Call Gemini API
-        logger.debug(f"Calling Gemini with {len(contents)} content items, system_instruction length: {len(system_instruction) if system_instruction else 0}")
+
+        logger.debug(f"Calling Gemini with {len(contents)} content items, system_instruction length: {len(system_instruction)}")
         response = client.models.generate_content(
             model=settings.llm_model,
             contents=contents,
@@ -292,8 +267,8 @@ def generate_reply(
             logger.warning(f"Response seems unusually short ({len(response_text)} chars). Finish reason: {finish_reason_str}")
             logger.warning(f"Full response text: {response_text}")
         
-        # Parse response
-        parsed = parse_llm_response(response_text)
+        # Parse response (JSON from Gemini)
+        parsed = parse_gemini_response(response_text)
         
         # Cache result
         set_json(cache_key, parsed, settings.llm_cache_ttl)
@@ -305,6 +280,7 @@ def generate_reply(
             "reply_text": "I'm having trouble responding right now. Please try again in a moment.",
             "correction": "",
             "hinglish_explanation": "",
+            "hinglish_explanation_show": "",
             "score": 0
         }
     except Exception as e:
@@ -313,5 +289,6 @@ def generate_reply(
             "reply_text": "Something went wrong. Please try again.",
             "correction": "",
             "hinglish_explanation": "",
+            "hinglish_explanation_show": "",
             "score": 0
         }
