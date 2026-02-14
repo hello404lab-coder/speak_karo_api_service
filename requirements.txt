@@ -15,7 +15,7 @@ pydub==0.25.1
 faster-whisper==1.2.1
 # TTS: Chatterbox-Turbo (English). PyPI chatterbox-tts does NOT include tts_turbo; install from GitHub to get ChatterboxTurboTTS.
 # https://github.com/resemble-ai/chatterbox (src/chatterbox/tts_turbo.py exists only in source)
-git+https://github.com/resemble-ai/chatterbox.git
+# git+https://github.com/resemble-ai/chatterbox.git
 # Watermarker required by ChatterboxTTS; in some envs PerthImplicitWatermarker is None, we patch to DummyWatermarker
 resemble-perth
 # IndicF5 TTS for Indic languages (hi, ml, ta). Install with: pip install git+https://github.com/ai4bharat/IndicF5.git
