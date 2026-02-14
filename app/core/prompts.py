@@ -1,26 +1,42 @@
 """Prompt templates for LLM interactions."""
+import json
 import re
-from typing import List, Dict
+from typing import List, Dict, Optional
+
+# Base schema for JSON output (used in system instruction)
+# Only reply_text is spoken (TTS/stream); correction is for display only.
+JSON_FORMAT_INSTRUCTION = """
+Respond ONLY in valid JSON format with these keys:
+{
+  "reply_text": "your response to the user (this is the ONLY part that will be spoken by TTS)",
+  "correction": "correct English phrase or sentence (what they should say in English); empty string if no correction (display only, not spoken)",
+  "score": 0-100 integer
+}
+"""
 
 # English-only: user spoke English only -> respond only in English, Chatterbox TTS
-SYSTEM_PROMPT_ENGLISH = """You are a warm English speaking buddy on a voice call with an Indian learner.
+SYSTEM_PROMPT_ENGLISH = f"""You are a warm English tutor on a voice call with an Indian learner. Your goal is to help them practice and improve their English.
+{JSON_FORMAT_INSTRUCTION}
+RULES:
+1. Respond ONLY in English in 'reply_text'. No Hindi or other Indian languages.
+2. Be brief: 2-4 short sentences. Under 50 words.
+3. If they made a mistake in English, give the correct English phrase in 'correction'. No labels.
+4. Speak naturally. End with a short question in 'reply_text' to keep them talking.
+5. Avoid filler like "Dont worry" or "Keep practicing" unless they seem discouraged.
+6. Only put spoken content in 'reply_text'. 'correction' is for on-screen reading only, never TTS."""
+
+# Indic-only: user spoke Hindi/Malayalam/etc. -> reply in that language, but tutor ENGLISH (correction = correct English)
+INDIC_PROMPT_TEMPLATE = """You are a warm English tutor on a voice call with an Indian learner who is speaking {language_name}. 
+Your goal is to teach them English by bridging it from {language_name}.
+
+{json_format}
 
 RULES:
-1. Respond ONLY in English. No Hindi or other Indian languages.
-2. Be brief: 2-4 short sentences. Under 50 words.
-3. If they made a mistake, give one quick correction and move on. No labels like "Correction:".
-4. Speak naturally. End with a short question to keep them talking.
-5. Avoid filler like "Dont worry" or "Keep practicing" unless they seem discouraged."""
-
-# Indic-only: user spoke Hindi/Malayalam/etc. -> respond entirely in that language, IndicF5 TTS
-INDIC_PROMPT_TEMPLATE = """You are a warm speaking buddy on a voice call with an Indian learner.
-
-RULES:
-1. Respond ENTIRELY in {language_name}. No English mixing. The learner will hear this in their language via TTS.
-2. Be brief: 2-4 short sentences. Under 50 words.
-3. If they made a mistake, give one quick correction in {language_name} and move on. No labels.
-4. Speak naturally. End with a short question in {language_name} to keep them talking.
-5. Avoid filler unless they seem discouraged."""
+1. FOCUS: Every response MUST teach an English phrase. If the user speaks {language_name}, your goal is to show them how to say that same thought in English.
+2. 'reply_text' (SPOKEN): Respond ENTIRELY in {language_name}. Merge greetings naturally.
+3. 'correction' (DISPLAY ONLY): Provide the correct English sentence using Latin/English characters (e.g., "How are you?").
+4. BE A TUTOR: Do not just chat. If they are correct, congratulate them and give them a slightly more advanced way to say the same thing in English.
+"""
 
 # Language code to display name for prompt
 INDIC_LANG_NAMES = {
@@ -36,166 +52,88 @@ INDIC_LANG_NAMES = {
 SYSTEM_PROMPT = SYSTEM_PROMPT_ENGLISH
 
 
-def build_conversation_prompt(
-    user_message: str,
-    conversation_history: List[Dict[str, str]],
-    response_language: str = "en",
-) -> List[Dict[str, str]]:
+def get_system_instruction(response_language: str = "en", long_term_context: Optional[str] = None) -> str:
+    """Returns the system string to be used in Gemini model config (system_instruction).
+    If long_term_context is provided, prepends it so the model always sees learner context.
     """
-    Build conversation messages for LLM API.
+    base = SYSTEM_PROMPT_ENGLISH if response_language == "en" else INDIC_PROMPT_TEMPLATE.format(
+        json_format=JSON_FORMAT_INSTRUCTION,
+        language_name=INDIC_LANG_NAMES.get(response_language, "Hindi"),
+    )
+    if long_term_context and long_term_context.strip():
+        return f"Known about this learner: {long_term_context.strip()}\n\n{base}"
+    return base
 
-    Args:
-        user_message: Current user message
-        conversation_history: List of previous messages with 'role' and 'content'
-        response_language: "en" for English-only response, or "hi"/"ml"/"ta"/etc. for full Indic
 
-    Returns:
-        List of message dicts for LLM API
+def prepare_history(conversation_history: List[Dict[str, str]]) -> List[Dict[str, str]]:
     """
-    if response_language == "en":
-        system_content = SYSTEM_PROMPT_ENGLISH
-    else:
-        language_name = INDIC_LANG_NAMES.get(response_language, "Hindi")
-        system_content = INDIC_PROMPT_TEMPLATE.format(language_name=language_name)
-
-    messages = [
-        {"role": "system", "content": system_content}
-    ]
-    
-    # Add conversation history (last 5 messages for context)
-    for msg in conversation_history[-5:]:
-        messages.append({
-            "role": msg.get("role", "user"),
-            "content": msg.get("content", "")
-        })
-    
-    # Add current message
-    messages.append({
-        "role": "user",
-        "content": user_message
-    })
-    
-    return messages
-
-
-def parse_llm_response(response_text: str) -> Dict[str, str]:
+    Format history for Gemini: list of {"role": "user"|"model", "parts": [content]}.
+    Maps assistant -> model. No trimming here; LLM layer trims by token budget.
     """
-    Parse LLM response into structured format.
-    
-    Expected format (flexible parsing):
-    - Reply text
-    - Correction (if any)
-    - Hinglish explanation
-    - Score (0-100)
-    
-    Args:
-        response_text: Raw LLM response
-    
-    Returns:
-        Dict with reply_text, correction, hinglish_explanation, score
+    formatted = []
+    for msg in conversation_history or []:
+        role = "user" if msg.get("role") == "user" else "model"
+        content = msg.get("content", "")
+        formatted.append({"role": role, "parts": [content]})
+    return formatted
+
+
+def _extract_json_string_value(raw: str, key: str) -> str:
+    """Extract the first JSON string value for key from raw text (e.g. "reply_text": "...").
+    Handles escaped quotes inside the value. Returns empty string if not found.
     """
-    # Simple parsing - LLM should follow format, but we'll be flexible
-    lines = response_text.strip().split('\n')
-    
-    reply_text = ""
-    correction = ""
-    hinglish_explanation = ""
-    score = 75  # Default score
-    
-    current_section = "reply"
-    
-    for line in lines:
-        line = line.strip()
-        if not line:
+    pattern = rf'"{re.escape(key)}"\s*:\s*"'
+    m = re.search(pattern, raw)
+    if not m:
+        return ""
+    start = m.end()
+    result = []
+    i = start
+    while i < len(raw):
+        c = raw[i]
+        if c == "\\" and i + 1 < len(raw):
+            result.append(raw[i + 1])
+            i += 2
             continue
-            
-        # Clean markdown formatting
-        line = re.sub(r'\*\*([^*]+)\*\*', r'\1', line)  # Remove **bold**
-        line = re.sub(r'\*([^*]+)\*', r'\1', line)  # Remove *italic*
-        line = line.strip()
-        
-        # Try to detect sections - look for explicit headers (but remove them)
-        line_lower = line.lower()
-        if line_lower.startswith("**correction:**") or line_lower.startswith("correction:") or line_lower.startswith("correction"):
-            current_section = "correction"
-            # Remove the header from the line
-            line = re.sub(r'^(\*\*)?correction(\*\*)?:?\s*', '', line, flags=re.IGNORECASE).strip()
-        elif line_lower.startswith("**hinglish explanation:**") or line_lower.startswith("hinglish explanation:") or line_lower.startswith("**hinglish:**") or line_lower.startswith("hinglish:") or line_lower.startswith("hinglish explanation"):
-            current_section = "explanation"
-            # Remove the header from the line
-            line = re.sub(r'^(\*\*)?(hinglish\s+)?explanation(\*\*)?:?\s*', '', line, flags=re.IGNORECASE).strip()
-        elif line_lower.startswith("**improved sentence:**") or line_lower.startswith("improved sentence:") or line_lower.startswith("improved sentence"):
-            # Skip improved sentence section for now
-            continue
-        elif line_lower.startswith("**reply:**") or line_lower.startswith("reply:") or line_lower.startswith("reply"):
-            current_section = "reply"
-            # Remove the header from the line
-            line = re.sub(r'^(\*\*)?reply(\*\*)?:?\s*', '', line, flags=re.IGNORECASE).strip()
-        elif any(keyword in line_lower for keyword in ["correction", "mistake", "wrong"]) and current_section == "reply" and len(line) > 20:
-            current_section = "correction"
-        elif any(keyword in line_lower for keyword in ["hinglish", "explanation", "matlab", "ka matlab"]) and current_section != "explanation" and len(line) > 20:
-            current_section = "explanation"
-        elif any(keyword in line_lower for keyword in ["score", "rating"]):
-            # Try to extract score
+        if c == '"':
+            break
+        result.append(c)
+        i += 1
+    return "".join(result)
+
+
+def parse_gemini_response(response_text: str) -> Dict[str, any]:
+    """
+    Parse JSON from Gemini response. Handles optional markdown code fences.
+    Returns dict with reply_text, correction, score.
+    When full JSON parse fails (e.g. truncated stream), tries to extract fields from raw text
+    so reply_text is never the raw JSON string.
+    """
+    clean = re.sub(r"```json\s?|\s?```", "", response_text.strip()).strip()
+    try:
+        data = json.loads(clean)
+        reply_text = data.get("reply_text") or data.get("reply", "")
+        correction = data.get("correction") or ""
+        score = data.get("score", 70)
+        if not isinstance(score, int):
             try:
-                score_str = ''.join(filter(str.isdigit, line))
-                if score_str:
-                    score = min(100, max(0, int(score_str)))
-            except:
-                pass
-        
-        # Accumulate content
-        if current_section == "reply":
-            reply_text += line + " "
-        # elif current_section == "correction":
-        #     correction += line + " "
-        # elif current_section == "explanation":
-        #     hinglish_explanation += line + " "
-    
-    # If no structured parsing worked, use entire response as reply
-    if not reply_text:
-        reply_text = response_text
-    
-    # If we got reply but no explanation, try to extract it from the response
-    if reply_text and not hinglish_explanation:
-        # Look for Hindi text (Devanagari script) in the response
-        # Check if there's Hindi text anywhere in the response
-        hindi_pattern = r'[\u0900-\u097F]+'
-        if re.search(hindi_pattern, response_text):
-            # If we found Hindi but no explanation was parsed, use the part with Hindi
-            # Try to find the explanation part
-            parts = re.split(r'(?i)(hinglish|explanation|matlab)', response_text)
-            if len(parts) > 1:
-                # Take everything after the keyword
-                hinglish_explanation = " ".join(parts[1:]).strip()
-    
-    # Log parsing results for debugging
-    if not hinglish_explanation and reply_text:
-        # If still no explanation, check if the reply itself contains Hindi
-        hindi_pattern = r'[\u0900-\u097F]+'
-        if re.search(hindi_pattern, reply_text):
-            # The reply might contain the explanation mixed in
-            pass  # Keep it in reply_text for now
-    
-    # Clean up all text - remove markdown, extra quotes, and formatting
-    def clean_text(text: str) -> str:
-        if not text:
-            return ""
-        # Remove markdown bold/italic
-        text = re.sub(r'\*\*([^*]+)\*\*', r'\1', text)
-        text = re.sub(r'\*([^*]+)\*', r'\1', text)
-        # Remove extra quotes around English phrases (but keep quotes that are part of the text)
-        text = re.sub(r'"([^"]+)"', r'\1', text)  # Remove quotes
-        text = re.sub(r"'([^']+)'", r'\1', text)  # Remove single quotes
-        # Remove section headers if they somehow got included
-        text = re.sub(r'^(\*\*)?(reply|correction|hinglish|explanation)(\*\*)?:?\s*', '', text, flags=re.IGNORECASE)
-        # Clean up extra whitespace
-        text = ' '.join(text.split())
-        return text.strip()
-    
-    return {
-        "reply_text": clean_text(reply_text),
-        "correction": clean_text(correction),
-        "hinglish_explanation": clean_text(hinglish_explanation),
-        "score": score
-    }
+                score = int(score) if score is not None else 70
+            except (TypeError, ValueError):
+                score = 70
+        score = max(0, min(100, score))
+        return {
+            "reply_text": (reply_text or "").strip() or _extract_json_string_value(clean, "reply_text"),
+            "correction": (correction or "").strip(),
+            "score": score,
+        }
+    except Exception:
+        reply_text = _extract_json_string_value(clean, "reply_text")
+        correction = _extract_json_string_value(clean, "correction")
+        score_str = re.search(r'"score"\s*:\s*(\d+)', clean)
+        score = int(score_str.group(1)) if score_str else 70
+        score = max(0, min(100, score))
+        return {
+            "reply_text": reply_text.strip() or "I couldn't process that.",
+            "correction": correction.strip(),
+            "score": score,
+        }

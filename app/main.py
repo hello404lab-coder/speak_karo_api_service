@@ -1,4 +1,8 @@
 """FastAPI application entry point."""
+# Avoid "The current process just got forked, after parallelism has already been used" from tokenizers
+import os
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
 import logging
 from pathlib import Path
 
@@ -36,7 +40,6 @@ app.add_middleware(
 )
 
 # Mount static files for audio serving (local storage fallback)
-import os
 os.makedirs(settings.audio_storage_path, exist_ok=True)
 app.mount("/audio", StaticFiles(directory=settings.audio_storage_path), name="audio")
 
@@ -73,8 +76,12 @@ async def startup_event():
     # Log STT configuration
     if settings.stt_mode == "faster_whisper_large":
         logger.info("STT: faster_whisper_large (Systran/faster-whisper-large-v3, local)")
-    else:
+    elif settings.stt_mode == "openai_whisper_large_v3":
+        logger.info("STT: openai_whisper_large_v3 (Hugging Face Transformers, openai/whisper-large-v3)")
+    elif settings.stt_mode == "faster_whisper_medium":
         logger.info(f"STT: faster_whisper_medium (model: {settings.stt_faster_whisper_model_size}, CPU, int8)")
+    else:
+        logger.info(f"STT: {settings.stt_mode}")
     
     # Log LLM configuration
     if settings.gemini_api_key:

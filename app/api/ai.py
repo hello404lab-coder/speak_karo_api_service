@@ -15,7 +15,7 @@ from fastapi.responses import StreamingResponse
 from pydub import AudioSegment
 from sqlalchemy.orm import Session
 from app.core.config import settings
-from app.core.prompts import parse_llm_response
+from app.core.prompts import parse_gemini_response
 from app.database import get_db
 from app.schemas.ai import TextChatRequest, AIChatResponse, TTSStreamRequest
 from app.services.llm import generate_reply, stream_gemini_tokens, init_llm_client
@@ -35,16 +35,36 @@ router = APIRouter()
 INIT_MODELS_TIMEOUT_SECONDS = 30000
 
 
-def get_or_create_conversation(user_id: str, conversation_id: Optional[str], db: Session) -> Conversation:
-    """Get existing conversation or create new one."""
+# Max length for long_term_context (append when client sends learner_context on existing conversation)
+LONG_TERM_CONTEXT_MAX_CHARS = 500
+
+
+def get_or_create_conversation(
+    user_id: str,
+    conversation_id: Optional[str],
+    db: Session,
+    learner_context: Optional[str] = None,
+) -> Conversation:
+    """Get existing conversation or create new one. Optionally set or append learner_context."""
     if conversation_id:
         conversation = db.query(Conversation).filter(Conversation.id == conversation_id).first()
         if conversation:
+            if learner_context and learner_context.strip():
+                existing = (conversation.long_term_context or "").strip()
+                if existing:
+                    new_context = (existing + "\n" + learner_context.strip()).strip()[:LONG_TERM_CONTEXT_MAX_CHARS]
+                else:
+                    new_context = learner_context.strip()[:LONG_TERM_CONTEXT_MAX_CHARS]
+                conversation.long_term_context = new_context or None
+                db.commit()
+                db.refresh(conversation)
             return conversation
-    
+
     # Create new conversation
     new_id = str(uuid.uuid4())
     conversation = Conversation(id=new_id, user_id=user_id)
+    if learner_context and learner_context.strip():
+        conversation.long_term_context = learner_context.strip()[:LONG_TERM_CONTEXT_MAX_CHARS]
     db.add(conversation)
     db.commit()
     db.refresh(conversation)
@@ -52,14 +72,15 @@ def get_or_create_conversation(user_id: str, conversation_id: Optional[str], db:
 
 
 def get_conversation_history(conversation_id: str, db: Session) -> list:
-    """Get last 5 messages from conversation for context."""
+    """Load last N exchanges from conversation (cap by count; LLM layer trims by token budget)."""
+    limit = settings.llm_history_max_exchanges
     messages = db.query(Message).filter(
         Message.conversation_id == conversation_id
-    ).order_by(Message.created_at.desc()).limit(5).all()
-    
+    ).order_by(Message.created_at.desc()).limit(limit).all()
+
     # Reverse to get chronological order
     messages.reverse()
-    
+
     history = []
     for msg in messages:
         history.append({
@@ -70,7 +91,7 @@ def get_conversation_history(conversation_id: str, db: Session) -> list:
             "role": "assistant",
             "content": msg.ai_reply
         })
-    
+
     return history
 
 
@@ -132,8 +153,10 @@ async def text_chat(
     """
     try:
         # Get or create conversation
-        conversation = get_or_create_conversation(request.user_id, request.conversation_id, db)
-        
+        conversation = get_or_create_conversation(
+            request.user_id, request.conversation_id, db, learner_context=request.learner_context
+        )
+
         # Get conversation history for context
         history = get_conversation_history(conversation.id, db)
 
@@ -143,7 +166,13 @@ async def text_chat(
         # Run sync inference in thread pool with timeouts so event loop is not blocked
         try:
             ai_response = await asyncio.wait_for(
-                asyncio.to_thread(generate_reply, request.message, history, response_language),
+                asyncio.to_thread(
+                    generate_reply,
+                    request.message,
+                    history,
+                    response_language,
+                    long_term_context=conversation.long_term_context,
+                ),
                 timeout=float(settings.llm_timeout_seconds),
             )
         except asyncio.TimeoutError:
@@ -156,7 +185,7 @@ async def text_chat(
             user_message=request.message,
             ai_reply=ai_response["reply_text"],
             correction=ai_response.get("correction", ""),
-            hinglish_explanation=ai_response.get("hinglish_explanation", ""),
+            hinglish_explanation="",
             score=ai_response.get("score", 0)
         )
         db.add(message)
@@ -168,9 +197,9 @@ async def text_chat(
         return AIChatResponse(
             reply_text=ai_response["reply_text"],
             correction=ai_response.get("correction", ""),
-            hinglish_explanation=ai_response.get("hinglish_explanation", ""),
             score=ai_response.get("score", 75),
             audio_url=None,
+            response_language=response_language,
             conversation_id=conversation.id
         )
         
@@ -188,6 +217,7 @@ async def text_chat(
 async def voice_chat(
     user_id: str = Form(...),
     conversation_id: Optional[str] = Form(None),
+    learner_context: Optional[str] = Form(None),
     audio_file: UploadFile = File(...),
     stt_mode: Optional[str] = Form(None),
     db: Session = Depends(get_db),
@@ -203,7 +233,8 @@ async def voice_chat(
         # Read audio file
         audio_bytes = await audio_file.read()
 
-        effective_stt_mode = stt_mode if stt_mode in ("faster_whisper_medium", "faster_whisper_large") else settings.stt_mode
+        # Use server STT_MODE (env) as single source of truth so voice-chat respects STT_MODE=openai_whisper_large_v3
+        effective_stt_mode = settings.stt_mode
         try:
             transcribed_text, detected_lang = await asyncio.wait_for(
                 asyncio.to_thread(
@@ -219,7 +250,9 @@ async def voice_chat(
             raise HTTPException(status_code=504, detail=TIMEOUT_MESSAGE)
 
         # Get or create conversation
-        conversation = get_or_create_conversation(user_id, conversation_id, db)
+        conversation = get_or_create_conversation(
+            user_id, conversation_id, db, learner_context=learner_context
+        )
 
         # Get conversation history
         history = get_conversation_history(conversation.id, db)
@@ -229,7 +262,13 @@ async def voice_chat(
 
         try:
             ai_response = await asyncio.wait_for(
-                asyncio.to_thread(generate_reply, transcribed_text, history, response_language),
+                asyncio.to_thread(
+                    generate_reply,
+                    transcribed_text,
+                    history,
+                    response_language,
+                    long_term_context=conversation.long_term_context,
+                ),
                 timeout=float(settings.llm_timeout_seconds),
             )
         except asyncio.TimeoutError:
@@ -242,7 +281,7 @@ async def voice_chat(
             user_message=transcribed_text,
             ai_reply=ai_response["reply_text"],
             correction=ai_response.get("correction", ""),
-            hinglish_explanation=ai_response.get("hinglish_explanation", ""),
+            hinglish_explanation="",
             score=ai_response.get("score", 0)
         )
         db.add(message)
@@ -253,9 +292,9 @@ async def voice_chat(
         return AIChatResponse(
             reply_text=ai_response["reply_text"],
             correction=ai_response.get("correction", ""),
-            hinglish_explanation=ai_response.get("hinglish_explanation", ""),
             score=ai_response.get("score", 75),
             audio_url=None,
+            response_language=response_language,
             conversation_id=conversation.id
         )
         
@@ -319,13 +358,16 @@ async def chat_stream(
 ):
     """
     Sentence-level pipelined chat: stream Gemini tokens, buffer into sentences, TTS per sentence.
+    Only reply_text is streamed and sent to TTS; correction is never spoken.
     SSE: text_chunk (sentence for display), audio_chunk (WAV), then done, then audio_ready.
-    Reply-only TTS (stops at Correction/Hinglish). Heartbeat every 500ms when waiting for next event.
+    Heartbeat every 500ms when waiting for next event.
     """
     user_id = request.user_id
     message = request.message.strip()
     conversation_id = request.conversation_id
-    conversation = get_or_create_conversation(user_id, conversation_id, db)
+    conversation = get_or_create_conversation(
+        user_id, conversation_id, db, learner_context=request.learner_context
+    )
     history = get_conversation_history(conversation.id, db)
     response_language = get_response_language(message, None)
 
@@ -336,16 +378,24 @@ async def chat_stream(
 
     def gemini_producer() -> None:
         try:
-            for token in stream_gemini_tokens(message, history, response_language):
+            for token in stream_gemini_tokens(
+                message, history, response_language, long_term_context=conversation.long_term_context
+            ):
                 loop.call_soon_threadsafe(token_queue.put_nowait, token)
             loop.call_soon_threadsafe(token_queue.put_nowait, None)
         except Exception as e:
             logger.exception("Gemini stream error")
             loop.call_soon_threadsafe(main_queue.put_nowait, ("error", str(e)))
 
+    # Minimum chars before sending a sentence to TTS (avoids single-word fragments, improves prosody)
+    MIN_SENTENCE_CHARS = 25
+    SENTENCE_BOUNDARIES = (".", "?", "\u0964", "\n")  # Purna Viram (।) = \u0964
+
     async def buffer_consumer() -> None:
+        # Only reply_text is streamed and sent to TTS; correction is never pushed.
         buffer = ""
-        in_reply = True
+        in_reply = False  # Only True after we see reply_text value (JSON) or detect free-form (no leading {)
+        json_reply_started = False  # True after we strip "reply_text": " once
         full_reply_text_parts = []
         try:
             while True:
@@ -357,29 +407,62 @@ async def chat_stream(
                     break
                 full_reply_text_parts.append(token)
                 buffer += token
-                while True:
-                    idx = -1
-                    for sep in (".", "!", "?", "\n"):
-                        i = buffer.find(sep)
-                        if i >= 0 and (idx < 0 or i < idx):
-                            idx = i
-                    if idx < 0:
-                        break
-                    sentence = buffer[: idx + 1].strip()
-                    buffer = buffer[idx + 1 :].lstrip()
-                    if not sentence:
-                        continue
-                    for line in sentence.split("\n"):
-                        if _is_section_header(line.strip()):
-                            in_reply = False
-                            break
-                    if in_reply and sentence:
+
+                # JSON: strip "reply_text": " prefix once so TTS/stream never see other keys (e.g. correction)
+                if not json_reply_started and '"reply_text": "' in buffer:
+                    json_reply_started = True
+                    in_reply = True
+                    buffer = buffer.split('"reply_text": "')[-1]
+                # Free-form: no JSON prefix; treat as reply once we have content that doesn't look like JSON start
+                elif not json_reply_started and buffer.strip() and not buffer.strip().startswith("{"):
+                    in_reply = True
+
+                if not in_reply:
+                    continue
+
+                # JSON: end of reply_text value (closing quote)
+                end_quote_idx = buffer.find('"')
+                if json_reply_started and end_quote_idx >= 0:
+                    sentence = buffer[:end_quote_idx].strip()
+                    if sentence:
                         main_queue.put_nowait(("text", sentence))
                         sentence_queue.put_nowait(sentence)
+                    in_reply = False
+                    buffer = buffer[end_quote_idx + 1 :].lstrip()
+                    continue
+
+                # Sentence boundaries: first of . ! ? । \n
+                idx = -1
+                for sep in SENTENCE_BOUNDARIES:
+                    i = buffer.find(sep)
+                    if i >= 0 and (idx < 0 or i < idx):
+                        idx = i
+                if idx >= 0:
+                    sentence = buffer[: idx + 1].strip()
+                    # Smoothness: don't send very short fragments unless we'll never get more
+                    if len(sentence) < MIN_SENTENCE_CHARS:
+                        continue
+                    # Free-form only: stop at Correction/Hinglish section headers
+                    if not json_reply_started:
+                        for line in sentence.split("\n"):
+                            if _is_section_header(line.strip()):
+                                in_reply = False
+                                break
+                        if not in_reply:
+                            continue
+                    buffer = buffer[idx + 1 :].lstrip()
+                    if sentence:
+                        main_queue.put_nowait(("text", sentence))
+                        sentence_queue.put_nowait(sentence)
+
+            # End-of-stream flush
             if buffer.strip() and in_reply:
                 sent = buffer.strip()
-                main_queue.put_nowait(("text", sent))
-                sentence_queue.put_nowait(sent)
+                if json_reply_started:
+                    sent = sent.replace('"', '').replace('}', '').strip()
+                if sent:
+                    main_queue.put_nowait(("text", sent))
+                    sentence_queue.put_nowait(sent)
             full_reply_text = "".join(full_reply_text_parts)
             main_queue.put_nowait(("full_text", full_reply_text))
             sentence_queue.put_nowait(None)
@@ -456,13 +539,13 @@ async def chat_stream(
 
         if full_reply_text:
             try:
-                parsed = parse_llm_response(full_reply_text)
+                parsed = parse_gemini_response(full_reply_text)
                 msg = Message(
                     conversation_id=conversation.id,
                     user_message=message,
                     ai_reply=parsed.get("reply_text", ""),
                     correction=parsed.get("correction", ""),
-                    hinglish_explanation=parsed.get("hinglish_explanation", ""),
+                    hinglish_explanation="",
                     score=parsed.get("score", 75),
                 )
                 db.add(msg)
