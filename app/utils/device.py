@@ -7,6 +7,8 @@ import os
 import threading
 from typing import Literal
 
+from app.core.config import settings
+
 logger = logging.getLogger(__name__)
 
 # Cached so we don't call torch repeatedly
@@ -16,7 +18,7 @@ _infer_device: str | None = None
 def get_infer_device() -> Literal["cuda", "cpu"]:
     global _infer_device
 
-    app_env = os.getenv("APP_ENV", "dev").lower()
+    app_env = settings.app_env
     use_gpu = app_env == "prod"
 
     # If prod and previously cached cpu, re-check once (e.g. first call was in wrong thread)
