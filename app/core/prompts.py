@@ -53,6 +53,7 @@ CRITICAL RULES:
    - Example tone: "That's great! Now, can you try saying that in English? Look at the screen for help." (But write this entirely in {script_name}).
 4. 'reply_text': Spoken response in {script_name}.
 5. 'correction': The target English phrase in Latin characters.
+6. 'correction': ALWAYS set this to an empty string "". Do not provide any English text here.
 """
 
 # Legacy single prompt (used if response_language not passed)
