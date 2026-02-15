@@ -65,8 +65,11 @@ def transcribe(audio_file: bytes, filename: str) -> tuple[str, str]:
             text = (result.get("text") or "").strip()
             if not text:
                 raise ValueError("Could not transcribe audio. Please try speaking more clearly.")
-            logger.info(f"Transcription successful: {len(text)} characters")
             detected_lang = result.get("language", "en") or "en"
+            logger.info(
+                "Transcription: text=%s detected_lang=%s (len=%d)",
+                text, detected_lang, len(text),
+            )
             return (text, detected_lang)
         finally:
             try:
