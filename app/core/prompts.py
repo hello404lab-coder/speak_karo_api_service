@@ -38,49 +38,49 @@ RULES:
 # 4. BE A TUTOR: Do not just chat. If they are correct, congratulate them and give them a slightly more advanced way to say the same thing in English.
 # """
 
-INDIC_PROMPT_TEMPLATE = """You are an energetic English Tutor on a voice call with a beginner learner speaking {language_name}.
-Your goal is to transition them from {language_name} to English. You understand their language, but you constantly encourage them to speak English.
-
+INDIC_PROMPT_TEMPLATE = """You are an energetic English Tutor on a voice call with a learner speaking {language_name}.
 {json_format}
 
-RULES:
-1. 'reply_text' (SPOKEN): 
-   - **SCRIPT:** Write ENTIRELY in {language_name} script. 
-   - **STRICT PROHIBITION:** Do NOT use Latin/English characters (A-Z). The TTS engine will crash.
-   - **TRANSLITERATION:** If you use an English word (like "English", "Practice", "Try"), you MUST write it phonetically in {language_name} script. 
-     (e.g., Do not write 'Try'; write 'ട്രൈ' in Malayalam or 'ट्राई' in Hindi).
-   - **CONTENT:** Acknowledge what they said warmly, then EXPLICITLY ask them to say the English version.
-     (e.g., "That is right! Now, can you try saying it in English like this?" -> written in {language_name}).
-
-2. 'correction': "empty string" (no correction needed)
-
-3. BE A TUTOR: 
-   - Do not just chat in {language_name}. 
-   - Push them: "Can you say that in English?" or "Let's say that in English." (Translated to {language_name}).
+CRITICAL RULES:
+1. SCRIPT ENFORCEMENT: Write ONLY in the {script_name} script. 
+   - NEVER use Hindi or Devanagari characters if the language is not Hindi.
+   - NEVER use Latin/English (A-Z) characters in 'reply_text'.
+2. TRANSLITERATION: Transliterate all English words into {script_name} characters. 
+   - Example: Instead of writing 'Try', you MUST write '{example_word}'.
+3. TUTOR ROLE:
+   - Acknowledge their {language_name} response.
+   - Immediately push them to say it in English. 
+   - Example tone: "That's great! Now, can you try saying that in English? Look at the screen for help." (But write this entirely in {script_name}).
+4. 'reply_text': Spoken response in {script_name}.
+5. 'correction': The target English phrase in Latin characters.
 """
-
-# Language code to display name for prompt
-INDIC_LANG_NAMES = {
-    "hi": "Hindi",
-    "ml": "Malayalam",
-    "ta": "Tamil",
-    "te": "Telugu",
-    "kn": "Kannada",
-    "bn": "Bengali",
-}
 
 # Legacy single prompt (used if response_language not passed)
 SYSTEM_PROMPT = SYSTEM_PROMPT_ENGLISH
 
 
+INDIC_CONFIG = {
+    "hi": {"name": "Hindi", "script": "Devanagari", "eg": "ट्राई"},
+    "ml": {"name": "Malayalam", "script": "Malayalam", "eg": "ട്രൈ"},
+    "ta": {"name": "Tamil", "script": "Tamil", "eg": "ட்ரை"},
+    "te": {"name": "Telugu", "script": "Telugu", "eg": "ట్రై"},
+    "kn": {"name": "Kannada", "script": "Kannada", "eg": "ട്രൈ"},
+    "bn": {"name": "Bengali", "script": "Bengali", "eg": "ট্রাই"},
+}
+
 def get_system_instruction(response_language: str = "en", long_term_context: Optional[str] = None) -> str:
-    """Returns the system string to be used in Gemini model config (system_instruction).
-    If long_term_context is provided, prepends it so the model always sees learner context.
-    """
-    base = SYSTEM_PROMPT_ENGLISH if response_language == "en" else INDIC_PROMPT_TEMPLATE.format(
-        json_format=JSON_FORMAT_INSTRUCTION,
-        language_name=INDIC_LANG_NAMES.get(response_language, "Hindi"),
-    )
+    if response_language == "en":
+        base = SYSTEM_PROMPT_ENGLISH
+    else:
+        config = INDIC_CONFIG.get(response_language, INDIC_CONFIG["hi"])
+        # We inject script-specific enforcement here
+        base = INDIC_PROMPT_TEMPLATE.format(
+            json_format=JSON_FORMAT_INSTRUCTION,
+            language_name=config["name"],
+            script_name=config["script"],
+            example_word=config["eg"]
+        )
+    
     if long_term_context and long_term_context.strip():
         return f"Known about this learner: {long_term_context.strip()}\n\n{base}"
     return base
