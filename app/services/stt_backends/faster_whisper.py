@@ -84,14 +84,18 @@ def _run_transcribe(model, audio_file: bytes, model_label: str) -> tuple[str, st
                 language=None,
                 beam_size=5,
             )
-            logger.info(
-                f"Detected language: {info.language} (probability: {info.language_probability:.2f})"
-            )
             transcribed_text = " ".join([segment.text for segment in segments]).strip()
             if not transcribed_text:
                 raise ValueError("Could not transcribe audio. Please try speaking more clearly.")
-            logger.info(f"Transcription successful: {len(transcribed_text)} characters")
             detected_lang = getattr(info, "language", "en") or "en"
+            logger.info(
+                "Detected language: %s (probability: %.2f)",
+                info.language, info.language_probability,
+            )
+            logger.info(
+                "Transcription: text=%s detected_lang=%s (len=%d)",
+                transcribed_text, detected_lang, len(transcribed_text),
+            )
             return (transcribed_text, detected_lang)
         finally:
             try:
