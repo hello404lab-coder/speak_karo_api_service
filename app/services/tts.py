@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 _turbo_model = None
 _turbo_device = None
 _lock_turbo = threading.Lock()
+_turbo_voice_prepared = False  # Voice cloning: prepare once, reuse for all generate() calls
 
 # Lazy-loaded IndicF5 model and vocoder (loaded on first use); lock prevents double-load
 _indicf5_model = None
@@ -488,11 +489,22 @@ def _tts_with_turbo(text: str) -> bytes:
                 "Chatterbox-Turbo requires a reference clip for voice cloning. "
                 "Set tts_audio_prompt_path in config (e.g. a 10s WAV file)."
             )
-        logger.info(f"Using audio prompt for voice cloning: {audio_prompt_path}")
+        # Prepare voice conditionals once and reuse (Turbo supports prepare_conditionals + generate without path)
+        global _turbo_voice_prepared
+        with _lock_turbo:
+            if getattr(model, "prepare_conditionals", None) and not _turbo_voice_prepared:
+                model.prepare_conditionals(audio_prompt_path)
+                _turbo_voice_prepared = True
+                logger.info(
+                    "Voice cloning reference loaded once: %s (reusing for subsequent requests)",
+                    audio_prompt_path,
+                )
 
         with torch.no_grad():
-            # Chatterbox-Turbo: generate(text, audio_prompt_path=...), returns tensor, model.sr
-            wav_tensor = model.generate(text, audio_prompt_path=audio_prompt_path)
+            if _turbo_voice_prepared:
+                wav_tensor = model.generate(text)
+            else:
+                wav_tensor = model.generate(text, audio_prompt_path=audio_prompt_path)
 
         wav_array = wav_tensor.cpu().numpy()
         if wav_array.ndim > 1:
