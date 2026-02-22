@@ -1,7 +1,19 @@
 """Prompt templates for LLM interactions."""
 import json
+import logging
 import re
 from typing import List, Dict, Optional
+
+from pydantic import BaseModel, Field
+
+logger = logging.getLogger(__name__)
+
+
+class LLMReplySchema(BaseModel):
+    """Schema for Gemini LLM reply. Used for response_json_schema and parsing."""
+    reply_text: str = Field(..., description="Response to the user (spoken by TTS)")
+    correction: str = Field(default="", description="Correct English phrase; display only")
+    score: int = Field(default=70, ge=0, le=100, description="Score 0-100")
 
 # Base schema for JSON output (used in system instruction)
 # Only reply_text is spoken (TTS/stream); correction is for display only.
@@ -154,6 +166,10 @@ def parse_gemini_response(response_text: str) -> Dict[str, any]:
         score_str = re.search(r'"score"\s*:\s*(\d+)', clean)
         score = int(score_str.group(1)) if score_str else 70
         score = max(0, min(100, score))
+        # Plain-text fallback: if model returned natural language instead of JSON, use it as reply_text
+        if not reply_text.strip() and clean.strip() and not clean.strip().startswith("{"):
+            reply_text = clean.strip()
+            logger.info("Using full response as reply_text (JSON parse failed)")
         return {
             "reply_text": reply_text.strip() or "I couldn't process that.",
             "correction": correction.strip(),

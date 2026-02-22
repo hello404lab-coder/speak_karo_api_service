@@ -3,6 +3,7 @@ import logging
 import os
 import tempfile
 import threading
+from typing import Optional
 
 from app.utils.device import get_infer_device
 
@@ -52,16 +53,24 @@ def _get_pipeline():
     return _pipeline
 
 
-def transcribe(audio_file: bytes, filename: str) -> tuple[str, str]:
-    """Transcribe using openai/whisper-large-v3. Returns (text, detected_lang)."""
+def transcribe(audio_file: bytes, filename: str, language_hint: Optional[str] = None) -> tuple[str, str]:
+    """Transcribe using openai/whisper-large-v3. Returns (text, detected_lang).
+
+    Pass language_hint (e.g. "en") to force that language and reduce wrong-script hallucination.
+    condition_on_prev_tokens=False is always set to reduce repetitive hallucination.
+    """
     pipe = _get_pipeline()
+    generate_kwargs: dict = {"condition_on_prev_tokens": False}
+    if language_hint:
+        generate_kwargs["language"] = language_hint
+        logger.info(f"Transcribing with language forced to: {language_hint}")
     with _inference_lock:
         with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_file:
             temp_file.write(audio_file)
             temp_path = temp_file.name
         try:
             logger.info(f"Transcribing audio with Transformers Whisper (model: {MODEL_ID})")
-            result = pipe(temp_path)
+            result = pipe(temp_path, generate_kwargs=generate_kwargs)
             text = (result.get("text") or "").strip()
             if not text:
                 raise ValueError("Could not transcribe audio. Please try speaking more clearly.")

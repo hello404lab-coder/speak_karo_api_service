@@ -46,7 +46,9 @@ def transcribe_audio(
             return faster_whisper.transcribe(audio_file, filename, variant="large")
         if effective_mode == "openai_whisper_large_v3":
             from app.services.stt_backends import transformers_whisper
-            return transformers_whisper.transcribe(audio_file, filename)
+            return transformers_whisper.transcribe(
+                audio_file, filename, language_hint=settings.stt_force_language
+            )
         # Fallback to large if unknown
         from app.services.stt_backends import faster_whisper
         return faster_whisper.transcribe(audio_file, filename, variant="large")
