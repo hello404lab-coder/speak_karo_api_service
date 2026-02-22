@@ -6,7 +6,7 @@ from typing import Iterator, List, Dict, Optional
 from google import genai
 from google.genai import types
 from app.core.config import settings
-from app.core.prompts import get_system_instruction, prepare_history, parse_gemini_response
+from app.core.prompts import get_system_instruction, prepare_history, parse_gemini_response, LLMReplySchema
 from app.services.cache import get_json, set_json
 
 logger = logging.getLogger(__name__)
@@ -261,10 +261,12 @@ def generate_reply(
         if safety_settings is not None:
             logger.debug("Safety settings configured to block only HIGH probability content")
 
+        # No tools passed; if AFC is enabled by default and causes non-JSON responses, consider disabling AFC here when supported.
         config_dict = {
             "thinking_config": genai.types.ThinkingConfig(thinking_budget=0),
             "system_instruction": system_instruction,
             "response_mime_type": "application/json",
+            "response_json_schema": LLMReplySchema.model_json_schema(),
             "max_output_tokens": settings.llm_max_tokens,
             "temperature": settings.llm_temperature,
         }

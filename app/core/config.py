@@ -64,6 +64,8 @@ class Settings(BaseSettings):
     # STT Settings
     stt_mode: Literal["faster_whisper_medium", "faster_whisper_large", "openai_whisper_large_v3"] = "openai_whisper_large_v3"  # Env: STT_MODE
     stt_faster_whisper_model_size: str = "medium"  # Used for faster_whisper_medium
+    # Force transcription language for Transformers Whisper (e.g. "en" to avoid wrong-script hallucination). None = auto-detect.
+    stt_force_language: Optional[str] = None  # Env: STT_FORCE_LANGUAGE
     
     # TTS Settings - Chatterbox-Turbo (English, https://huggingface.co/ResembleAI/chatterbox-turbo)
     # Device is auto-detected: cuda > mps > cpu. Requires a reference clip for voice cloning.
