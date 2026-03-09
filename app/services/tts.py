@@ -641,6 +641,27 @@ def _tts_with_turbo(text: str) -> bytes:
             "top_k": getattr(settings, "tts_turbo_top_k", 1000),
             "repetition_penalty": getattr(settings, "tts_turbo_repetition_penalty", 1.2),
         }
+        # ChatterboxTTS (non-Turbo fallback) does not accept top_k; it uses temperature, top_p, repetition_penalty, exaggeration, cfg_weight, min_p.
+        gen_kwargs_fallback = {k: v for k, v in gen_kwargs.items() if k != "top_k"}
+
+        def _do_generate():
+            if _turbo_voice_prepared:
+                try:
+                    return model.generate(text, **gen_kwargs)
+                except TypeError:
+                    try:
+                        return model.generate(text, **gen_kwargs_fallback)
+                    except TypeError:
+                        return model.generate(text)
+            else:
+                try:
+                    return model.generate(text, audio_prompt_path=audio_prompt_path, **gen_kwargs)
+                except TypeError:
+                    try:
+                        return model.generate(text, audio_prompt_path=audio_prompt_path, **gen_kwargs_fallback)
+                    except TypeError:
+                        return model.generate(text, audio_prompt_path=audio_prompt_path)
+
         # generate_stream is not in upstream; requires a streaming-capable fork (e.g. rsxdalv/chatterbox).
         use_streaming = getattr(settings, "tts_turbo_use_streaming", False) and callable(getattr(model, "generate_stream", None))
         if use_streaming:
@@ -664,10 +685,7 @@ def _tts_with_turbo(text: str) -> bytes:
                     wav_array = wav_array.squeeze()
         if not use_streaming:
             with torch.no_grad():
-                if _turbo_voice_prepared:
-                    wav_tensor = model.generate(text, **gen_kwargs)
-                else:
-                    wav_tensor = model.generate(text, audio_prompt_path=audio_prompt_path, **gen_kwargs)
+                wav_tensor = _do_generate()
             wav_array = wav_tensor.cpu().numpy()
             if wav_array.ndim > 1:
                 wav_array = wav_array.squeeze()
