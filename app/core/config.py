@@ -21,6 +21,15 @@ class Settings(BaseSettings):
     
     # API Keys
     gemini_api_key: Optional[str] = None  # Required for LLM; required in prod (validated at startup)
+    openai_api_key: Optional[str] = None  # Reserved; STT uses Groq when local Whisper disabled
+    groq_api_key: Optional[str] = None  # For Groq Speech-to-Text when STT_WHISPER_LOCAL_ENABLED=false
+    
+    # Auth: JWT and OAuth
+    jwt_secret: str = Field(default="change-me-in-production", description="JWT_SECRET: secret for signing tokens")
+    jwt_access_token_expire_minutes: int = Field(default=15, description="JWT_ACCESS_TOKEN_EXPIRE_MINUTES")
+    jwt_refresh_token_expire_days: int = Field(default=30, description="JWT_REFRESH_TOKEN_EXPIRE_DAYS")
+    google_client_id: Optional[str] = Field(default=None, description="GOOGLE_CLIENT_ID: for Google OAuth ID token verification")
+    apple_client_id: Optional[str] = Field(default=None, description="APPLE_CLIENT_ID: for Apple OAuth ID token verification")
     
     # Database: PostgreSQL (postgresql://user:pass@host:5432/db) or SQLite (sqlite:///./data/english_practice.sqlite or sqlite:///:memory:)
     database_url: str = Field(
@@ -62,9 +71,14 @@ class Settings(BaseSettings):
     llm_history_max_exchanges: int = 10
     
     # STT Settings
-    stt_mode: Literal["faster_whisper_medium", "faster_whisper_large", "openai_whisper_large_v3"] = "openai_whisper_large_v3"  # Env: STT_MODE
+    stt_mode: Literal["faster_whisper_medium", "faster_whisper_large", "openai_whisper_large_v3"] = "openai_whisper_large_v3"  # Env: STT_MODE (used only when stt_whisper_local_enabled=True)
     stt_faster_whisper_model_size: str = "medium"  # Used for faster_whisper_medium
-    # Force transcription language for Transformers Whisper (e.g. "en" to avoid wrong-script hallucination). None = auto-detect.
+    # When False: local Whisper models are never loaded; transcription uses Groq Whisper API (requires GROQ_API_KEY)
+    stt_whisper_local_enabled: bool = Field(default=False, description="STT_WHISPER_LOCAL_ENABLED: use local Whisper; if false, use Groq Whisper API")
+    # Groq STT model when local disabled: whisper-large-v3-turbo (faster, cheaper) or whisper-large-v3 (higher accuracy)
+    stt_groq_model: str = Field(default="whisper-large-v3-turbo", description="STT_GROQ_MODEL: Groq transcription model")
+    # STT outputs raw transcription in the spoken language (no language hint passed; auto-detect).
+    # Reserved for optional use: force transcription language (e.g. "en"). When set, could be passed to backends for non-raw mode.
     stt_force_language: Optional[str] = None  # Env: STT_FORCE_LANGUAGE
     
     # TTS Settings - Chatterbox-Turbo (English, https://huggingface.co/ResembleAI/chatterbox-turbo)
@@ -72,10 +86,17 @@ class Settings(BaseSettings):
     tts_audio_prompt_path: Optional[str] = "chirp3-hd-sulafat.wav"  # Path to ~10s reference WAV for voice cloning (required for Turbo)
 
     # TTS Settings - IndicF5 (for Indic languages: hi, ml, ta)
-    # Base directory containing ref WAVs (e.g. IndicF5/prompts or backend/assets/indicf5_prompts)
-    # Default: project root / IndicF5 / prompts if that path exists
-    tts_indicf5_ref_audio_dir: Optional[str] = None  # Set to path for ref WAVs; None disables IndicF5
+    # When False: IndicF5 is never loaded; Indic TTS uses Gemini TTS or Chatterbox-Turbo fallback
+    tts_indicf5_enabled: bool = Field(default=False, description="TTS_INDICF5_ENABLED: enable local IndicF5 for Indic languages")
+    # Base directory containing ref WAVs (e.g. IndicF5/prompts or backend/assets/indicf5_prompts). Only used when tts_indicf5_enabled=True.
+    tts_indicf5_ref_audio_dir: Optional[str] = None  # Set to path for ref WAVs
     tts_indicf5_speed: float = 0.9  # Speech speed (0.9 in IndicF5 main.py)
+
+    # TTS Settings - Chatterbox toggle and Gemini TTS fallback
+    # When False: Chatterbox is never loaded; English/Indic fallback use Gemini gemini-2.5-flash-lite-preview-tts
+    tts_chatterbox_enabled: bool = Field(default=True, description="TTS_CHATTERBOX_ENABLED: enable local Chatterbox-Turbo (GPU)")
+    tts_gemini_model: str = Field(default="gemini-2.5-flash-lite-preview-tts", description="TTS_GEMINI_MODEL: Gemini TTS model when Chatterbox disabled")
+    tts_gemini_voice: str = Field(default="Puck", description="TTS_GEMINI_VOICE: prebuilt voice name for Gemini TTS")
 
     # Cache TTLs
     llm_cache_ttl: int = 86400  # 24 hours

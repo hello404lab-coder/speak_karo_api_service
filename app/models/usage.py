@@ -16,7 +16,9 @@ class Usage(Base):
     date = Column(Date, default=date.today, nullable=False, index=True)
     minutes_used = Column(Float, default=0.0)
     request_count = Column(Integer, default=0)
-    
+    chat_count = Column(Integer, default=0)
+    voice_count = Column(Integer, default=0)
+
     __table_args__ = (
         {"schema": None},
     )

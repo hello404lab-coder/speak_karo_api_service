@@ -6,6 +6,7 @@ from sqlalchemy.orm import sessionmaker, Session
 from sqlalchemy.pool import NullPool
 from app.core.config import settings
 from app.models.usage import Base
+from app.models import user  # noqa: F401 - register User model with Base.metadata
 
 
 def _create_engine():

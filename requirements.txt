@@ -7,6 +7,14 @@ sqlalchemy==2.0.45
 psycopg2-binary==2.9.11
 redis==7.1.0
 python-multipart==0.0.21
+google-auth>=2.36.0
+python-jose[cryptography]>=3.3.0
+passlib[bcrypt]>=1.7.4
+slowapi>=0.1.9
+pytest-asyncio>=0.25.0
+httpx>=0.28.0
+requests==2.32.3
+groq>=0.4.0
 pytest==9.0.2
 boto3==1.42.31
 alembic==1.18.1

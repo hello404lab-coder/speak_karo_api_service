@@ -35,6 +35,20 @@ _lock_indicf5 = threading.Lock()
 # Inference lock: one TTS inference at a time on the GPU to avoid OOM with workers=1 and multiple threads.
 _inference_lock = threading.Lock()
 
+# Lazy-loaded Gemini client for TTS (when Chatterbox disabled). API-based, no GPU lock.
+_gemini_tts_client = None
+
+# Internal language code to BCP-47 for Gemini TTS (en-US, hi-IN, etc.)
+LANG_TO_BCP47 = {
+    "en": "en-US",
+    "hi": "hi-IN",
+    "ml": "ml-IN",
+    "ta": "ta-IN",
+    "te": "te-IN",
+    "kn": "kn-IN",
+    "bn": "bn-BD",
+}
+
 # IndicF5 ref audio filenames and ref text per language (must match the ref WAV content)
 INDICF5_REF_FILENAMES = {
     "hi": "MAR_F_HAPPY_00001.wav",   # Devanagari (Marathi) for Hindi
@@ -216,6 +230,67 @@ def _convert_to_wav(audio_data: bytes, mime_type: str) -> bytes:
     return header + audio_data
 
 
+def _get_gemini_tts_client():
+    """Lazy load Gemini client for TTS (used when Chatterbox is disabled). Same SDK as LLM."""
+    global _gemini_tts_client
+    if _gemini_tts_client is None:
+        if not settings.gemini_api_key:
+            raise ValueError("Gemini API key not configured. Set GEMINI_API_KEY for TTS when Chatterbox is disabled.")
+        from google import genai
+        timeout_ms = getattr(settings, "tts_timeout_seconds", 45) * 1000
+        try:
+            from google.genai.types import HttpOptions
+            _gemini_tts_client = genai.Client(
+                api_key=settings.gemini_api_key,
+                http_options=HttpOptions(timeout=timeout_ms),
+            )
+        except (ImportError, AttributeError):
+            _gemini_tts_client = genai.Client(api_key=settings.gemini_api_key)
+        logger.info("Gemini TTS client initialized (model=%s)", getattr(settings, "tts_gemini_model", "gemini-2.5-flash-lite-preview-tts"))
+    return _gemini_tts_client
+
+
+def _tts_with_gemini(text: str, response_language: str) -> bytes:
+    """
+    Generate TTS audio using Gemini (e.g. gemini-2.5-flash-lite-preview-tts).
+    Used when Chatterbox is disabled. Returns WAV bytes.
+    """
+    from google.genai import types
+    if not text or not text.strip():
+        raise ValueError("Empty text for Gemini TTS")
+    text = text.strip()
+    if len(text) > 4000:
+        text = text[:4000]
+    client = _get_gemini_tts_client()
+    lang_code = LANG_TO_BCP47.get(response_language, "en-US")
+    voice_name = getattr(settings, "tts_gemini_voice", "Puck") or "Puck"
+    model_name = getattr(settings, "tts_gemini_model", "gemini-2.5-flash-lite-preview-tts")
+    contents = f"Say the following: {text}"
+    config = types.GenerateContentConfig(
+        response_modalities=["AUDIO"],
+        speech_config=types.SpeechConfig(
+            language_code=lang_code,
+            voice_config=types.VoiceConfig(
+                prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=voice_name),
+            ),
+        ),
+    )
+    response = client.models.generate_content(
+        model=model_name,
+        contents=contents,
+        config=config,
+    )
+    if not response.candidates or not response.candidates[0].content or not response.candidates[0].content.parts:
+        raise ValueError("No audio content in Gemini TTS response")
+    part = response.candidates[0].content.parts[0]
+    if not getattr(part, "inline_data", None) or not getattr(part.inline_data, "data", None):
+        raise ValueError("Gemini TTS response missing inline_data")
+    pcm_data = part.inline_data.data
+    if not pcm_data:
+        raise ValueError("Gemini TTS returned empty audio")
+    return _convert_to_wav(pcm_data, "audio/L16;rate=24000")
+
+
 def _convert_wav_to_mp3(wav_bytes: bytes) -> bytes:
     """
     Convert WAV audio bytes to MP3 format.
@@ -266,6 +341,8 @@ def _convert_wav_to_mp3(wav_bytes: bytes) -> bytes:
 
 def _get_turbo_model():
     """Lazy load Chatterbox-Turbo (or ChatterboxTTS fallback) for English TTS. Thread-safe. Uses get_infer_device() so STT and TTS share the same GPU in prod."""
+    if not getattr(settings, "tts_chatterbox_enabled", True):
+        raise ValueError("Chatterbox is disabled. Set TTS_CHATTERBOX_ENABLED=true to use Chatterbox-Turbo.")
     global _turbo_model, _turbo_device
     with _lock_turbo:
         if _turbo_model is None:
@@ -319,9 +396,12 @@ def _get_indicf5_ref_audio_dir() -> Optional[str]:
 
 
 def _get_indicf5_model():
-    """Lazy load IndicF5 model and vocoder. On failure set _indicf5_available=False. Thread-safe."""
+    """Lazy load IndicF5 model and vocoder. On failure set _indicf5_available=False. When tts_indicf5_enabled=False, never loads. Thread-safe."""
     global _indicf5_model, _indicf5_vocoder, _indicf5_device, _indicf5_available
     with _lock_indicf5:
+        if not getattr(settings, "tts_indicf5_enabled", False):
+            _indicf5_available = False
+            return None, None, None
         if not _indicf5_available:
             return None, None, None
 
@@ -366,7 +446,8 @@ def _get_indicf5_model():
             logger.info("IndicF5 model loaded successfully")
             return _indicf5_model, _indicf5_vocoder, _indicf5_device
         except Exception as e:
-            logger.warning(f"IndicF5 load failed: {e}. Indic languages will use Turbo fallback.")
+            fallback = "Gemini TTS" if not getattr(settings, "tts_chatterbox_enabled", True) else "Turbo"
+            logger.warning(f"IndicF5 load failed: {e}. Indic languages will use {fallback} fallback.")
             _indicf5_available = False
             return None, None, None
 
@@ -572,9 +653,12 @@ def generate_tts_bytes(text: str, response_language: str = "en") -> bytes:
     """
     Public entrypoint: generate TTS audio bytes for one sentence (WAV).
     Used by the chat/stream pipeline for sentence-level TTS.
+    When TTS_CHATTERBOX_ENABLED=false, English and Indic fallback use Gemini TTS (no GPU lock).
     """
     lang = _effective_response_language(text, response_language)
-    use_indicf5 = lang != "en"
+    use_indicf5 = lang != "en" and getattr(settings, "tts_indicf5_enabled", False)
+    chatterbox_enabled = getattr(settings, "tts_chatterbox_enabled", True)
+
     if use_indicf5:
         ref = _get_indicf5_ref(lang)
         model, _, _ = _get_indicf5_model()
@@ -585,9 +669,14 @@ def generate_tts_bytes(text: str, response_language: str = "en") -> bytes:
             except ValueError:
                 raise
             except Exception as e:
-                logger.warning(f"IndicF5 generation failed: {e}. Falling back to Chatterbox-Turbo.")
-        use_indicf5 = False
+                logger.warning(f"IndicF5 generation failed: {e}. Falling back to %s.", "Gemini TTS" if not chatterbox_enabled else "Chatterbox-Turbo")
+                use_indicf5 = False
+        else:
+            use_indicf5 = False
+
     if not use_indicf5:
+        if not chatterbox_enabled:
+            return _tts_with_gemini(text, lang)
         with _inference_lock:
             return _tts_with_turbo(text)
     raise ValueError("Something went wrong generating audio. Please try again.")
@@ -673,7 +762,8 @@ def text_to_speech(text: str, response_language: str = "en") -> str:
             return presigned
         return cached
 
-    use_indicf5 = lang != "en"
+    chatterbox_enabled = getattr(settings, "tts_chatterbox_enabled", True)
+    use_indicf5 = lang != "en" and getattr(settings, "tts_indicf5_enabled", False)
     if use_indicf5:
         ref = _get_indicf5_ref(lang)
         model, _, _ = _get_indicf5_model()
@@ -696,12 +786,33 @@ def text_to_speech(text: str, response_language: str = "en") -> str:
             except ValueError:
                 raise
             except Exception as e:
-                logger.warning(f"IndicF5 generation failed: {e}. Falling back to Chatterbox-Turbo.")
+                logger.warning(f"IndicF5 generation failed: {e}. Falling back to %s.", "Gemini TTS" if not chatterbox_enabled else "Chatterbox-Turbo")
+                use_indicf5 = False
         else:
-            logger.warning(f"IndicF5 not configured for {lang}. Using Chatterbox-Turbo.")
-            use_indicf5 = False
+            logger.warning(f"IndicF5 not configured for {lang}. Using %s.", "Gemini TTS" if not chatterbox_enabled else "Chatterbox-Turbo")
+        use_indicf5 = False
 
     if not use_indicf5:
+        if not chatterbox_enabled:
+            logger.info("Using TTS provider: Gemini TTS (model: %s, voice: %s)", getattr(settings, "tts_gemini_model", "gemini-2.5-flash-lite-preview-tts"), getattr(settings, "tts_gemini_voice", "Puck"))
+            try:
+                audio_bytes = _tts_with_gemini(text, lang)
+                audio_bytes = _convert_wav_to_mp3(audio_bytes)
+                filename = f"{hashlib.md5(text.encode()).hexdigest()}.mp3"
+                s3_key = _store_audio_cloud(audio_bytes, filename)
+                if s3_key:
+                    presigned = _generate_presigned_url(s3_key)
+                    if presigned:
+                        set(cache_key, "s3:" + s3_key, settings.tts_cache_ttl)
+                        return presigned
+                audio_url = _store_audio_local(audio_bytes, filename)
+                set(cache_key, audio_url, settings.tts_cache_ttl)
+                return audio_url
+            except ValueError:
+                raise
+            except Exception as e:
+                logger.error(f"Gemini TTS error: {e}")
+                raise ValueError("Something went wrong generating audio. Please try again.")
         logger.info("Using TTS provider: Chatterbox-Turbo")
         try:
             with _inference_lock:
@@ -729,19 +840,27 @@ def text_to_speech(text: str, response_language: str = "en") -> str:
 def init_tts_models() -> dict:
     """
     Load TTS models (Turbo and optionally IndicF5) for warmup.
-    Returns {"turbo": "loaded"|"failed", "indicf5": "loaded"|"skipped"|"failed"}.
+    When TTS_CHATTERBOX_ENABLED=false, Turbo is not loaded.
+    When TTS_INDICF5_ENABLED=false, IndicF5 is not loaded.
+    Returns {"turbo": "loaded"|"disabled"|"failed", "indicf5": "loaded"|"disabled"|"skipped"|"failed"}.
     """
     result: dict = {}
-    try:
-        _get_turbo_model()
-        result["turbo"] = "loaded"
-    except Exception as e:
-        logger.exception("TTS Turbo init failed")
-        result["turbo"] = "failed"
-        result["turbo_error"] = str(e)
-    model, _, _ = _get_indicf5_model()
-    if model is not None:
-        result["indicf5"] = "loaded"
+    if not getattr(settings, "tts_chatterbox_enabled", True):
+        result["turbo"] = "disabled"
     else:
-        result["indicf5"] = "skipped"
+        try:
+            _get_turbo_model()
+            result["turbo"] = "loaded"
+        except Exception as e:
+            logger.exception("TTS Turbo init failed")
+            result["turbo"] = "failed"
+            result["turbo_error"] = str(e)
+    if not getattr(settings, "tts_indicf5_enabled", False):
+        result["indicf5"] = "disabled"
+    else:
+        model, _, _ = _get_indicf5_model()
+        if model is not None:
+            result["indicf5"] = "loaded"
+        else:
+            result["indicf5"] = "skipped"
     return result

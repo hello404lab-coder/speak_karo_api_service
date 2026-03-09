@@ -1,4 +1,4 @@
-"""Speech-to-Text service: dispatches to backends (faster_whisper or openai/whisper-large-v3 via Transformers)."""
+"""Speech-to-Text service: dispatches to backends (local Whisper or OpenAI Whisper API)."""
 import logging
 from typing import Optional
 
@@ -7,7 +7,9 @@ from app.utils.audio import validate_wav_file
 
 logger = logging.getLogger(__name__)
 
-ALLOWED_STT_MODES = ("faster_whisper_medium", "faster_whisper_large", "openai_whisper_large_v3")
+ALLOWED_STT_MODES = ("faster_whisper_medium", "faster_whisper_large", "openai_whisper_large_v3", "openai_whisper_api", "groq_whisper_api")
+MODE_OPENAI_WHISPER_API = "openai_whisper_api"
+MODE_GROQ_WHISPER_API = "groq_whisper_api"
 
 
 def transcribe_audio(
@@ -17,11 +19,12 @@ def transcribe_audio(
 ) -> tuple[str, str]:
     """
     Transcribe audio file to text using the configured or requested STT backend.
+    When STT_WHISPER_LOCAL_ENABLED=false, only Groq Whisper API is used (no local model loaded).
 
     Args:
         audio_file: Audio file bytes
         filename: Original filename (for format detection)
-        mode: One of faster_whisper_medium, faster_whisper_large, openai_whisper_large_v3; if None, uses settings.stt_mode
+        mode: One of faster_whisper_medium, faster_whisper_large, openai_whisper_large_v3, openai_whisper_api, groq_whisper_api; if None, uses settings
 
     Returns:
         Tuple of (transcribed_text, detected_lang). detected_lang is the ISO 639-1 code (e.g. "en", "hi").
@@ -35,7 +38,17 @@ def transcribe_audio(
         logger.error(f"Audio validation failed: {e}")
         raise ValueError("Invalid audio file. Please upload a valid WAV file.")
 
+    # When local Whisper is disabled, always use Groq Whisper API (no local model loaded)
+    if not getattr(settings, "stt_whisper_local_enabled", True):
+        from app.services.stt_backends import groq_whisper_api
+        return groq_whisper_api.transcribe(
+            audio_file, filename, language_hint="en"  # raw: auto-detect, transcribe in spoken language
+        )
+
     effective_mode = mode if mode in ALLOWED_STT_MODES else settings.stt_mode
+    # Don't allow openai_whisper_api as a mode when local is enabled (it's only used when local is disabled)
+    if effective_mode == MODE_OPENAI_WHISPER_API or effective_mode == MODE_GROQ_WHISPER_API:
+        effective_mode = settings.stt_mode
 
     try:
         if effective_mode == "faster_whisper_medium":
@@ -47,7 +60,7 @@ def transcribe_audio(
         if effective_mode == "openai_whisper_large_v3":
             from app.services.stt_backends import transformers_whisper
             return transformers_whisper.transcribe(
-                audio_file, filename, language_hint=settings.stt_force_language
+                audio_file, filename, language_hint="en"  # raw: auto-detect, transcribe in spoken language
             )
         # Fallback to large if unknown
         from app.services.stt_backends import faster_whisper
@@ -61,9 +74,19 @@ def transcribe_audio(
 
 def init_stt_models() -> dict:
     """
-    Load the STT model for the current stt_mode (used by /init-models warmup).
-    Returns {"status": "loaded", "mode": str} or {"status": "failed", "error": str}.
+    Load the STT model for the current config (used by /init-models warmup).
+    When STT_WHISPER_LOCAL_ENABLED=false, no local model is loaded; only Groq Whisper API is used.
+    Returns {"status": "loaded"|"disabled", "mode": str} or {"status": "failed", "error": str}.
     """
+    if not getattr(settings, "stt_whisper_local_enabled", True):
+        try:
+            from app.services.stt_backends import groq_whisper_api
+            groq_whisper_api.warmup()
+            return {"status": "loaded", "mode": MODE_GROQ_WHISPER_API}
+        except Exception as e:
+            logger.exception("STT Groq Whisper API warmup failed")
+            return {"status": "failed", "error": str(e)}
+
     try:
         if settings.stt_mode == "faster_whisper_medium":
             from app.services.stt_backends import faster_whisper
