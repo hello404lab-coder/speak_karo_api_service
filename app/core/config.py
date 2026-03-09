@@ -97,6 +97,10 @@ class Settings(BaseSettings):
     tts_chatterbox_enabled: bool = Field(default=True, description="TTS_CHATTERBOX_ENABLED: enable local Chatterbox-Turbo (GPU)")
     tts_gemini_model: str = Field(default="gemini-2.5-flash-lite-preview-tts", description="TTS_GEMINI_MODEL: Gemini TTS model when Chatterbox disabled")
     tts_gemini_voice: str = Field(default="Puck", description="TTS_GEMINI_VOICE: prebuilt voice name for Gemini TTS")
+    # Max concurrent TTS inferences (1 = strict serialization for low VRAM; 2+ = Semaphore for lower latency)
+    tts_concurrent_inferences: int = Field(default=2, description="TTS_CONCURRENT_INFERENCES: max concurrent TTS inferences")
+    # When True, force DummyWatermarker to skip loading watermark weights (patch must run before model instantiation)
+    tts_use_dummy_watermarker: bool = Field(default=False, description="TTS_USE_DUMMY_WATERMARKER: force DummyWatermarker to skip loading watermark weights")
 
     # Cache TTLs
     llm_cache_ttl: int = 86400  # 24 hours

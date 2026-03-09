@@ -32,8 +32,8 @@ _indicf5_device = None
 _indicf5_available = True  # Set False if load fails so we fallback to Turbo
 _lock_indicf5 = threading.Lock()
 
-# Inference lock: one TTS inference at a time on the GPU to avoid OOM with workers=1 and multiple threads.
-_inference_lock = threading.Lock()
+# Inference semaphore: up to N TTS inferences at once (configurable) to reduce latency for multi-sentence responses; set to 1 for strict serialization on low VRAM.
+_inference_semaphore = threading.Semaphore(settings.tts_concurrent_inferences)
 
 # Lazy-loaded Gemini client for TTS (when Chatterbox disabled). API-based, no GPU lock.
 _gemini_tts_client = None
@@ -349,26 +349,47 @@ def _get_turbo_model():
             device = get_infer_device()
             _turbo_device = device
 
+            # Patch must run before any model instantiation so that watermark weights are not loaded when using the dummy.
             # Both Turbo and ChatterboxTTS use perth.PerthImplicitWatermarker(); in some envs it is None (resemble-ai/chatterbox#198). Patch once before loading either.
             try:
                 import perth
-                if perth.PerthImplicitWatermarker is None and getattr(perth, "DummyWatermarker", None) is not None:
+                use_dummy = (
+                    perth.PerthImplicitWatermarker is None
+                    or getattr(settings, "tts_use_dummy_watermarker", False)
+                )
+                if use_dummy and getattr(perth, "DummyWatermarker", None) is not None:
                     perth.PerthImplicitWatermarker = perth.DummyWatermarker
                     logger.debug("Patched perth.PerthImplicitWatermarker to DummyWatermarker")
             except Exception:
                 pass
 
+            # Prefer SDPA over manual attention on CUDA (faster). Set global backend before loading so the model uses it when instantiated.
+            if device == "cuda":
+                try:
+                    import torch
+                    torch.backends.cuda.enable_flash_sdp(True)
+                    torch.backends.cuda.enable_math_sdp(False)
+                    logger.debug("SDPA backends set for Chatterbox load (flash=True, math=False)")
+                except Exception as e:
+                    logger.debug("Could not set SDPA backends: %s", e)
+
             # Prefer ChatterboxTurboTTS (chatterbox.tts_turbo); PyPI package may only have chatterbox.tts
             try:
                 from chatterbox.tts_turbo import ChatterboxTurboTTS
                 logger.info(f"Loading Chatterbox-Turbo model (device: {device})")
-                _turbo_model = ChatterboxTurboTTS.from_pretrained(device=device)
+                try:
+                    _turbo_model = ChatterboxTurboTTS.from_pretrained(device=device, attn_implementation="sdpa")
+                except TypeError:
+                    _turbo_model = ChatterboxTurboTTS.from_pretrained(device=device)
                 logger.info("Chatterbox-Turbo model loaded successfully")
             except ImportError:
                 try:
                     from chatterbox.tts import ChatterboxTTS
                     logger.info(f"Loading ChatterboxTTS (fallback, device: {device})")
-                    _turbo_model = ChatterboxTTS.from_pretrained(device=device)
+                    try:
+                        _turbo_model = ChatterboxTTS.from_pretrained(device=device, attn_implementation="sdpa")
+                    except TypeError:
+                        _turbo_model = ChatterboxTTS.from_pretrained(device=device)
                     logger.info("ChatterboxTTS model loaded successfully (use Turbo from source for lower latency)")
                 except ImportError as e:
                     logger.error(f"Chatterbox dependencies not installed: {e}")
@@ -664,7 +685,7 @@ def generate_tts_bytes(text: str, response_language: str = "en") -> bytes:
         model, _, _ = _get_indicf5_model()
         if ref and model is not None:
             try:
-                with _inference_lock:
+                with _inference_semaphore:
                     return _tts_with_indicf5(text, lang)
             except ValueError:
                 raise
@@ -677,7 +698,7 @@ def generate_tts_bytes(text: str, response_language: str = "en") -> bytes:
     if not use_indicf5:
         if not chatterbox_enabled:
             return _tts_with_gemini(text, lang)
-        with _inference_lock:
+        with _inference_semaphore:
             return _tts_with_turbo(text)
     raise ValueError("Something went wrong generating audio. Please try again.")
 
@@ -770,7 +791,7 @@ def text_to_speech(text: str, response_language: str = "en") -> str:
         if ref and model is not None:
             logger.info(f"Using TTS provider: IndicF5 (language: {lang})")
             try:
-                with _inference_lock:
+                with _inference_semaphore:
                     audio_bytes = _tts_with_indicf5(text, lang)
                 audio_bytes = _convert_wav_to_mp3(audio_bytes)
                 filename = f"{lang}_{hashlib.md5(text.encode()).hexdigest()}.mp3"
@@ -815,7 +836,7 @@ def text_to_speech(text: str, response_language: str = "en") -> str:
                 raise ValueError("Something went wrong generating audio. Please try again.")
         logger.info("Using TTS provider: Chatterbox-Turbo")
         try:
-            with _inference_lock:
+            with _inference_semaphore:
                 audio_bytes = _tts_with_turbo(text)
             audio_bytes = _convert_wav_to_mp3(audio_bytes)
             filename = f"{hashlib.md5(text.encode()).hexdigest()}.mp3"
