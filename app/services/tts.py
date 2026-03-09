@@ -382,6 +382,32 @@ def _get_turbo_model():
                 except TypeError:
                     _turbo_model = ChatterboxTurboTTS.from_pretrained(device=device)
                 logger.info("Chatterbox-Turbo model loaded successfully")
+                # Low-latency optimizations (Turbo only). Long-running servers: if throughput drops over time, consider clearing AlignmentStreamAnalyzer hooks or restarting workers (see rsxdalv/chatterbox or Chatterbox-TTS-Server).
+                if device == "cuda" and getattr(settings, "tts_turbo_use_bfloat16", True):
+                    try:
+                        import torch as _torch
+                        _turbo_model.t3 = _turbo_model.t3.to(_torch.bfloat16).eval()
+                        _turbo_model.s3gen = _turbo_model.s3gen.to(_torch.bfloat16).eval()
+                        _turbo_model.ve = _turbo_model.ve.to(_torch.bfloat16).eval()
+                        logger.debug("Chatterbox-Turbo converted to bfloat16")
+                    except Exception as e:
+                        logger.warning("Could not convert Turbo to bfloat16: %s", e)
+                if device == "cuda":
+                    step_target = getattr(_turbo_model.t3, "_step_compilation_target", None)
+                    if callable(step_target):
+                        try:
+                            import torch as _torch
+                            _turbo_model.t3._step_compilation_target = _torch.compile(step_target, fullgraph=True, backend="cudagraphs")
+                            logger.debug("Chatterbox-Turbo t3._step_compilation_target compiled with cudagraphs")
+                        except Exception as e:
+                            logger.debug("Could not compile Turbo step target: %s", e)
+                max_cache_len = getattr(settings, "tts_turbo_max_cache_len", None)
+                if max_cache_len is not None and hasattr(_turbo_model.t3, "max_cache_len"):
+                    try:
+                        _turbo_model.t3.max_cache_len = max_cache_len
+                        logger.debug("Chatterbox-Turbo max_cache_len set to %s", max_cache_len)
+                    except Exception as e:
+                        logger.debug("Could not set Turbo max_cache_len: %s", e)
             except ImportError:
                 try:
                     from chatterbox.tts import ChatterboxTTS
@@ -595,22 +621,50 @@ def _tts_with_turbo(text: str) -> bytes:
         global _turbo_voice_prepared
         with _lock_turbo:
             if getattr(model, "prepare_conditionals", None) and not _turbo_voice_prepared:
-                model.prepare_conditionals(audio_prompt_path)
+                exaggeration = getattr(settings, "tts_turbo_exaggeration", 0.5)
+                model.prepare_conditionals(audio_prompt_path, exaggeration=exaggeration, norm_loudness=True)
                 _turbo_voice_prepared = True
                 logger.info(
                     "Voice cloning reference loaded once: %s (reusing for subsequent requests)",
                     audio_prompt_path,
                 )
 
-        with torch.no_grad():
-            if _turbo_voice_prepared:
-                wav_tensor = model.generate(text)
-            else:
-                wav_tensor = model.generate(text, audio_prompt_path=audio_prompt_path)
-
-        wav_array = wav_tensor.cpu().numpy()
-        if wav_array.ndim > 1:
-            wav_array = wav_array.squeeze()
+        gen_kwargs = {
+            "temperature": getattr(settings, "tts_turbo_temperature", 0.8),
+            "top_p": getattr(settings, "tts_turbo_top_p", 0.95),
+            "top_k": getattr(settings, "tts_turbo_top_k", 1000),
+            "repetition_penalty": getattr(settings, "tts_turbo_repetition_penalty", 1.2),
+        }
+        # generate_stream is not in upstream; requires a streaming-capable fork (e.g. rsxdalv/chatterbox).
+        use_streaming = getattr(settings, "tts_turbo_use_streaming", False) and callable(getattr(model, "generate_stream", None))
+        if use_streaming:
+            chunk_size = getattr(settings, "tts_turbo_stream_chunk_size", 25)
+            chunks = []
+            try:
+                for item in model.generate_stream(text, chunk_size=chunk_size):
+                    if isinstance(item, tuple):
+                        audio_chunk = item[0]
+                    else:
+                        audio_chunk = item
+                    if hasattr(audio_chunk, "cpu"):
+                        audio_chunk = audio_chunk.cpu().numpy()
+                    if isinstance(audio_chunk, np.ndarray):
+                        chunks.append(audio_chunk)
+            except TypeError:
+                use_streaming = False
+            if use_streaming:
+                wav_array = np.concatenate(chunks, axis=0) if chunks else np.array([], dtype=np.float32)
+                if wav_array.ndim > 1:
+                    wav_array = wav_array.squeeze()
+        if not use_streaming:
+            with torch.no_grad():
+                if _turbo_voice_prepared:
+                    wav_tensor = model.generate(text, **gen_kwargs)
+                else:
+                    wav_tensor = model.generate(text, audio_prompt_path=audio_prompt_path, **gen_kwargs)
+            wav_array = wav_tensor.cpu().numpy()
+            if wav_array.ndim > 1:
+                wav_array = wav_array.squeeze()
 
         sample_rate = model.sr
         logger.info(f"Generated audio: {len(wav_array)} samples at {sample_rate}Hz")

@@ -85,7 +85,7 @@ The architecture is designed to handle synchronous blocks through threading (`as
 #### 3. Text-to-Speech (TTS) - `app/services/tts.py`
 - Converts AI text replies back into audio.
 - **Backends:**
-  - **Chatterbox-Turbo (English):** Requires a reference WAV (`tts_audio_prompt_path`) to perform high-quality zero-shot voice cloning locally.
+  - **Chatterbox-Turbo (English):** Requires a reference WAV (`tts_audio_prompt_path`) to perform high-quality zero-shot voice cloning locally. Optional low-latency settings: bfloat16 on CUDA (`TTS_TURBO_USE_BFLOAT16`), configurable generate/prepare_conditionals params (temperature, top_p, top_k, repetition_penalty, exaggeration), and optional torch.compile/max_cache_len when the model or a fork exposes them. For maximum throughput, a fork that passes `output_hidden_states=False` to the transformer forward (e.g. [rsxdalv/chatterbox](https://github.com/rsxdalv/chatterbox) streaming branch, see issue #127) can be used. Long-running servers: if TTS throughput drops over time, consider clearing AlignmentStreamAnalyzer hooks or restarting workers; some forks (e.g. Chatterbox-TTS-Server) handle this cleanup.
   - **IndicF5 (Indic Languages):** Dedicated local model for languages like Hindi, Malayalam, Tamil, etc., requiring reference audios per language.
   - **Gemini TTS (Fallback):** Cloud API generation if local models are disabled or fail.
 - **Storage:** Audio is synthesized as WAV bytes, converted to MP3 (via FFmpeg), and saved either to `audio_storage/` or uploaded to AWS S3 (returning a presigned GET URL).

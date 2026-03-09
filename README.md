@@ -95,7 +95,7 @@ The app supports two modes via `APP_ENV`:
 | **GEMINI_API_KEY** | Optional (LLM will fail without it) | **Required** — app will not start without it |
 | **Redis / S3** | Optional | Recommended for latency and scalability |
 
-**Production (e.g. RunPod):** Set `APP_ENV=prod`, provide `GEMINI_API_KEY`, and configure Redis and S3. STT uses faster-whisper large-v3 on GPU when available; TTS uses Chatterbox-Turbo and IndicF5 on GPU. All inference runs in a thread pool with configurable timeouts; slow requests return 504 with a user-safe message.
+**Production (e.g. RunPod):** Set `APP_ENV=prod`, provide `GEMINI_API_KEY`, and configure Redis and S3. STT uses faster-whisper large-v3 on GPU when available; TTS uses Chatterbox-Turbo and IndicF5 on GPU. Optional Turbo low-latency env vars: `TTS_TURBO_USE_BFLOAT16` (default true on CUDA), `TTS_TURBO_TEMPERATURE`, `TTS_TURBO_TOP_P`, `TTS_TURBO_EXAGGERATION`, `TTS_TURBO_USE_STREAMING` (for forks with `generate_stream`). If throughput drops over long runs, consider worker restart or a fork that clears AlignmentStreamAnalyzer hooks. All inference runs in a thread pool with configurable timeouts; slow requests return 504 with a user-safe message.
 
 ### Production (RunPod) — GPU Docker and Gunicorn
 

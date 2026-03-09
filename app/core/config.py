@@ -102,6 +102,17 @@ class Settings(BaseSettings):
     # When True, force DummyWatermarker to skip loading watermark weights (patch must run before model instantiation)
     tts_use_dummy_watermarker: bool = Field(default=False, description="TTS_USE_DUMMY_WATERMARKER: force DummyWatermarker to skip loading watermark weights")
 
+    # TTS Settings - Chatterbox-Turbo low-latency (optional; upstream + fork-friendly)
+    tts_turbo_use_bfloat16: bool = Field(default=True, description="TTS_TURBO_USE_BFLOAT16: use bfloat16 for Turbo on CUDA (saves memory bandwidth)")
+    tts_turbo_max_cache_len: Optional[int] = Field(default=550, description="TTS_TURBO_MAX_CACHE_LEN: KV cache length for Turbo (500-600 for latency; only used if model exposes it)")
+    tts_turbo_temperature: float = Field(default=0.8, description="TTS_TURBO_TEMPERATURE: sampling temperature for Turbo generate()")
+    tts_turbo_top_p: float = Field(default=0.95, description="TTS_TURBO_TOP_P: top-p for Turbo generate()")
+    tts_turbo_top_k: int = Field(default=1000, description="TTS_TURBO_TOP_K: top-k for Turbo generate()")
+    tts_turbo_repetition_penalty: float = Field(default=1.2, description="TTS_TURBO_REPETITION_PENALTY: repetition penalty for Turbo generate()")
+    tts_turbo_exaggeration: float = Field(default=0.5, description="TTS_TURBO_EXAGGERATION: exaggeration for prepare_conditionals (e.g. 0.7 for faster pacing)")
+    tts_turbo_use_streaming: bool = Field(default=False, description="TTS_TURBO_USE_STREAMING: use model.generate_stream when available (requires streaming-capable fork)")
+    tts_turbo_stream_chunk_size: int = Field(default=25, description="TTS_TURBO_STREAM_CHUNK_SIZE: chunk size for generate_stream when used (smaller = lower TTFS)")
+
     # Cache TTLs
     llm_cache_ttl: int = 86400  # 24 hours
     tts_cache_ttl: int = 604800  # 7 days
