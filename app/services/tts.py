@@ -622,7 +622,13 @@ def _tts_with_turbo(text: str) -> bytes:
         with _lock_turbo:
             if getattr(model, "prepare_conditionals", None) and not _turbo_voice_prepared:
                 exaggeration = getattr(settings, "tts_turbo_exaggeration", 0.5)
-                model.prepare_conditionals(audio_prompt_path, exaggeration=exaggeration, norm_loudness=True)
+                try:
+                    model.prepare_conditionals(audio_prompt_path, exaggeration=exaggeration, norm_loudness=True)
+                except TypeError:
+                    try:
+                        model.prepare_conditionals(audio_prompt_path, exaggeration=exaggeration)
+                    except TypeError:
+                        model.prepare_conditionals(audio_prompt_path)
                 _turbo_voice_prepared = True
                 logger.info(
                     "Voice cloning reference loaded once: %s (reusing for subsequent requests)",
