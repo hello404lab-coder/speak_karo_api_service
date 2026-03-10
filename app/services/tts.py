@@ -440,6 +440,8 @@ def _get_turbo_model():
                 t3_obj = _turbo_model.t3
                 _orig_inference_turbo = getattr(t3_obj, "inference_turbo", None)
                 if callable(_orig_inference_turbo):
+                    # Use unbound function so we can pass (t3_obj, *args, **kwargs) without double self.
+                    _orig_inference_turbo = getattr(_orig_inference_turbo, "__func__", _orig_inference_turbo)
                     _max_gen_len_default = getattr(settings, "tts_turbo_max_gen_len", 400)
 
                     def _wrapped_inference_turbo(*args, **kwargs):
@@ -482,6 +484,7 @@ def _get_turbo_model():
                     t3_obj = _turbo_model.t3
                     _orig_inference = getattr(t3_obj, "inference", None)
                     if callable(_orig_inference):
+                        _orig_inference = getattr(_orig_inference, "__func__", _orig_inference)
                         _max_new_tokens_default = getattr(settings, "tts_turbo_max_gen_len", 400)
 
                         def _wrapped_inference(*args, **kwargs):
