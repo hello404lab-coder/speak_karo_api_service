@@ -436,6 +436,26 @@ def _get_turbo_model():
                         logger.debug("Chatterbox-Turbo max_cache_len set to %s", max_cache_len)
                     except Exception as e:
                         logger.debug("Could not set Turbo max_cache_len: %s", e)
+                # Wrap inference_turbo to pass max_gen_len from config or per-call override (reduces loop overhead).
+                _orig_inference_turbo = getattr(_turbo_model.t3, "inference_turbo", None)
+                if callable(_orig_inference_turbo):
+                    _max_gen_len_default = getattr(settings, "tts_turbo_max_gen_len", 400)
+
+                    def _wrapped_inference_turbo(t3_self, *args, **kwargs):
+                        mg = getattr(t3_self, "_max_gen_len_override", None)
+                        kwargs["max_gen_len"] = mg if mg is not None else _max_gen_len_default
+                        return _orig_inference_turbo(t3_self, *args, **kwargs)
+
+                    _turbo_model.t3.inference_turbo = _wrapped_inference_turbo
+                    logger.debug("Chatterbox-Turbo t3.inference_turbo wrapped with max_gen_len from config")
+                # Compile S3 decoder when enabled (CUDA).
+                if device == "cuda" and getattr(settings, "tts_turbo_compile_s3gen", True) and hasattr(_turbo_model, "s3gen"):
+                    try:
+                        import torch as _torch
+                        _turbo_model.s3gen = _torch.compile(_turbo_model.s3gen, mode="reduce-overhead")
+                        logger.debug("Chatterbox-Turbo s3gen compiled with torch.compile (reduce-overhead)")
+                    except Exception as e:
+                        logger.debug("s3gen compile failed: %s; leaving uncompiled", e)
             except ImportError:
                 try:
                     from chatterbox.tts import ChatterboxTTS
@@ -457,6 +477,26 @@ def _get_turbo_model():
                             logger.debug("ChatterboxTTS tfmr.forward wrapped for SDPA")
                         except Exception as e:
                             logger.debug("Could not wrap ChatterboxTTS tfmr.forward: %s", e)
+                    # Wrap inference to pass max_new_tokens from config or per-call override.
+                    _orig_inference = getattr(_turbo_model.t3, "inference", None)
+                    if callable(_orig_inference):
+                        _max_new_tokens_default = getattr(settings, "tts_turbo_max_gen_len", 400)
+
+                        def _wrapped_inference(t3_self, *args, **kwargs):
+                            mn = getattr(t3_self, "_max_gen_len_override", None)
+                            kwargs["max_new_tokens"] = mn if mn is not None else _max_new_tokens_default
+                            return _orig_inference(t3_self, *args, **kwargs)
+
+                        _turbo_model.t3.inference = _wrapped_inference
+                        logger.debug("ChatterboxTTS t3.inference wrapped with max_new_tokens from config")
+                    # Compile S3 decoder when enabled (CUDA).
+                    if device == "cuda" and getattr(settings, "tts_turbo_compile_s3gen", True) and hasattr(_turbo_model, "s3gen"):
+                        try:
+                            import torch as _torch
+                            _turbo_model.s3gen = _torch.compile(_turbo_model.s3gen, mode="reduce-overhead")
+                            logger.debug("ChatterboxTTS s3gen compiled with torch.compile (reduce-overhead)")
+                        except Exception as e:
+                            logger.debug("s3gen compile failed: %s; leaving uncompiled", e)
                 except ImportError as e:
                     logger.error(f"Chatterbox dependencies not installed: {e}")
                     raise ValueError(
@@ -725,7 +765,14 @@ def _tts_with_turbo(text: str) -> bytes:
                 if wav_array.ndim > 1:
                     wav_array = wav_array.squeeze()
         if not use_streaming:
-            with torch.no_grad():
+            # Optional dynamic cap: limit max_gen_len per request (config ceiling still applies in wrapper).
+            if hasattr(model, "t3"):
+                model.t3._max_gen_len_override = min(512, max(100, len(text) * 3))
+            try:
+                no_grad_ctx = torch.inference_mode()
+            except AttributeError:
+                no_grad_ctx = torch.no_grad()
+            with no_grad_ctx:
                 wav_tensor = _do_generate()
             wav_array = wav_tensor.cpu().numpy()
             if wav_array.ndim > 1:

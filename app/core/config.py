@@ -115,6 +115,8 @@ class Settings(BaseSettings):
     tts_force_sdpa_attention: bool = Field(default=True, description="TTS_FORCE_SDPA_ATTENTION: force output_attentions=False on transformer forward to use SDPA (avoids manual attention fallback)")
     tts_turbo_cfg_weight: float = Field(default=0.3, description="TTS_TURBO_CFG_WEIGHT: CFG weight for generate (0.3 for faster pacing); used by non-Turbo ChatterboxTTS")
     tts_turbo_compile_t3: bool = Field(default=True, description="TTS_TURBO_COMPILE_T3: compile T3 with torch.compile for lower overhead; disable if it causes graph breaks")
+    tts_turbo_max_gen_len: int = Field(default=400, description="TTS_TURBO_MAX_GEN_LEN: max T3 speech tokens per sentence (lower = less loop overhead; library default 1000)")
+    tts_turbo_compile_s3gen: bool = Field(default=True, description="TTS_TURBO_COMPILE_S3GEN: compile S3 decoder with torch.compile; disable if it causes graph breaks")
 
     # Cache TTLs
     llm_cache_ttl: int = 86400  # 24 hours
