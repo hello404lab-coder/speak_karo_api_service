@@ -377,30 +377,58 @@ def _get_turbo_model():
             try:
                 from chatterbox.tts_turbo import ChatterboxTurboTTS
                 logger.info(f"Loading Chatterbox-Turbo model (device: {device})")
-                try:
-                    _turbo_model = ChatterboxTurboTTS.from_pretrained(device=device, attn_implementation="sdpa")
-                except TypeError:
-                    _turbo_model = ChatterboxTurboTTS.from_pretrained(device=device)
-                logger.info("Chatterbox-Turbo model loaded successfully")
-                # Low-latency optimizations (Turbo only). Long-running servers: if throughput drops over time, consider clearing AlignmentStreamAnalyzer hooks or restarting workers (see rsxdalv/chatterbox or Chatterbox-TTS-Server).
-                if device == "cuda" and getattr(settings, "tts_turbo_use_bfloat16", True):
+                use_bfloat16 = device == "cuda" and getattr(settings, "tts_turbo_use_bfloat16", True)
+                _turbo_model = None
+                if use_bfloat16:
                     try:
                         import torch as _torch
-                        _turbo_model.t3 = _turbo_model.t3.to(_torch.bfloat16).eval()
-                        _turbo_model.s3gen = _turbo_model.s3gen.to(_torch.bfloat16).eval()
-                        _turbo_model.ve = _turbo_model.ve.to(_torch.bfloat16).eval()
-                        logger.debug("Chatterbox-Turbo converted to bfloat16")
+                        _turbo_model = ChatterboxTurboTTS.from_pretrained(device=device, torch_dtype=_torch.bfloat16)
+                    except TypeError:
+                        pass
+                if _turbo_model is None:
+                    try:
+                        _turbo_model = ChatterboxTurboTTS.from_pretrained(device=device, attn_implementation="sdpa")
+                    except TypeError:
+                        _turbo_model = ChatterboxTurboTTS.from_pretrained(device=device)
+                logger.info("Chatterbox-Turbo model loaded successfully")
+                # Force SDPA: wrap transformer forward so output_attentions=False, output_hidden_states=False (avoids manual attention fallback). Depends on transformers version; for max throughput a fork that sets these at call site (e.g. rsxdalv/chatterbox#127) can be used.
+                if device == "cuda" and getattr(settings, "tts_force_sdpa_attention", True) and hasattr(_turbo_model.t3, "tfmr"):
+                    try:
+                        _orig_forward = _turbo_model.t3.tfmr.forward
+                        def _wrapped_forward(*args, **kwargs):
+                            kwargs["output_attentions"] = False
+                            kwargs["output_hidden_states"] = False
+                            return _orig_forward(*args, **kwargs)
+                        _turbo_model.t3.tfmr.forward = _wrapped_forward
+                        logger.debug("Chatterbox-Turbo tfmr.forward wrapped for SDPA (output_attentions=False, output_hidden_states=False)")
+                    except Exception as e:
+                        logger.debug("Could not wrap Turbo tfmr.forward for SDPA: %s", e)
+                # Post-load bfloat16 when not loaded with torch_dtype (e.g. library does not support it).
+                if device == "cuda" and use_bfloat16:
+                    try:
+                        import torch as _torch
+                        if _turbo_model.t3.tfmr.weight.dtype != _torch.bfloat16:
+                            _turbo_model.t3 = _turbo_model.t3.to(_torch.bfloat16).eval()
+                            _turbo_model.s3gen = _turbo_model.s3gen.to(_torch.bfloat16).eval()
+                            _turbo_model.ve = _turbo_model.ve.to(_torch.bfloat16).eval()
+                            logger.debug("Chatterbox-Turbo converted to bfloat16")
                     except Exception as e:
                         logger.warning("Could not convert Turbo to bfloat16: %s", e)
-                if device == "cuda":
-                    step_target = getattr(_turbo_model.t3, "_step_compilation_target", None)
-                    if callable(step_target):
-                        try:
-                            import torch as _torch
-                            _turbo_model.t3._step_compilation_target = _torch.compile(step_target, fullgraph=True, backend="cudagraphs")
-                            logger.debug("Chatterbox-Turbo t3._step_compilation_target compiled with cudagraphs")
-                        except Exception as e:
-                            logger.debug("Could not compile Turbo step target: %s", e)
+                if device == "cuda" and getattr(settings, "tts_turbo_compile_t3", True):
+                    try:
+                        import torch as _torch
+                        _turbo_model.t3 = _torch.compile(_turbo_model.t3, mode="reduce-overhead", fullgraph=True)
+                        logger.debug("Chatterbox-Turbo t3 compiled with torch.compile (reduce-overhead)")
+                    except Exception as e:
+                        logger.debug("Full t3 compile failed: %s; trying _step_compilation_target if present", e)
+                        step_target = getattr(_turbo_model.t3, "_step_compilation_target", None)
+                        if callable(step_target):
+                            try:
+                                import torch as _torch
+                                _turbo_model.t3._step_compilation_target = _torch.compile(step_target, fullgraph=True, backend="cudagraphs")
+                                logger.debug("Chatterbox-Turbo t3._step_compilation_target compiled with cudagraphs")
+                            except Exception as e2:
+                                logger.debug("Could not compile Turbo step target: %s", e2)
                 max_cache_len = getattr(settings, "tts_turbo_max_cache_len", None)
                 if max_cache_len is not None and hasattr(_turbo_model.t3, "max_cache_len"):
                     try:
@@ -417,6 +445,18 @@ def _get_turbo_model():
                     except TypeError:
                         _turbo_model = ChatterboxTTS.from_pretrained(device=device)
                     logger.info("ChatterboxTTS model loaded successfully (use Turbo from source for lower latency)")
+                    # SDPA wrap for fallback too (non-Turbo uses tfmr in inference loop).
+                    if device == "cuda" and getattr(settings, "tts_force_sdpa_attention", True) and hasattr(_turbo_model.t3, "tfmr"):
+                        try:
+                            _orig_fwd = _turbo_model.t3.tfmr.forward
+                            def _wrap_fwd(*args, **kwargs):
+                                kwargs["output_attentions"] = False
+                                kwargs["output_hidden_states"] = False
+                                return _orig_fwd(*args, **kwargs)
+                            _turbo_model.t3.tfmr.forward = _wrap_fwd
+                            logger.debug("ChatterboxTTS tfmr.forward wrapped for SDPA")
+                        except Exception as e:
+                            logger.debug("Could not wrap ChatterboxTTS tfmr.forward: %s", e)
                 except ImportError as e:
                     logger.error(f"Chatterbox dependencies not installed: {e}")
                     raise ValueError(
@@ -621,7 +661,7 @@ def _tts_with_turbo(text: str) -> bytes:
         global _turbo_voice_prepared
         with _lock_turbo:
             if getattr(model, "prepare_conditionals", None) and not _turbo_voice_prepared:
-                exaggeration = getattr(settings, "tts_turbo_exaggeration", 0.5)
+                exaggeration = getattr(settings, "tts_turbo_exaggeration", 0.7)
                 try:
                     model.prepare_conditionals(audio_prompt_path, exaggeration=exaggeration, norm_loudness=True)
                 except TypeError:
@@ -641,8 +681,9 @@ def _tts_with_turbo(text: str) -> bytes:
             "top_k": getattr(settings, "tts_turbo_top_k", 1000),
             "repetition_penalty": getattr(settings, "tts_turbo_repetition_penalty", 1.2),
         }
-        # ChatterboxTTS (non-Turbo fallback) does not accept top_k; it uses temperature, top_p, repetition_penalty, exaggeration, cfg_weight, min_p.
+        # ChatterboxTTS (non-Turbo fallback) does not accept top_k; it uses temperature, top_p, repetition_penalty, cfg_weight, exaggeration, min_p.
         gen_kwargs_fallback = {k: v for k, v in gen_kwargs.items() if k != "top_k"}
+        gen_kwargs_fallback["cfg_weight"] = getattr(settings, "tts_turbo_cfg_weight", 0.3)
 
         def _do_generate():
             if _turbo_voice_prepared:
