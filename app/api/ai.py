@@ -348,9 +348,19 @@ def _is_section_header(line: str) -> bool:
     )
 
 
-# Minimum chars before sending a sentence to TTS (avoids single-word fragments, improves prosody)
-_MIN_SENTENCE_CHARS = 25
-_SENTENCE_BOUNDARIES = (".", "?", "\u0964", "\n")  # Purna Viram (।) = \u0964
+# Minimum chars before sending a sentence to TTS (avoids single-word fragments, improves prosody; ~18 prevents "Ok." from flushing alone)
+_MIN_SENTENCE_CHARS = 18
+_SENTENCE_BOUNDARIES = (".", "?", "!", "\u0964", "\n")  # Purna Viram (।) = \u0964
+
+
+def _clean_sentence_for_tts(s: str) -> str:
+    """Strip whitespace, quotes, and JSON cruft so TTS never sees characters that cause alignment pauses."""
+    if not s:
+        return ""
+    s = s.strip().strip('"')
+    # Remove internal quotes and trailing JSON/control chars
+    s = s.replace('"', "").replace("}", "").replace("\n", " ").strip()
+    return s
 
 
 async def _llm_tts_streaming_pipeline(
@@ -412,16 +422,41 @@ async def _llm_tts_streaming_pipeline(
                 if not in_reply:
                     continue
 
-                end_quote_idx = buffer.find('"')
-                if json_reply_started and end_quote_idx >= 0:
-                    sentence = buffer[:end_quote_idx].strip()
-                    if sentence:
-                        main_queue.put_nowait(("text", sentence))
-                        sentence_queue.put_nowait(sentence)
-                    in_reply = False
-                    buffer = buffer[end_quote_idx + 1 :].lstrip()
+                # Intra-quote flushing: when inside JSON reply_text, flush on sentence boundaries
+                if json_reply_started:
+                    while True:
+                        idx = -1
+                        for sep in _SENTENCE_BOUNDARIES:
+                            i = buffer.find(sep)
+                            if i >= 0 and (idx < 0 or i < idx):
+                                idx = i
+                        if idx < 0:
+                            break
+                        segment = buffer[: idx + 1].strip()
+                        if len(segment) < _MIN_SENTENCE_CHARS:
+                            break
+                        cleaned = _clean_sentence_for_tts(segment)
+                        if cleaned:
+                            main_queue.put_nowait(("text", cleaned))
+                            sentence_queue.put_nowait(cleaned)
+                        buffer = buffer[idx + 1 :].lstrip()
+                    # Closing quote: flush any remaining content before the quote, then exit reply
+                    if buffer.startswith('"'):
+                        in_reply = False
+                        buffer = buffer[1:].lstrip()
+                        continue
+                    end_quote_idx = buffer.find('"')
+                    if end_quote_idx >= 0:
+                        segment = buffer[:end_quote_idx].strip()
+                        cleaned = _clean_sentence_for_tts(segment)
+                        if cleaned:
+                            main_queue.put_nowait(("text", cleaned))
+                            sentence_queue.put_nowait(cleaned)
+                        in_reply = False
+                        buffer = buffer[end_quote_idx + 1 :].lstrip()
                     continue
 
+                # Plain-text reply path: sentence-boundary flush
                 idx = -1
                 for sep in _SENTENCE_BOUNDARIES:
                     i = buffer.find(sep)
@@ -429,24 +464,22 @@ async def _llm_tts_streaming_pipeline(
                         idx = i
                 if idx >= 0:
                     sentence = buffer[: idx + 1].strip()
-                    if len(sentence) < _MIN_SENTENCE_CHARS:
-                        continue
-                    if not json_reply_started:
-                        for line in sentence.split("\n"):
-                            if _is_section_header(line.strip()):
-                                in_reply = False
-                                break
-                        if not in_reply:
-                            continue
-                    buffer = buffer[idx + 1 :].lstrip()
-                    if sentence:
-                        main_queue.put_nowait(("text", sentence))
-                        sentence_queue.put_nowait(sentence)
+                    if len(sentence) >= _MIN_SENTENCE_CHARS:
+                        if not json_reply_started:
+                            for line in sentence.split("\n"):
+                                if _is_section_header(line.strip()):
+                                    in_reply = False
+                                    break
+                            if not in_reply:
+                                continue
+                        cleaned = _clean_sentence_for_tts(sentence)
+                        if cleaned:
+                            main_queue.put_nowait(("text", cleaned))
+                            sentence_queue.put_nowait(cleaned)
+                        buffer = buffer[idx + 1 :].lstrip()
 
             if buffer.strip() and in_reply:
-                sent = buffer.strip()
-                if json_reply_started:
-                    sent = sent.replace('"', '').replace('}', '').strip()
+                sent = _clean_sentence_for_tts(buffer.strip())
                 if sent:
                     main_queue.put_nowait(("text", sent))
                     sentence_queue.put_nowait(sent)

@@ -108,14 +108,14 @@ class Settings(BaseSettings):
     tts_turbo_temperature: float = Field(default=0.8, description="TTS_TURBO_TEMPERATURE: sampling temperature for Turbo generate()")
     tts_turbo_top_p: float = Field(default=0.95, description="TTS_TURBO_TOP_P: top-p for Turbo generate()")
     tts_turbo_top_k: int = Field(default=1000, description="TTS_TURBO_TOP_K: top-k for Turbo generate()")
-    tts_turbo_repetition_penalty: float = Field(default=1.2, description="TTS_TURBO_REPETITION_PENALTY: repetition penalty for Turbo generate()")
+    tts_turbo_repetition_penalty: float = Field(default=1.05, description="TTS_TURBO_REPETITION_PENALTY: repetition penalty for Turbo generate(); 1.05 reduces hesitations for low-latency")
     tts_turbo_exaggeration: float = Field(default=0.7, description="TTS_TURBO_EXAGGERATION: exaggeration for prepare_conditionals (0.7+ for faster pacing)")
     tts_turbo_use_streaming: bool = Field(default=False, description="TTS_TURBO_USE_STREAMING: use model.generate_stream when available (requires streaming-capable fork)")
     tts_turbo_stream_chunk_size: int = Field(default=25, description="TTS_TURBO_STREAM_CHUNK_SIZE: chunk size for generate_stream when used (smaller = lower TTFS)")
     tts_force_sdpa_attention: bool = Field(default=True, description="TTS_FORCE_SDPA_ATTENTION: force output_attentions=False on transformer forward to use SDPA (avoids manual attention fallback)")
     tts_turbo_cfg_weight: float = Field(default=0.3, description="TTS_TURBO_CFG_WEIGHT: CFG weight for generate (0.3 for faster pacing); used by non-Turbo ChatterboxTTS")
     tts_turbo_compile_t3: bool = Field(default=True, description="TTS_TURBO_COMPILE_T3: compile T3 with torch.compile for lower overhead; disable if it causes graph breaks")
-    tts_turbo_max_gen_len: int = Field(default=400, description="TTS_TURBO_MAX_GEN_LEN: max T3 speech tokens per sentence (lower = less loop overhead; library default 1000)")
+    tts_turbo_max_gen_len: int = Field(default=400, description="TTS_TURBO_MAX_GEN_LEN: ceiling for T3 speech tokens per sentence; per-call uses min(400, max(100, len(text)*3)). Lower = less loop overhead.")
     tts_turbo_compile_s3gen: bool = Field(default=True, description="TTS_TURBO_COMPILE_S3GEN: compile S3 decoder with torch.compile; disable if it causes graph breaks")
 
     # Cache TTLs

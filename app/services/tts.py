@@ -24,6 +24,7 @@ _turbo_model = None
 _turbo_device = None
 _lock_turbo = threading.Lock()
 _turbo_voice_prepared = False  # Voice cloning: prepare once, reuse for all generate() calls
+_turbo_warmup_done = False  # One inference after load so compiled kernels are ready for first user
 
 # Lazy-loaded IndicF5 model and vocoder (loaded on first use); lock prevents double-load
 _indicf5_model = None
@@ -770,9 +771,10 @@ def _tts_with_turbo(text: str) -> bytes:
                 if wav_array.ndim > 1:
                     wav_array = wav_array.squeeze()
         if not use_streaming:
-            # Optional dynamic cap: limit max_gen_len per request (config ceiling still applies in wrapper).
+            # Dynamic cap: min(config ceiling, max(100, len(text)*3)) for lower latency.
+            max_gen_len_ceiling = getattr(settings, "tts_turbo_max_gen_len", 400) or 400
             if hasattr(model, "t3"):
-                model.t3._max_gen_len_override = min(512, max(100, len(text) * 3))
+                model.t3._max_gen_len_override = min(max_gen_len_ceiling, max(100, len(text) * 3))
             try:
                 no_grad_ctx = torch.inference_mode()
             except AttributeError:
@@ -1034,8 +1036,10 @@ def init_tts_models() -> dict:
     Load TTS models (Turbo and optionally IndicF5) for warmup.
     When TTS_CHATTERBOX_ENABLED=false, Turbo is not loaded.
     When TTS_INDICF5_ENABLED=false, IndicF5 is not loaded.
+    Runs one short TTS inference after loading Turbo so torch.compile/CUDA kernels are warmed.
     Returns {"turbo": "loaded"|"disabled"|"failed", "indicf5": "loaded"|"disabled"|"skipped"|"failed"}.
     """
+    global _turbo_warmup_done
     result: dict = {}
     if not getattr(settings, "tts_chatterbox_enabled", True):
         result["turbo"] = "disabled"
@@ -1043,6 +1047,13 @@ def init_tts_models() -> dict:
         try:
             _get_turbo_model()
             result["turbo"] = "loaded"
+            if not _turbo_warmup_done:
+                try:
+                    generate_tts_bytes("Hello.", "en")
+                    _turbo_warmup_done = True
+                    logger.info("TTS warm-up inference completed (compiled kernels ready)")
+                except Exception as warmup_e:
+                    logger.warning("TTS warm-up inference failed: %s (first user request may be slower)", warmup_e)
         except Exception as e:
             logger.exception("TTS Turbo init failed")
             result["turbo"] = "failed"
