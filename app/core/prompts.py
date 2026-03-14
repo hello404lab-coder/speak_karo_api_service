@@ -13,16 +13,20 @@ class LLMReplySchema(BaseModel):
     """Schema for Gemini LLM reply. Used for response_json_schema and parsing."""
     reply_text: str = Field(..., description="Response to the user (spoken by TTS)")
     correction: str = Field(default="", description="Correct English phrase; display only")
+    explanation: str = Field(default="", description="Short explanation of the mistake (max 20 words)")
+    example: str = Field(default="", description="One example sentence showing correct usage")
     score: int = Field(default=70, ge=0, le=100, description="Score 0-100")
 
 # Base schema for JSON output (used in system instruction)
-# Only reply_text is spoken (TTS/stream); correction is for display only.
+# Only reply_text is spoken (TTS/stream); correction, explanation, example are for display only.
 JSON_FORMAT_INSTRUCTION = """
 Respond ONLY in valid JSON format with these keys:
 {
-  "reply_text": "your response to the user (this is the ONLY part that will be spoken by TTS)",
-  "correction": "correct English phrase or sentence (what they should say in English); empty string if no correction (display only, not spoken)",
-  "score": 0-100 integer
+  "reply_text": "spoken response that continues conversation (this is the ONLY part spoken by TTS)",
+  "correction": "correct sentence if mistake exists, otherwise empty string (display only, not spoken)",
+  "explanation": "short explanation of the mistake (max 20 words); empty if no mistake (display only)",
+  "example": "one example sentence showing correct usage; empty if no mistake (display only)",
+  "score": integer from 0 to 100
 }
 """
 
@@ -49,35 +53,57 @@ LANGUAGE_NAMES: Dict[str, str] = {
     "pt": "Portuguese",
 }
 
-SYSTEM_PROMPT_TEMPLATE = """You are a friendly but thorough English tutor on a voice call. Your PRIMARY job is to catch and correct the learner's English mistakes — grammar, vocabulary, word order, tense, articles, prepositions — while keeping the conversation flowing naturally.
+SYSTEM_PROMPT_TEMPLATE = """You are an experienced English speaking tutor helping a learner practice English in a voice conversation.
+
+Your goals are:
+1. Help the learner speak more naturally.
+2. Correct mistakes clearly.
+3. Teach one useful improvement at a time.
+4. Keep the conversation natural and engaging.
+
+You must behave like a friendly tutor on a voice call.
 
 LANGUAGE: Respond ONLY in English in 'reply_text'.
+
 {json_format}
 
-HOW TO CORRECT:
-- When the learner makes a mistake, briefly acknowledge what they said, then naturally model the correct form in your reply so they hear it spoken aloud.
-- Put the corrected sentence or phrase in 'correction' (shown on-screen, never spoken). Write ONLY the corrected version, no labels or explanations.
-- If they made multiple mistakes, correct the most important one. Don't overwhelm.
-- If their English was correct, leave 'correction' as an empty string and give them a higher score.
+IMPORTANT RULES:
 
-HOW TO TEACH:
-- After correcting, move the conversation forward. Ask a follow-up question that nudges them to use the corrected structure again.
-- Introduce slightly more advanced vocabulary or structures when they're doing well.
-- If they seem stuck, offer a simpler way to say what they're trying to express.
+1. If the learner makes a mistake:
+   - Identify the most important mistake.
+   - Provide the corrected sentence.
+   - Give a short explanation (max 20 words).
+   - Provide one example sentence.
 
-SCORING:
-- 90-100: No mistakes, natural phrasing.
-- 70-89: Minor errors (article, preposition) but understandable.
-- 50-69: Noticeable grammar or vocabulary issues.
-- 30-49: Hard to understand, frequent errors.
-- 0-29: Very limited communication.
+2. Never correct more than ONE mistake in a single response.
 
-RULES:
-1. Be brief: 2-4 short sentences. Under 50 words in 'reply_text'.
-2. Always end with a question to keep them talking.
-3. Speak naturally and conversationally — this is a voice call, not a textbook.
-4. Only put spoken content in 'reply_text'. 'correction' is for on-screen reading only, never spoken by TTS.
-5. Do NOT use filler praise like "Great job!" or "Don't worry!" unless they specifically need encouragement."""
+3. If the sentence is correct:
+   - Leave "correction", "explanation", and "example" empty.
+   - Give a higher score.
+
+4. Your spoken reply must:
+   - sound natural
+   - be conversational
+   - be under 50 words
+   - end with a question to continue the conversation
+
+5. Do not include explanations inside reply_text.
+
+6. Be encouraging but avoid excessive praise.
+
+7. Adjust vocabulary difficulty based on learner level.
+
+SCORING RULES:
+
+Start from score 100.
+
+Subtract:
+-10 for grammar mistake
+-10 for vocabulary mistake
+-5 for article or preposition mistake
+-5 for word order mistake
+
+Minimum score = 0."""
 
 
 def get_system_instruction(response_language: str = "en", long_term_context: Optional[str] = None) -> str:
@@ -128,7 +154,7 @@ def _extract_json_string_value(raw: str, key: str) -> str:
 def parse_gemini_response(response_text: str) -> Dict[str, any]:
     """
     Parse JSON from Gemini response. Handles optional markdown code fences.
-    Returns dict with reply_text, correction, score.
+    Returns dict with reply_text, correction, explanation, example, score.
     When full JSON parse fails (e.g. truncated stream), tries to extract fields from raw text
     so reply_text is never the raw JSON string.
     """
@@ -137,6 +163,8 @@ def parse_gemini_response(response_text: str) -> Dict[str, any]:
         data = json.loads(clean)
         reply_text = data.get("reply_text") or data.get("reply", "")
         correction = data.get("correction") or ""
+        explanation = data.get("explanation") or ""
+        example = data.get("example") or ""
         score = data.get("score", 70)
         if not isinstance(score, int):
             try:
@@ -147,11 +175,15 @@ def parse_gemini_response(response_text: str) -> Dict[str, any]:
         return {
             "reply_text": (reply_text or "").strip() or _extract_json_string_value(clean, "reply_text"),
             "correction": (correction or "").strip(),
+            "explanation": (explanation or "").strip(),
+            "example": (example or "").strip(),
             "score": score,
         }
     except Exception:
         reply_text = _extract_json_string_value(clean, "reply_text")
         correction = _extract_json_string_value(clean, "correction")
+        explanation = _extract_json_string_value(clean, "explanation")
+        example = _extract_json_string_value(clean, "example")
         score_str = re.search(r'"score"\s*:\s*(\d+)', clean)
         score = int(score_str.group(1)) if score_str else 70
         score = max(0, min(100, score))
@@ -162,5 +194,7 @@ def parse_gemini_response(response_text: str) -> Dict[str, any]:
         return {
             "reply_text": reply_text.strip() or "I couldn't process that.",
             "correction": correction.strip(),
+            "explanation": explanation.strip(),
+            "example": example.strip(),
             "score": score,
         }

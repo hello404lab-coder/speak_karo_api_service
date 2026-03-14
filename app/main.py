@@ -18,6 +18,7 @@ from app.core.config import settings
 from app.database import init_db
 from app.api.ai import router as ai_router
 from app.api.auth import router as auth_router
+from app.api.conversations import router as conversations_router
 from app.api.subscription import router as subscription_router
 from app.dependencies.auth import limiter
 
@@ -174,6 +175,7 @@ async def health_check():
 # Include API routers
 app.include_router(ai_router, prefix="/api/v1/ai", tags=["AI"])
 app.include_router(auth_router, prefix="/api/v1/auth", tags=["Auth"])
+app.include_router(conversations_router, prefix="/api/v1/conversations", tags=["Conversations"])
 app.include_router(subscription_router, prefix="/api/v1/subscription", tags=["Subscription"])
 
 

@@ -47,6 +47,53 @@ def init_llm_client() -> dict:
         return {"status": "failed", "error": str(e)}
 
 
+TITLE_SYSTEM_INSTRUCTION = (
+    "Generate a very short conversation title (max 6 words, no quotes) "
+    "based on the following excerpt. Reply with only the title, nothing else."
+)
+TITLE_MAX_WORDS = 6
+
+
+def generate_conversation_title(excerpt: str) -> str:
+    """
+    Generate a short conversation title from the first messages excerpt using Gemini.
+    Returns a string of at most TITLE_MAX_WORDS words, or "Conversation" if empty/failed.
+    """
+    if not (excerpt or "").strip():
+        return "Conversation"
+    try:
+        client = _get_gemini_client()
+        contents = [types.Content(role="user", parts=[types.Part.from_text(text=excerpt.strip())])]
+        config = types.GenerateContentConfig(
+            system_instruction=TITLE_SYSTEM_INSTRUCTION,
+            max_output_tokens=50,
+            temperature=0.3,
+        )
+        response = client.models.generate_content(
+            model=settings.llm_model,
+            contents=contents,
+            config=config,
+        )
+        if (
+            not response.candidates
+            or not response.candidates[0].content
+            or not response.candidates[0].content.parts
+        ):
+            return "Conversation"
+        text = ""
+        for part in response.candidates[0].content.parts:
+            if hasattr(part, "text") and part.text:
+                text += part.text
+        title = (text or "").strip().strip('"\'')
+        if not title:
+            return "Conversation"
+        words = title.split()[:TITLE_MAX_WORDS]
+        return " ".join(words) if words else "Conversation"
+    except Exception as e:
+        logger.warning("Conversation title generation failed: %s", e)
+        return "Conversation"
+
+
 def _history_to_contents(history_formatted: List[Dict]) -> List[types.Content]:
     """
     Convert prepare_history() output to Gemini Content list.
@@ -199,15 +246,23 @@ def stream_gemini_tokens(
             contents=contents,
             config=config,
         ):
-            text = getattr(chunk, "text", None)
+            # Avoid chunk.text when AFC may emit function_call parts (raises ValueError)
+            text = None
+            try:
+                text = getattr(chunk, "text", None)
+            except ValueError:
+                pass
             if text and isinstance(text, str) and text.strip():
                 yield text
             elif chunk.candidates and len(chunk.candidates) > 0:
                 c = chunk.candidates[0]
                 if c.content and c.content.parts:
                     for part in c.content.parts:
-                        if hasattr(part, "text") and part.text:
-                            yield part.text
+                        if getattr(part, "function_call", None) is not None:
+                            continue
+                        t = getattr(part, "text", None)
+                        if t and isinstance(t, str) and t.strip():
+                            yield t
     except Exception as e:
         logger.exception("Gemini stream error: %s", e)
         raise
@@ -354,6 +409,8 @@ def generate_reply(
         return {
             "reply_text": "I'm having trouble responding right now. Please try again in a moment.",
             "correction": "",
+            "explanation": "",
+            "example": "",
             "score": 0
         }
     except Exception as e:
@@ -361,5 +418,7 @@ def generate_reply(
         return {
             "reply_text": "Something went wrong. Please try again.",
             "correction": "",
+            "explanation": "",
+            "example": "",
             "score": 0
         }

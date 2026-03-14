@@ -119,8 +119,8 @@ def _generate_presigned_url(s3_key: str) -> Optional[str]:
         return None
 
 
-def _store_audio_cloud(audio_bytes: bytes, filename: str) -> Optional[str]:
-    """Store audio file in S3 and return the S3 key (e.g. 'audio/filename.mp3'), or None."""
+def _store_audio_cloud(audio_bytes: bytes, filename: str, content_type: str = "audio/mpeg") -> Optional[str]:
+    """Store audio file in S3 and return the S3 key (e.g. 'ai/audio/filename.mp3'), or None."""
     if not all([
         settings.aws_access_key_id,
         settings.aws_secret_access_key,
@@ -141,7 +141,7 @@ def _store_audio_cloud(audio_bytes: bytes, filename: str) -> Optional[str]:
             Bucket=settings.s3_bucket_name,
             Key=s3_key,
             Body=audio_bytes,
-            ContentType="audio/mpeg"
+            ContentType=content_type
         )
         return s3_key
     except ImportError:
@@ -150,6 +150,23 @@ def _store_audio_cloud(audio_bytes: bytes, filename: str) -> Optional[str]:
     except Exception as e:
         logger.error(f"Cloud storage error: {e}, falling back to local")
         return None
+
+
+def store_user_voice_wav(audio_bytes: bytes, filename: str) -> str:
+    """
+    Store user voice recording (WAV) in S3 or local and return the playback URL.
+    Used for voice-chat and voice-chat/stream to persist the user's recording.
+    On S3/store failure, falls back to local; if both fail, caller should handle (log and use None).
+    """
+    try:
+        s3_key = _store_audio_cloud(audio_bytes, f"user_voice/{filename}", content_type="audio/wav")
+        if s3_key:
+            presigned = _generate_presigned_url(s3_key)
+            if presigned:
+                return presigned
+    except Exception as e:
+        logger.warning("User voice S3 upload failed: %s, falling back to local", e)
+    return _store_audio_local(audio_bytes, filename)
 
 
 def _parse_audio_mime_type(mime_type: str) -> dict[str, int]:

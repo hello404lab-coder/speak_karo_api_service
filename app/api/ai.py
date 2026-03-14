@@ -7,6 +7,7 @@ import logging
 import re
 import threading
 import uuid
+from datetime import datetime
 from typing import Literal, Optional
 from io import BytesIO
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
@@ -21,7 +22,7 @@ from app.dependencies.subscription import require_active_plan
 from app.schemas.ai import TextChatRequest, AIChatResponse, TTSStreamRequest
 from app.services.llm import generate_reply, stream_gemini_tokens, init_llm_client
 from app.services.stt import transcribe_audio, init_stt_models
-from app.services.tts import text_to_speech_stream, store_audio_mp3, generate_tts_bytes, feed_tts_stream_to_queue, init_tts_models
+from app.services.tts import text_to_speech_stream, store_audio_mp3, store_user_voice_wav, generate_tts_bytes, feed_tts_stream_to_queue, init_tts_models
 from app.services.subscription_service import update_usage_stats
 from app.utils.language import get_response_language
 from app.models.usage import Conversation, Message
@@ -72,6 +73,7 @@ def get_or_create_conversation(
     db.add(conversation)
     db.commit()
     db.refresh(conversation)
+    logger.info("conversation_created", extra={"conversation_id": conversation.id, "user_id": user_id})
     return conversation
 
 
@@ -178,11 +180,15 @@ async def text_chat(
             user_message=request.message,
             ai_reply=ai_response["reply_text"],
             correction=ai_response.get("correction", ""),
-            hinglish_explanation="",
+            hinglish_explanation=ai_response.get("explanation", ""),
+            example=ai_response.get("example", ""),
             score=ai_response.get("score", 0)
         )
         db.add(message)
+        conversation.updated_at = datetime.utcnow()
         db.commit()
+        db.refresh(message)
+        logger.info("Message saved for conversation %s", conversation.id, extra={"conversation_id": conversation.id, "message_id": message.id})
         
         # Update usage stats
         update_usage_stats(user_id, db, 0.0, "chat")
@@ -190,6 +196,8 @@ async def text_chat(
         return AIChatResponse(
             reply_text=ai_response["reply_text"],
             correction=ai_response.get("correction", ""),
+            explanation=ai_response.get("explanation") or None,
+            example=ai_response.get("example") or None,
             score=ai_response.get("score", 75),
             audio_url=None,
             response_language=response_language,
@@ -257,6 +265,15 @@ async def voice_chat(
         # Response language from STT + script detection (en -> Chatterbox, hi/ml/ta -> IndicF5)
         response_language = get_response_language(transcribed_text, detected_lang)
 
+        user_audio_url_sync: Optional[str] = None
+        try:
+            user_audio_url_sync = store_user_voice_wav(
+                audio_bytes,
+                f"user_voice_{conversation.id}_{uuid.uuid4().hex[:12]}.wav",
+            )
+        except Exception as e:
+            logger.warning("User voice storage failed: %s", e)
+
         try:
             ai_response = await asyncio.wait_for(
                 asyncio.to_thread(
@@ -278,17 +295,24 @@ async def voice_chat(
             user_message=transcribed_text,
             ai_reply=ai_response["reply_text"],
             correction=ai_response.get("correction", ""),
-            hinglish_explanation="",
-            score=ai_response.get("score", 0)
+            hinglish_explanation=ai_response.get("explanation", ""),
+            example=ai_response.get("example", ""),
+            score=ai_response.get("score", 0),
+            user_audio_url=user_audio_url_sync,
         )
         db.add(message)
+        conversation.updated_at = datetime.utcnow()
         db.commit()
+        db.refresh(message)
+        logger.info("Message saved for conversation %s", conversation.id, extra={"conversation_id": conversation.id, "message_id": message.id})
         
         update_usage_stats(user_id, db, 0.0, "voice")
         
         return AIChatResponse(
             reply_text=ai_response["reply_text"],
             correction=ai_response.get("correction", ""),
+            explanation=ai_response.get("explanation") or None,
+            example=ai_response.get("example") or None,
             score=ai_response.get("score", 75),
             audio_url=None,
             response_language=response_language,
@@ -334,7 +358,7 @@ def _concat_wav_chunks_and_store(chunks: list[bytes], text: str) -> tuple[Option
 
 
 def _is_section_header(line: str) -> bool:
-    """True if line starts with correction/hinglish/explanation (reply-only TTS boundary)."""
+    """True if line starts with correction/hinglish/explanation/example (reply-only TTS boundary)."""
     lower = line.strip().lower()
     if not lower:
         return False
@@ -342,9 +366,11 @@ def _is_section_header(line: str) -> bool:
         lower.startswith("correction") or
         lower.startswith("hinglish") or
         lower.startswith("explanation") or
+        lower.startswith("example") or
         lower.startswith("**correction") or
         lower.startswith("**hinglish") or
-        lower.startswith("**explanation")
+        lower.startswith("**explanation") or
+        lower.startswith("**example")
     )
 
 
@@ -372,6 +398,7 @@ async def _llm_tts_streaming_pipeline(
     user_id: str,
     long_term_context: Optional[str] = None,
     usage_type: Literal["chat", "voice"] = "chat",
+    user_audio_url: Optional[str] = None,
 ):
     """
     Reusable async generator: LLM stream -> sentence buffer -> per-sentence TTS -> SSE events.
@@ -549,18 +576,23 @@ async def _llm_tts_streaming_pipeline(
             parsed = parse_gemini_response(full_reply_text)
             yield (
                 f"event: metadata\ndata: "
-                f"{json.dumps({'correction': parsed.get('correction', ''), 'score': parsed.get('score', 75), 'conversation_id': conversation.id})}\n\n"
+                f"{json.dumps({'correction': parsed.get('correction', ''), 'explanation': parsed.get('explanation', ''), 'example': parsed.get('example', ''), 'score': parsed.get('score', 75), 'conversation_id': conversation.id})}\n\n"
             )
             msg = Message(
                 conversation_id=conversation.id,
                 user_message=user_message,
                 ai_reply=parsed.get("reply_text", ""),
                 correction=parsed.get("correction", ""),
-                hinglish_explanation="",
+                hinglish_explanation=parsed.get("explanation", ""),
+                example=parsed.get("example", ""),
                 score=parsed.get("score", 75),
+                user_audio_url=user_audio_url,
             )
             db.add(msg)
+            conversation.updated_at = datetime.utcnow()
             db.commit()
+            db.refresh(msg)
+            logger.info("Message saved for conversation %s", conversation.id, extra={"conversation_id": conversation.id, "message_id": msg.id})
             update_usage_stats(user_id, db, 0.0, usage_type)
         except Exception as e:
             logger.exception("streaming pipeline save error: %s", e)
@@ -701,6 +733,16 @@ async def voice_chat_stream(
     conversation = get_or_create_conversation(user_id, conversation_id, db, learner_context=learner_context)
     history = get_conversation_history(conversation.id, db)
 
+    user_audio_url: Optional[str] = None
+    try:
+        user_audio_url = await asyncio.to_thread(
+            store_user_voice_wav,
+            audio_bytes,
+            f"user_voice_{conversation.id}_{uuid.uuid4().hex[:12]}.wav",
+        )
+    except Exception as e:
+        logger.warning("User voice storage failed: %s", e)
+
     async def event_gen():
         yield (
             f"event: stt_result\ndata: "
@@ -710,6 +752,7 @@ async def voice_chat_stream(
             transcribed_text, history, response_language, conversation, db, user_id,
             long_term_context=conversation.long_term_context,
             usage_type="voice",
+            user_audio_url=user_audio_url,
         ):
             yield chunk
 
