@@ -95,6 +95,43 @@ class Settings(BaseSettings):
     # TTS Settings - Chatterbox toggle and Gemini TTS fallback
     # When False: Chatterbox is never loaded; English/Indic fallback use Gemini gemini-2.5-flash-lite-preview-tts
     tts_chatterbox_enabled: bool = Field(default=True, description="TTS_CHATTERBOX_ENABLED: enable local Chatterbox-Turbo (GPU)")
+    # When local: GPU Chatterbox-Turbo. When api: Resemble AI https://f.cluster.resemble.ai/stream (requires RESEMBLE_* keys)
+    tts_chatterbox_mode: Literal["local", "api"] = Field(
+        default="local",
+        description="TTS_CHATTERBOX_MODE: local for GPU inference, api for Resemble AI cloud API",
+    )
+    resemble_api_key: Optional[str] = Field(
+        default=None,
+        description="RESEMBLE_API_KEY: API token from https://app.resemble.ai/account/api",
+    )
+    resemble_voice_uuid: Optional[str] = Field(
+        default=None,
+        description="RESEMBLE_VOICE_UUID: voice UUID for Resemble API synthesis",
+    )
+    resemble_api_model: str = Field(
+        default="chatterbox-turbo",
+        description="RESEMBLE_API_MODEL: model for Resemble API (chatterbox-turbo for lower latency)",
+    )
+    resemble_sample_rate: str = Field(
+        default="44100",
+        description="RESEMBLE_SAMPLE_RATE: audio sample rate for Resemble API",
+    )
+    resemble_precision: str = Field(
+        default="PCM_16",
+        description="RESEMBLE_PRECISION: audio precision for Resemble API (PCM_16, PCM_32, etc.)",
+    )
+    resemble_use_hd: bool = Field(
+        default=False,
+        description="RESEMBLE_USE_HD: enable HD synthesis (small latency trade-off)",
+    )
+    resemble_api_timeout: int = Field(
+        default=30,
+        description="RESEMBLE_API_TIMEOUT: HTTP timeout in seconds for Resemble API calls",
+    )
+    resemble_api_max_retries: int = Field(
+        default=2,
+        description="RESEMBLE_API_MAX_RETRIES: max retry attempts on transient failures",
+    )
     tts_gemini_model: str = Field(default="gemini-2.5-flash-lite-preview-tts", description="TTS_GEMINI_MODEL: Gemini TTS model when Chatterbox disabled")
     tts_gemini_voice: str = Field(default="Puck", description="TTS_GEMINI_VOICE: prebuilt voice name for Gemini TTS")
     # Max concurrent TTS inferences (1 = strict serialization for low VRAM; 2+ = Semaphore for lower latency)

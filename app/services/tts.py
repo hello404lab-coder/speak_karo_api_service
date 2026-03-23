@@ -1,11 +1,13 @@
 """Text-to-Speech service with cloud/local storage."""
 import asyncio
 import hashlib
+import json
 import logging
 import os
 import re
 import struct
 import threading
+import time
 from io import BytesIO
 from pathlib import Path
 from typing import Iterator, Optional
@@ -38,6 +40,10 @@ _inference_semaphore = threading.Semaphore(settings.tts_concurrent_inferences)
 
 # Lazy-loaded Gemini client for TTS (when Chatterbox disabled). API-based, no GPU lock.
 _gemini_tts_client = None
+
+# Lazy-loaded Resemble HTTP client (TTS_CHATTERBOX_MODE=api)
+_resemble_client = None
+_lock_resemble = threading.Lock()
 
 # Internal language code to BCP-47 for Gemini TTS (en-US, hi-IN, etc.)
 LANG_TO_BCP47 = {
@@ -693,6 +699,136 @@ def _resolve_audio_prompt_path() -> Optional[str]:
     return None
 
 
+def _get_resemble_client():
+    """Lazy-load pooled httpx client for Resemble streaming TTS (thread-safe)."""
+    global _resemble_client
+    with _lock_resemble:
+        if _resemble_client is None:
+            if not settings.resemble_api_key:
+                raise ValueError(
+                    "RESEMBLE_API_KEY not set. Set it when TTS_CHATTERBOX_MODE=api."
+                )
+            if not settings.resemble_voice_uuid:
+                raise ValueError(
+                    "RESEMBLE_VOICE_UUID not set. Set it when TTS_CHATTERBOX_MODE=api."
+                )
+            import httpx
+
+            _resemble_client = httpx.Client(
+                base_url="https://f.cluster.resemble.ai",
+                headers={
+                    "Authorization": f"Bearer {settings.resemble_api_key}",
+                    "Content-Type": "application/json",
+                },
+                timeout=httpx.Timeout(
+                    connect=10.0,
+                    read=float(settings.resemble_api_timeout),
+                    write=10.0,
+                    pool=5.0,
+                ),
+                limits=httpx.Limits(
+                    max_connections=10,
+                    max_keepalive_connections=5,
+                ),
+            )
+    return _resemble_client
+
+
+def _parse_resemble_error_body(body: bytes, status_code: int) -> str:
+    """Extract a user-safe message from Resemble JSON error responses."""
+    if not body:
+        return f"Resemble TTS request failed (HTTP {status_code})"
+    try:
+        data = json.loads(body.decode("utf-8", errors="replace"))
+        if isinstance(data, dict):
+            msg = data.get("message") or data.get("error") or data.get("detail")
+            if msg:
+                return str(msg)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        pass
+    preview = body[:500].decode("utf-8", errors="replace")
+    return f"Resemble TTS request failed (HTTP {status_code}): {preview}"
+
+
+def _tts_with_resemble_api(text: str) -> bytes:
+    """
+    Generate WAV via Resemble AI streaming synthesis (POST /stream).
+    https://docs.resemble.ai/api-reference/text-to-speech/stream-synthesize
+    """
+    text = (text or "").strip()
+    if not text:
+        raise ValueError("Empty text for Resemble TTS")
+    if len(text) > 2000:
+        logger.warning("Resemble TTS text length %s, truncating to 2000", len(text))
+        text = text[:2000]
+
+    client = _get_resemble_client()
+    payload = {
+        "voice_uuid": settings.resemble_voice_uuid,
+        "data": text,
+        "model": settings.resemble_api_model,
+        "sample_rate": settings.resemble_sample_rate,
+        "precision": settings.resemble_precision,
+        "use_hd": settings.resemble_use_hd,
+    }
+    max_retries = max(0, int(getattr(settings, "resemble_api_max_retries", 2)))
+
+    import httpx
+
+    last_error_msg: Optional[str] = None
+    for attempt in range(max_retries + 1):
+        try:
+            with client.stream("POST", "/stream", json=payload) as response:
+                if response.status_code != 200:
+                    err_body = response.read()
+                    msg = _parse_resemble_error_body(err_body, response.status_code)
+                    if 400 <= response.status_code < 500:
+                        raise ValueError(msg)
+                    last_error_msg = msg
+                    if attempt < max_retries:
+                        delay = 0.5 * (2**attempt)
+                        logger.warning(
+                            "Resemble TTS HTTP %s, retry %s/%s after %.1fs",
+                            response.status_code,
+                            attempt + 1,
+                            max_retries,
+                            delay,
+                        )
+                        time.sleep(delay)
+                        continue
+                    raise ValueError(msg)
+
+                buf = bytearray()
+                for chunk in response.iter_bytes():
+                    if chunk:
+                        buf.extend(chunk)
+                wav = bytes(buf)
+                if not wav:
+                    raise ValueError("Resemble TTS returned empty audio")
+                logger.debug("Resemble TTS generated %s bytes WAV", len(wav))
+                return wav
+
+        except ValueError:
+            raise
+        except (httpx.TimeoutException, httpx.ConnectError, httpx.TransportError) as e:
+            last_error_msg = str(e)
+            if attempt < max_retries:
+                delay = 0.5 * (2**attempt)
+                logger.warning(
+                    "Resemble TTS transport error, retry %s/%s after %.1fs: %s",
+                    attempt + 1,
+                    max_retries,
+                    delay,
+                    e,
+                )
+                time.sleep(delay)
+                continue
+            logger.error("Resemble TTS failed after retries: %s", e, exc_info=True)
+            raise ValueError("Resemble TTS temporarily unavailable. Please try again.") from e
+
+    raise ValueError(last_error_msg or "Resemble TTS failed.")
+
+
 def _tts_with_turbo(text: str) -> bytes:
     """
     Generate audio using Chatterbox-Turbo (ResembleAI/chatterbox-turbo). English only.
@@ -865,6 +1001,7 @@ def generate_tts_bytes(text: str, response_language: str = "en") -> bytes:
     Public entrypoint: generate TTS audio bytes for one sentence (WAV).
     Used by the chat/stream pipeline for sentence-level TTS.
     When TTS_CHATTERBOX_ENABLED=false, English and Indic fallback use Gemini TTS (no GPU lock).
+    When TTS_CHATTERBOX_MODE=api, English uses Resemble AI streaming API (no local GPU).
     """
     lang = _effective_response_language(text, response_language)
     use_indicf5 = lang != "en" and getattr(settings, "tts_indicf5_enabled", False)
@@ -888,6 +1025,8 @@ def generate_tts_bytes(text: str, response_language: str = "en") -> bytes:
     if not use_indicf5:
         if not chatterbox_enabled:
             return _tts_with_gemini(text, lang)
+        if getattr(settings, "tts_chatterbox_mode", "local") == "api":
+            return _tts_with_resemble_api(text)
         with _inference_semaphore:
             return _tts_with_turbo(text)
     raise ValueError("Something went wrong generating audio. Please try again.")
@@ -1024,10 +1163,16 @@ def text_to_speech(text: str, response_language: str = "en") -> str:
             except Exception as e:
                 logger.error(f"Gemini TTS error: {e}")
                 raise ValueError("Something went wrong generating audio. Please try again.")
-        logger.info("Using TTS provider: Chatterbox-Turbo")
+        if getattr(settings, "tts_chatterbox_mode", "local") == "api":
+            logger.info("Using TTS provider: Resemble Chatterbox API")
+        else:
+            logger.info("Using TTS provider: Chatterbox-Turbo")
         try:
-            with _inference_semaphore:
-                audio_bytes = _tts_with_turbo(text)
+            if getattr(settings, "tts_chatterbox_mode", "local") == "api":
+                audio_bytes = _tts_with_resemble_api(text)
+            else:
+                with _inference_semaphore:
+                    audio_bytes = _tts_with_turbo(text)
             audio_bytes = _convert_wav_to_mp3(audio_bytes)
             filename = f"{hashlib.md5(text.encode()).hexdigest()}.mp3"
             s3_key = _store_audio_cloud(audio_bytes, filename)
@@ -1052,14 +1197,31 @@ def init_tts_models() -> dict:
     """
     Load TTS models (Turbo and optionally IndicF5) for warmup.
     When TTS_CHATTERBOX_ENABLED=false, Turbo is not loaded.
+    When TTS_CHATTERBOX_MODE=api, local Turbo is not loaded; Resemble API is warmed with a short synthesis.
     When TTS_INDICF5_ENABLED=false, IndicF5 is not loaded.
     Runs one short TTS inference after loading Turbo so torch.compile/CUDA kernels are warmed.
-    Returns {"turbo": "loaded"|"disabled"|"failed", "indicf5": "loaded"|"disabled"|"skipped"|"failed"}.
+    Returns {"turbo": "loaded"|"api_mode"|"disabled"|"failed", "indicf5": "loaded"|"disabled"|"skipped"|"failed"}.
     """
     global _turbo_warmup_done
     result: dict = {}
     if not getattr(settings, "tts_chatterbox_enabled", True):
         result["turbo"] = "disabled"
+    elif getattr(settings, "tts_chatterbox_mode", "local") == "api":
+        if not settings.resemble_api_key or not settings.resemble_voice_uuid:
+            result["turbo"] = "failed"
+            result["turbo_error"] = (
+                "RESEMBLE_API_KEY and RESEMBLE_VOICE_UUID are required when TTS_CHATTERBOX_MODE=api"
+            )
+        else:
+            try:
+                _tts_with_resemble_api("Hi.")
+                _turbo_warmup_done = True
+                result["turbo"] = "api_mode"
+                logger.info("Resemble TTS API warm-up completed")
+            except Exception as e:
+                logger.exception("Resemble TTS API init failed")
+                result["turbo"] = "failed"
+                result["turbo_error"] = str(e)
     else:
         try:
             _get_turbo_model()
