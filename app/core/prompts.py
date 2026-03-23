@@ -13,87 +13,102 @@ class LLMReplySchema(BaseModel):
     """Schema for Gemini LLM reply. Used for response_json_schema and parsing."""
     reply_text: str = Field(..., description="Response to the user (spoken by TTS)")
     correction: str = Field(default="", description="Correct English phrase; display only")
+    explanation: str = Field(default="", description="Short explanation of the mistake (max 20 words)")
+    example: str = Field(default="", description="One example sentence showing correct usage")
     score: int = Field(default=70, ge=0, le=100, description="Score 0-100")
 
 # Base schema for JSON output (used in system instruction)
-# Only reply_text is spoken (TTS/stream); correction is for display only.
+# Only reply_text is spoken (TTS/stream); correction, explanation, example are for display only.
 JSON_FORMAT_INSTRUCTION = """
 Respond ONLY in valid JSON format with these keys:
 {
-  "reply_text": "your response to the user (this is the ONLY part that will be spoken by TTS)",
-  "correction": "correct English phrase or sentence (what they should say in English); empty string if no correction (display only, not spoken)",
-  "score": 0-100 integer
+  "reply_text": "spoken response that continues conversation (this is the ONLY part spoken by TTS)",
+  "correction": "correct sentence if mistake exists, otherwise empty string (display only, not spoken)",
+  "explanation": "short explanation of the mistake (max 20 words); empty if no mistake (display only)",
+  "example": "one example sentence showing correct usage; empty if no mistake (display only)",
+  "score": integer from 0 to 100
 }
 """
 
-# English-only: user spoke English only -> respond only in English, Chatterbox TTS
-SYSTEM_PROMPT_ENGLISH = f"""You are a warm English tutor on a voice call with an Indian learner. Your goal is to help them practice and improve their English.
-{JSON_FORMAT_INSTRUCTION}
-RULES:
-1. Respond ONLY in English in 'reply_text'. No Hindi or other Indian languages.
-2. Be brief: 2-4 short sentences. Under 50 words.
-3. If they made a mistake in English, give the correct English phrase in 'correction'. No labels.
-4. Speak naturally. End with a short question in 'reply_text' to keep them talking.
-5. Avoid filler like "Dont worry" or "Keep practicing" unless they seem discouraged.
-6. Only put spoken content in 'reply_text'. 'correction' is for on-screen reading only, never TTS."""
+# Language code (ISO 639-1) -> display name for the prompt. Unknown codes fall back to "the same language they are speaking".
+LANGUAGE_NAMES: Dict[str, str] = {
+    "en": "English",
+    "hi": "Hindi",
+    "ml": "Malayalam",
+    "ta": "Tamil",
+    "te": "Telugu",
+    "kn": "Kannada",
+    "bn": "Bengali",
+    "mr": "Marathi",
+    "gu": "Gujarati",
+    "pa": "Punjabi",
+    "ur": "Urdu",
+    "es": "Spanish",
+    "fr": "French",
+    "de": "German",
+    "zh": "Chinese",
+    "ja": "Japanese",
+    "ko": "Korean",
+    "ar": "Arabic",
+    "pt": "Portuguese",
+}
 
-# Indic-only: user spoke Hindi/Malayalam/etc. -> reply in that language, but tutor ENGLISH (correction = correct English)
-# INDIC_PROMPT_TEMPLATE = """You are a warm English tutor on a voice call with an Indian learner who is speaking {language_name}. 
-# Your goal is to teach them English by bridging it from {language_name}.
+SYSTEM_PROMPT_TEMPLATE = """You are an experienced English speaking tutor helping a learner practice English in a voice conversation.
 
-# {json_format}
+Your goals are:
+1. Help the learner speak more naturally.
+2. Correct mistakes clearly.
+3. Teach one useful improvement at a time.
+4. Keep the conversation natural and engaging.
 
-# RULES:
-# 1. FOCUS: Every response MUST teach an English phrase. If the user speaks {language_name}, your goal is to show them how to say that same thought in English.
-# 2. 'reply_text' (SPOKEN): Respond ENTIRELY in {language_name}. Merge greetings naturally.
-# 3. 'correction' (DISPLAY ONLY): Provide the correct English sentence using Latin/English characters (e.g., "How are you?").
-# 4. BE A TUTOR: Do not just chat. If they are correct, congratulate them and give them a slightly more advanced way to say the same thing in English.
-# """
+You must behave like a friendly tutor on a voice call.
 
-INDIC_PROMPT_TEMPLATE = """You are an energetic English Tutor on a voice call with a learner speaking {language_name}.
+LANGUAGE: Respond ONLY in English in 'reply_text'.
+
 {json_format}
 
-CRITICAL RULES:
-1. SCRIPT ENFORCEMENT: Write ONLY in the {script_name} script. 
-   - NEVER use Hindi or Devanagari characters if the language is not Hindi.
-   - NEVER use Latin/English (A-Z) characters in 'reply_text'.
-2. TRANSLITERATION: Transliterate all English words into {script_name} characters. 
-   - Example: Instead of writing 'Try', you MUST write '{example_word}'.
-3. TUTOR ROLE:
-   - Acknowledge their {language_name} response.
-   - Immediately push them to say it in English. 
-   - Example tone: "That's great! Now, can you try saying that in English? Look at the screen for help." (But write this entirely in {script_name}).
-4. 'reply_text': Spoken response in {script_name}.
-5. 'correction': The target English phrase in Latin characters.
-6. 'correction': ALWAYS set this to an empty string "". Do not provide any English text here.
-"""
+IMPORTANT RULES:
 
-# Legacy single prompt (used if response_language not passed)
-SYSTEM_PROMPT = SYSTEM_PROMPT_ENGLISH
+1. If the learner makes a mistake:
+   - Identify the most important mistake.
+   - Provide the corrected sentence.
+   - Give a short explanation (max 20 words).
+   - Provide one example sentence.
 
+2. Never correct more than ONE mistake in a single response.
 
-INDIC_CONFIG = {
-    "hi": {"name": "Hindi", "script": "Devanagari", "eg": "ट्राई"},
-    "ml": {"name": "Malayalam", "script": "Malayalam", "eg": "ട്രൈ"},
-    "ta": {"name": "Tamil", "script": "Tamil", "eg": "ட்ரை"},
-    "te": {"name": "Telugu", "script": "Telugu", "eg": "ట్రై"},
-    "kn": {"name": "Kannada", "script": "Kannada", "eg": "ട്രൈ"},
-    "bn": {"name": "Bengali", "script": "Bengali", "eg": "ট্রাই"},
-}
+3. If the sentence is correct:
+   - Leave "correction", "explanation", and "example" empty.
+   - Give a higher score.
+
+4. Your spoken reply must:
+   - sound natural
+   - be conversational
+   - be under 50 words
+   - end with a question to continue the conversation
+
+5. Do not include explanations inside reply_text.
+
+6. Be encouraging but avoid excessive praise.
+
+7. Adjust vocabulary difficulty based on learner level.
+
+SCORING RULES:
+
+Start from score 100.
+
+Subtract:
+-10 for grammar mistake
+-10 for vocabulary mistake
+-5 for article or preposition mistake
+-5 for word order mistake
+
+Minimum score = 0."""
+
 
 def get_system_instruction(response_language: str = "en", long_term_context: Optional[str] = None) -> str:
-    if response_language == "en":
-        base = SYSTEM_PROMPT_ENGLISH
-    else:
-        config = INDIC_CONFIG.get(response_language, INDIC_CONFIG["hi"])
-        # We inject script-specific enforcement here
-        base = INDIC_PROMPT_TEMPLATE.format(
-            json_format=JSON_FORMAT_INSTRUCTION,
-            language_name=config["name"],
-            script_name=config["script"],
-            example_word=config["eg"]
-        )
-    
+    """Build the system instruction. English-only for now."""
+    base = SYSTEM_PROMPT_TEMPLATE.format(json_format=JSON_FORMAT_INSTRUCTION)
     if long_term_context and long_term_context.strip():
         return f"Known about this learner: {long_term_context.strip()}\n\n{base}"
     return base
@@ -139,7 +154,7 @@ def _extract_json_string_value(raw: str, key: str) -> str:
 def parse_gemini_response(response_text: str) -> Dict[str, any]:
     """
     Parse JSON from Gemini response. Handles optional markdown code fences.
-    Returns dict with reply_text, correction, score.
+    Returns dict with reply_text, correction, explanation, example, score.
     When full JSON parse fails (e.g. truncated stream), tries to extract fields from raw text
     so reply_text is never the raw JSON string.
     """
@@ -148,6 +163,8 @@ def parse_gemini_response(response_text: str) -> Dict[str, any]:
         data = json.loads(clean)
         reply_text = data.get("reply_text") or data.get("reply", "")
         correction = data.get("correction") or ""
+        explanation = data.get("explanation") or ""
+        example = data.get("example") or ""
         score = data.get("score", 70)
         if not isinstance(score, int):
             try:
@@ -158,11 +175,15 @@ def parse_gemini_response(response_text: str) -> Dict[str, any]:
         return {
             "reply_text": (reply_text or "").strip() or _extract_json_string_value(clean, "reply_text"),
             "correction": (correction or "").strip(),
+            "explanation": (explanation or "").strip(),
+            "example": (example or "").strip(),
             "score": score,
         }
     except Exception:
         reply_text = _extract_json_string_value(clean, "reply_text")
         correction = _extract_json_string_value(clean, "correction")
+        explanation = _extract_json_string_value(clean, "explanation")
+        example = _extract_json_string_value(clean, "example")
         score_str = re.search(r'"score"\s*:\s*(\d+)', clean)
         score = int(score_str.group(1)) if score_str else 70
         score = max(0, min(100, score))
@@ -173,5 +194,7 @@ def parse_gemini_response(response_text: str) -> Dict[str, any]:
         return {
             "reply_text": reply_text.strip() or "I couldn't process that.",
             "correction": correction.strip(),
+            "explanation": explanation.strip(),
+            "example": example.strip(),
             "score": score,
         }

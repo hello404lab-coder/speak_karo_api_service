@@ -7,9 +7,9 @@ import logging
 import re
 import threading
 import uuid
-from datetime import date
+from datetime import datetime
+from typing import Literal, Optional
 from io import BytesIO
-from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
 from fastapi.responses import StreamingResponse
 from pydub import AudioSegment
@@ -17,17 +17,22 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.core.prompts import parse_gemini_response
 from app.database import get_db
+from app.dependencies.auth import get_current_user
+from app.dependencies.subscription import require_active_plan
 from app.schemas.ai import TextChatRequest, AIChatResponse, TTSStreamRequest
 from app.services.llm import generate_reply, stream_gemini_tokens, init_llm_client
 from app.services.stt import transcribe_audio, init_stt_models
-from app.services.tts import text_to_speech_stream, store_audio_mp3, generate_tts_bytes, feed_tts_stream_to_queue, init_tts_models
+from app.services.tts import text_to_speech_stream, store_audio_mp3, store_user_voice_wav, generate_tts_bytes, feed_tts_stream_to_queue, init_tts_models
+from app.services.subscription_service import update_usage_stats
 from app.utils.language import get_response_language
-from app.models.usage import Conversation, Message, Usage
+from app.models.usage import Conversation, Message
+from app.models.user import User
 
 logger = logging.getLogger(__name__)
 
 # User-safe message for timeout (no stack traces or internal detail)
 TIMEOUT_MESSAGE = "Request took too long. Please try again."
+ONBOARDING_REQUIRED_MESSAGE = "User onboarding not completed"
 
 router = APIRouter()
 
@@ -68,6 +73,7 @@ def get_or_create_conversation(
     db.add(conversation)
     db.commit()
     db.refresh(conversation)
+    logger.info("conversation_created", extra={"conversation_id": conversation.id, "user_id": user_id})
     return conversation
 
 
@@ -95,25 +101,6 @@ def get_conversation_history(conversation_id: str, db: Session) -> list:
     return history
 
 
-def update_usage_stats(user_id: str, db: Session, duration_seconds: float = 0.0):
-    """Update daily usage statistics."""
-    today = date.today()
-    
-    usage = db.query(Usage).filter(
-        Usage.user_id == user_id,
-        Usage.date == today
-    ).first()
-    
-    if not usage:
-        usage = Usage(user_id=user_id, date=today, minutes_used=0.0, request_count=0)
-        db.add(usage)
-    
-    usage.request_count += 1
-    usage.minutes_used += duration_seconds / 60.0
-    
-    db.commit()
-
-
 def _run_init_models_sync() -> dict:
     """Run all model initializers sequentially (called from thread)."""
     stt = init_stt_models()
@@ -123,12 +110,16 @@ def _run_init_models_sync() -> dict:
 
 
 @router.post("/init-models")
-async def init_models():
+async def init_models(
+    current_user: User = Depends(require_active_plan),
+):
     """
-    Initialize (warm up) all models: STT, LLM client, and TTS (Turbo + IndicF5 if configured).
+    Initialize (warm up) all models: STT, LLM client, and TTS (local Turbo, Resemble API, or IndicF5 per config).
     Call this after startup to avoid cold-start latency on first user request.
     Runs in a thread with a 5-minute timeout.
     """
+    if not current_user.onboarding_completed:
+        raise HTTPException(status_code=403, detail=ONBOARDING_REQUIRED_MESSAGE)
     try:
         result = await asyncio.wait_for(
             asyncio.to_thread(_run_init_models_sync),
@@ -146,15 +137,19 @@ async def init_models():
 @router.post("/text-chat", response_model=AIChatResponse)
 async def text_chat(
     request: TextChatRequest,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_active_plan),
 ):
     """
     Text chat endpoint - accepts text message and returns AI reply.
     """
+    if not current_user.onboarding_completed:
+        raise HTTPException(status_code=403, detail=ONBOARDING_REQUIRED_MESSAGE)
+    user_id = current_user.id
     try:
         # Get or create conversation
         conversation = get_or_create_conversation(
-            request.user_id, request.conversation_id, db, learner_context=request.learner_context
+            user_id, request.conversation_id, db, learner_context=request.learner_context
         )
 
         # Get conversation history for context
@@ -185,18 +180,24 @@ async def text_chat(
             user_message=request.message,
             ai_reply=ai_response["reply_text"],
             correction=ai_response.get("correction", ""),
-            hinglish_explanation="",
+            hinglish_explanation=ai_response.get("explanation", ""),
+            example=ai_response.get("example", ""),
             score=ai_response.get("score", 0)
         )
         db.add(message)
+        conversation.updated_at = datetime.utcnow()
         db.commit()
+        db.refresh(message)
+        logger.info("Message saved for conversation %s", conversation.id, extra={"conversation_id": conversation.id, "message_id": message.id})
         
         # Update usage stats
-        update_usage_stats(request.user_id, db)
+        update_usage_stats(user_id, db, 0.0, "chat")
         
         return AIChatResponse(
             reply_text=ai_response["reply_text"],
             correction=ai_response.get("correction", ""),
+            explanation=ai_response.get("explanation") or None,
+            example=ai_response.get("example") or None,
             score=ai_response.get("score", 75),
             audio_url=None,
             response_language=response_language,
@@ -221,10 +222,14 @@ async def voice_chat(
     audio_file: UploadFile = File(...),
     stt_mode: Optional[str] = Form(None),
     db: Session = Depends(get_db),
+    current_user: User = Depends(require_active_plan),
 ):
     """
     Voice chat endpoint - accepts audio file and returns AI reply.
     """
+    if not current_user.onboarding_completed:
+        raise HTTPException(status_code=403, detail=ONBOARDING_REQUIRED_MESSAGE)
+    user_id = current_user.id
     try:
         # Validate file type
         if not audio_file.filename.endswith('.wav'):
@@ -260,6 +265,15 @@ async def voice_chat(
         # Response language from STT + script detection (en -> Chatterbox, hi/ml/ta -> IndicF5)
         response_language = get_response_language(transcribed_text, detected_lang)
 
+        user_audio_url_sync: Optional[str] = None
+        try:
+            user_audio_url_sync = store_user_voice_wav(
+                audio_bytes,
+                f"user_voice_{conversation.id}_{uuid.uuid4().hex[:12]}.wav",
+            )
+        except Exception as e:
+            logger.warning("User voice storage failed: %s", e)
+
         try:
             ai_response = await asyncio.wait_for(
                 asyncio.to_thread(
@@ -281,17 +295,24 @@ async def voice_chat(
             user_message=transcribed_text,
             ai_reply=ai_response["reply_text"],
             correction=ai_response.get("correction", ""),
-            hinglish_explanation="",
-            score=ai_response.get("score", 0)
+            hinglish_explanation=ai_response.get("explanation", ""),
+            example=ai_response.get("example", ""),
+            score=ai_response.get("score", 0),
+            user_audio_url=user_audio_url_sync,
         )
         db.add(message)
+        conversation.updated_at = datetime.utcnow()
         db.commit()
+        db.refresh(message)
+        logger.info("Message saved for conversation %s", conversation.id, extra={"conversation_id": conversation.id, "message_id": message.id})
         
-        update_usage_stats(user_id, db, 0.0)
+        update_usage_stats(user_id, db, 0.0, "voice")
         
         return AIChatResponse(
             reply_text=ai_response["reply_text"],
             correction=ai_response.get("correction", ""),
+            explanation=ai_response.get("explanation") or None,
+            example=ai_response.get("example") or None,
             score=ai_response.get("score", 75),
             audio_url=None,
             response_language=response_language,
@@ -337,7 +358,7 @@ def _concat_wav_chunks_and_store(chunks: list[bytes], text: str) -> tuple[Option
 
 
 def _is_section_header(line: str) -> bool:
-    """True if line starts with correction/hinglish/explanation (reply-only TTS boundary)."""
+    """True if line starts with correction/hinglish/explanation/example (reply-only TTS boundary)."""
     lower = line.strip().lower()
     if not lower:
         return False
@@ -345,32 +366,47 @@ def _is_section_header(line: str) -> bool:
         lower.startswith("correction") or
         lower.startswith("hinglish") or
         lower.startswith("explanation") or
+        lower.startswith("example") or
         lower.startswith("**correction") or
         lower.startswith("**hinglish") or
-        lower.startswith("**explanation")
+        lower.startswith("**explanation") or
+        lower.startswith("**example")
     )
 
 
-@router.post("/chat/stream")
-async def chat_stream(
-    request: TextChatRequest,
-    db: Session = Depends(get_db),
+# Minimum chars before sending a sentence to TTS (avoids single-word fragments, improves prosody; ~18 prevents "Ok." from flushing alone)
+_MIN_SENTENCE_CHARS = 18
+_SENTENCE_BOUNDARIES = (".", "?", "!", "\u0964", "\n")  # Purna Viram (।) = \u0964
+
+
+def _clean_sentence_for_tts(s: str) -> str:
+    """Strip whitespace, quotes, and JSON cruft so TTS never sees characters that cause alignment pauses."""
+    if not s:
+        return ""
+    s = s.strip().strip('"')
+    # Remove internal quotes and trailing JSON/control chars
+    s = s.replace('"', "").replace("}", "").replace("\n", " ").strip()
+    return s
+
+
+async def _llm_tts_streaming_pipeline(
+    user_message: str,
+    history: list,
+    response_language: str,
+    conversation: Conversation,
+    db: Session,
+    user_id: str,
+    long_term_context: Optional[str] = None,
+    usage_type: Literal["chat", "voice"] = "chat",
+    user_audio_url: Optional[str] = None,
 ):
     """
-    Sentence-level pipelined chat: stream Gemini tokens, buffer into sentences, TTS per sentence.
-    Only reply_text is streamed and sent to TTS; correction is never spoken.
-    SSE: text_chunk (sentence for display), audio_chunk (WAV), then done, then audio_ready.
-    Heartbeat every 500ms when waiting for next event.
-    """
-    user_id = request.user_id
-    message = request.message.strip()
-    conversation_id = request.conversation_id
-    conversation = get_or_create_conversation(
-        user_id, conversation_id, db, learner_context=request.learner_context
-    )
-    history = get_conversation_history(conversation.id, db)
-    response_language = get_response_language(message, None)
+    Reusable async generator: LLM stream -> sentence buffer -> per-sentence TTS -> SSE events.
+    Only reply_text is streamed to TTS; correction/score emitted via a metadata event.
 
+    Yields SSE-formatted strings:
+      text_chunk, audio_chunk, metadata, done, audio_ready, error, : keep-alive
+    """
     token_queue: asyncio.Queue = asyncio.Queue()
     sentence_queue: asyncio.Queue = asyncio.Queue()
     main_queue: asyncio.Queue = asyncio.Queue()
@@ -379,7 +415,7 @@ async def chat_stream(
     def gemini_producer() -> None:
         try:
             for token in stream_gemini_tokens(
-                message, history, response_language, long_term_context=conversation.long_term_context
+                user_message, history, response_language, long_term_context=long_term_context
             ):
                 loop.call_soon_threadsafe(token_queue.put_nowait, token)
             loop.call_soon_threadsafe(token_queue.put_nowait, None)
@@ -387,16 +423,11 @@ async def chat_stream(
             logger.exception("Gemini stream error")
             loop.call_soon_threadsafe(main_queue.put_nowait, ("error", str(e)))
 
-    # Minimum chars before sending a sentence to TTS (avoids single-word fragments, improves prosody)
-    MIN_SENTENCE_CHARS = 25
-    SENTENCE_BOUNDARIES = (".", "?", "\u0964", "\n")  # Purna Viram (।) = \u0964
-
     async def buffer_consumer() -> None:
-        # Only reply_text is streamed and sent to TTS; correction is never pushed.
         buffer = ""
-        in_reply = False  # Only True after we see reply_text value (JSON) or detect free-form (no leading {)
-        json_reply_started = False  # True after we strip "reply_text": " once
-        full_reply_text_parts = []
+        in_reply = False
+        json_reply_started = False
+        full_reply_text_parts: list[str] = []
         try:
             while True:
                 try:
@@ -408,58 +439,74 @@ async def chat_stream(
                 full_reply_text_parts.append(token)
                 buffer += token
 
-                # JSON: strip "reply_text": " prefix once so TTS/stream never see other keys (e.g. correction)
                 if not json_reply_started and '"reply_text": "' in buffer:
                     json_reply_started = True
                     in_reply = True
                     buffer = buffer.split('"reply_text": "')[-1]
-                # Free-form: no JSON prefix; treat as reply once we have content that doesn't look like JSON start
                 elif not json_reply_started and buffer.strip() and not buffer.strip().startswith("{"):
                     in_reply = True
 
                 if not in_reply:
                     continue
 
-                # JSON: end of reply_text value (closing quote)
-                end_quote_idx = buffer.find('"')
-                if json_reply_started and end_quote_idx >= 0:
-                    sentence = buffer[:end_quote_idx].strip()
-                    if sentence:
-                        main_queue.put_nowait(("text", sentence))
-                        sentence_queue.put_nowait(sentence)
-                    in_reply = False
-                    buffer = buffer[end_quote_idx + 1 :].lstrip()
+                # Intra-quote flushing: when inside JSON reply_text, flush on sentence boundaries
+                if json_reply_started:
+                    while True:
+                        idx = -1
+                        for sep in _SENTENCE_BOUNDARIES:
+                            i = buffer.find(sep)
+                            if i >= 0 and (idx < 0 or i < idx):
+                                idx = i
+                        if idx < 0:
+                            break
+                        segment = buffer[: idx + 1].strip()
+                        if len(segment) < _MIN_SENTENCE_CHARS:
+                            break
+                        cleaned = _clean_sentence_for_tts(segment)
+                        if cleaned:
+                            main_queue.put_nowait(("text", cleaned))
+                            sentence_queue.put_nowait(cleaned)
+                        buffer = buffer[idx + 1 :].lstrip()
+                    # Closing quote: flush any remaining content before the quote, then exit reply
+                    if buffer.startswith('"'):
+                        in_reply = False
+                        buffer = buffer[1:].lstrip()
+                        continue
+                    end_quote_idx = buffer.find('"')
+                    if end_quote_idx >= 0:
+                        segment = buffer[:end_quote_idx].strip()
+                        cleaned = _clean_sentence_for_tts(segment)
+                        if cleaned:
+                            main_queue.put_nowait(("text", cleaned))
+                            sentence_queue.put_nowait(cleaned)
+                        in_reply = False
+                        buffer = buffer[end_quote_idx + 1 :].lstrip()
                     continue
 
-                # Sentence boundaries: first of . ! ? । \n
+                # Plain-text reply path: sentence-boundary flush
                 idx = -1
-                for sep in SENTENCE_BOUNDARIES:
+                for sep in _SENTENCE_BOUNDARIES:
                     i = buffer.find(sep)
                     if i >= 0 and (idx < 0 or i < idx):
                         idx = i
                 if idx >= 0:
                     sentence = buffer[: idx + 1].strip()
-                    # Smoothness: don't send very short fragments unless we'll never get more
-                    if len(sentence) < MIN_SENTENCE_CHARS:
-                        continue
-                    # Free-form only: stop at Correction/Hinglish section headers
-                    if not json_reply_started:
-                        for line in sentence.split("\n"):
-                            if _is_section_header(line.strip()):
-                                in_reply = False
-                                break
-                        if not in_reply:
-                            continue
-                    buffer = buffer[idx + 1 :].lstrip()
-                    if sentence:
-                        main_queue.put_nowait(("text", sentence))
-                        sentence_queue.put_nowait(sentence)
+                    if len(sentence) >= _MIN_SENTENCE_CHARS:
+                        if not json_reply_started:
+                            for line in sentence.split("\n"):
+                                if _is_section_header(line.strip()):
+                                    in_reply = False
+                                    break
+                            if not in_reply:
+                                continue
+                        cleaned = _clean_sentence_for_tts(sentence)
+                        if cleaned:
+                            main_queue.put_nowait(("text", cleaned))
+                            sentence_queue.put_nowait(cleaned)
+                        buffer = buffer[idx + 1 :].lstrip()
 
-            # End-of-stream flush
             if buffer.strip() and in_reply:
-                sent = buffer.strip()
-                if json_reply_started:
-                    sent = sent.replace('"', '').replace('}', '').strip()
+                sent = _clean_sentence_for_tts(buffer.strip())
                 if sent:
                     main_queue.put_nowait(("text", sent))
                     sentence_queue.put_nowait(sent)
@@ -496,79 +543,117 @@ async def chat_stream(
     audio_chunks_collected: list[bytes] = []
     full_reply_text = ""
 
-    async def event_gen():
-        nonlocal full_reply_text
-        try:
-            while True:
-                try:
-                    item = await asyncio.wait_for(main_queue.get(), timeout=SSE_HEARTBEAT_SECONDS)
-                except asyncio.TimeoutError:
-                    yield ": keep-alive\n\n"
-                    continue
-                if item[0] == "error":
-                    yield f"event: error\ndata: {json.dumps({'error': item[1]})}\n\n"
-                    return
-                if item[0] is None:
-                    break
-                if item[0] == "text":
-                    yield f"event: text_chunk\ndata: {json.dumps({'text': item[1]})}\n\n"
-                elif item[0] == "audio":
-                    audio_chunks_collected.append(item[1])
-                    b64 = base64.b64encode(item[1]).decode("ascii")
-                    yield f"event: audio_chunk\ndata: {b64}\n\n"
-                elif item[0] == "full_text":
-                    full_reply_text = item[1] or ""
-
-            await asyncio.gather(buffer_task, tts_task)
-        except Exception as e:
-            logger.exception("chat/stream event_gen error")
-            yield f"event: error\ndata: {json.dumps({'error': str(e)})}\n\n"
-            return
-
-        if audio_chunks_collected:
-            yield f"event: done\ndata: {json.dumps({'audio_url': None, 'saving_in_background': True})}\n\n"
-            audio_url, err = await asyncio.to_thread(
-                _concat_wav_chunks_and_store, audio_chunks_collected, full_reply_text
-            )
-            if err:
-                yield f"event: error\ndata: {json.dumps({'error': err})}\n\n"
-            else:
-                yield f"event: audio_ready\ndata: {json.dumps({'audio_url': audio_url})}\n\n"
-        else:
-            yield f"event: done\ndata: {json.dumps({'audio_url': None})}\n\n"
-
-        if full_reply_text:
+    try:
+        while True:
             try:
-                parsed = parse_gemini_response(full_reply_text)
-                msg = Message(
-                    conversation_id=conversation.id,
-                    user_message=message,
-                    ai_reply=parsed.get("reply_text", ""),
-                    correction=parsed.get("correction", ""),
-                    hinglish_explanation="",
-                    score=parsed.get("score", 75),
-                )
-                db.add(msg)
-                db.commit()
-                update_usage_stats(user_id, db, 0.0)
-            except Exception as e:
-                logger.exception("chat/stream save message error: %s", e)
+                item = await asyncio.wait_for(main_queue.get(), timeout=SSE_HEARTBEAT_SECONDS)
+            except asyncio.TimeoutError:
+                yield ": keep-alive\n\n"
+                continue
+            if item[0] == "error":
+                yield f"event: error\ndata: {json.dumps({'error': item[1]})}\n\n"
+                return
+            if item[0] is None:
+                break
+            if item[0] == "text":
+                yield f"event: text_chunk\ndata: {json.dumps({'text': item[1]})}\n\n"
+            elif item[0] == "audio":
+                audio_chunks_collected.append(item[1])
+                b64 = base64.b64encode(item[1]).decode("ascii")
+                yield f"event: audio_chunk\ndata: {b64}\n\n"
+            elif item[0] == "full_text":
+                full_reply_text = item[1] or ""
+
+        await asyncio.gather(buffer_task, tts_task)
+    except Exception as e:
+        logger.exception("streaming pipeline error")
+        yield f"event: error\ndata: {json.dumps({'error': str(e)})}\n\n"
+        return
+
+    # Parse full LLM response -> metadata event -> DB save
+    if full_reply_text:
+        try:
+            parsed = parse_gemini_response(full_reply_text)
+            yield (
+                f"event: metadata\ndata: "
+                f"{json.dumps({'correction': parsed.get('correction', ''), 'explanation': parsed.get('explanation', ''), 'example': parsed.get('example', ''), 'score': parsed.get('score', 75), 'conversation_id': conversation.id})}\n\n"
+            )
+            msg = Message(
+                conversation_id=conversation.id,
+                user_message=user_message,
+                ai_reply=parsed.get("reply_text", ""),
+                correction=parsed.get("correction", ""),
+                hinglish_explanation=parsed.get("explanation", ""),
+                example=parsed.get("example", ""),
+                score=parsed.get("score", 75),
+                user_audio_url=user_audio_url,
+            )
+            db.add(msg)
+            conversation.updated_at = datetime.utcnow()
+            db.commit()
+            db.refresh(msg)
+            logger.info("Message saved for conversation %s", conversation.id, extra={"conversation_id": conversation.id, "message_id": msg.id})
+            update_usage_stats(user_id, db, 0.0, usage_type)
+        except Exception as e:
+            logger.exception("streaming pipeline save error: %s", e)
+
+    if audio_chunks_collected:
+        yield f"event: done\ndata: {json.dumps({'audio_url': None, 'saving_in_background': True})}\n\n"
+        audio_url, err = await asyncio.to_thread(
+            _concat_wav_chunks_and_store, audio_chunks_collected, full_reply_text
+        )
+        if err:
+            yield f"event: error\ndata: {json.dumps({'error': err})}\n\n"
+        else:
+            yield f"event: audio_ready\ndata: {json.dumps({'audio_url': audio_url})}\n\n"
+    else:
+        yield f"event: done\ndata: {json.dumps({'audio_url': None})}\n\n"
+
+
+@router.post("/chat/stream")
+async def chat_stream(
+    request: TextChatRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_active_plan),
+):
+    """
+    Sentence-level pipelined chat (text input): LLM stream -> sentence buffer -> TTS per sentence.
+    SSE events: text_chunk, audio_chunk, metadata, done, audio_ready.
+    """
+    if not current_user.onboarding_completed:
+        raise HTTPException(status_code=403, detail=ONBOARDING_REQUIRED_MESSAGE)
+    user_id = current_user.id
+    message = request.message.strip()
+    conversation = get_or_create_conversation(
+        user_id, request.conversation_id, db, learner_context=request.learner_context
+    )
+    history = get_conversation_history(conversation.id, db)
+    response_language = get_response_language(message, None)
 
     return StreamingResponse(
-        event_gen(),
+        _llm_tts_streaming_pipeline(
+            message, history, response_language, conversation, db, user_id,
+            long_term_context=conversation.long_term_context,
+            usage_type="chat",
+        ),
         media_type="text/event-stream",
         headers=SSE_HEADERS,
     )
 
 
 @router.post("/tts/stream")
-async def tts_stream(request: TTSStreamRequest):
+async def tts_stream(
+    request: TTSStreamRequest,
+    current_user: User = Depends(require_active_plan),
+):
     """
     Stream TTS audio over Server-Sent Events (SSE).
     Producer (thread): feed_tts_stream_to_queue puts ("audio", chunk) per sentence, then (None, None) sentinel.
     Consumer (async gen): yields event: audio_chunk as soon as ("audio", chunk) is received; done and audio_ready
     only after queue is exhausted. media_type is text/event-stream.
     """
+    if not current_user.onboarding_completed:
+        raise HTTPException(status_code=403, detail=ONBOARDING_REQUIRED_MESSAGE)
     text = request.text.strip()
     response_language = request.response_language or "en"
     queue: asyncio.Queue = asyncio.Queue()
@@ -603,6 +688,73 @@ async def tts_stream(request: TTSStreamRequest):
                 yield f"event: audio_ready\ndata: {json.dumps({'audio_url': audio_url})}\n\n"
         else:
             yield f"event: done\ndata: {json.dumps({'audio_url': None})}\n\n"
+
+    return StreamingResponse(
+        event_gen(),
+        media_type="text/event-stream",
+        headers=SSE_HEADERS,
+    )
+
+
+@router.post("/voice-chat/stream")
+async def voice_chat_stream(
+    user_id: str = Form(...),
+    conversation_id: Optional[str] = Form(None),
+    learner_context: Optional[str] = Form(None),
+    audio_file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_active_plan),
+):
+    """
+    Sentence-level pipelined voice chat: STT (Groq) -> LLM stream -> sentence buffer -> TTS per sentence.
+    SSE events: stt_result, text_chunk, audio_chunk, metadata, done, audio_ready.
+    """
+    if not current_user.onboarding_completed:
+        raise HTTPException(status_code=403, detail=ONBOARDING_REQUIRED_MESSAGE)
+    user_id = current_user.id
+    if not audio_file.filename.endswith(".wav"):
+        raise HTTPException(status_code=400, detail="Only WAV files are supported.")
+
+    audio_bytes = await audio_file.read()
+    effective_stt_mode = settings.stt_mode
+
+    try:
+        transcribed_text, detected_lang = await asyncio.wait_for(
+            asyncio.to_thread(transcribe_audio, audio_bytes, audio_file.filename, effective_stt_mode),
+            timeout=float(settings.stt_timeout_seconds),
+        )
+    except asyncio.TimeoutError:
+        logger.warning("STT request timed out")
+        raise HTTPException(status_code=504, detail=TIMEOUT_MESSAGE)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    response_language = get_response_language(transcribed_text, detected_lang)
+    conversation = get_or_create_conversation(user_id, conversation_id, db, learner_context=learner_context)
+    history = get_conversation_history(conversation.id, db)
+
+    user_audio_url: Optional[str] = None
+    try:
+        user_audio_url = await asyncio.to_thread(
+            store_user_voice_wav,
+            audio_bytes,
+            f"user_voice_{conversation.id}_{uuid.uuid4().hex[:12]}.wav",
+        )
+    except Exception as e:
+        logger.warning("User voice storage failed: %s", e)
+
+    async def event_gen():
+        yield (
+            f"event: stt_result\ndata: "
+            f"{json.dumps({'text': transcribed_text, 'detected_lang': detected_lang, 'response_language': response_language})}\n\n"
+        )
+        async for chunk in _llm_tts_streaming_pipeline(
+            transcribed_text, history, response_language, conversation, db, user_id,
+            long_term_context=conversation.long_term_context,
+            usage_type="voice",
+            user_audio_url=user_audio_url,
+        ):
+            yield chunk
 
     return StreamingResponse(
         event_gen(),

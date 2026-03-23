@@ -1,11 +1,13 @@
 """Text-to-Speech service with cloud/local storage."""
 import asyncio
 import hashlib
+import json
 import logging
 import os
 import re
 import struct
 import threading
+import time
 from io import BytesIO
 from pathlib import Path
 from typing import Iterator, Optional
@@ -24,6 +26,7 @@ _turbo_model = None
 _turbo_device = None
 _lock_turbo = threading.Lock()
 _turbo_voice_prepared = False  # Voice cloning: prepare once, reuse for all generate() calls
+_turbo_warmup_done = False  # One inference after load so compiled kernels are ready for first user
 
 # Lazy-loaded IndicF5 model and vocoder (loaded on first use); lock prevents double-load
 _indicf5_model = None
@@ -32,8 +35,26 @@ _indicf5_device = None
 _indicf5_available = True  # Set False if load fails so we fallback to Turbo
 _lock_indicf5 = threading.Lock()
 
-# Inference lock: one TTS inference at a time on the GPU to avoid OOM with workers=1 and multiple threads.
-_inference_lock = threading.Lock()
+# Inference semaphore: up to N TTS inferences at once (configurable) to reduce latency for multi-sentence responses; set to 1 for strict serialization on low VRAM.
+_inference_semaphore = threading.Semaphore(settings.tts_concurrent_inferences)
+
+# Lazy-loaded Gemini client for TTS (when Chatterbox disabled). API-based, no GPU lock.
+_gemini_tts_client = None
+
+# Lazy-loaded Resemble HTTP client (TTS_CHATTERBOX_MODE=api)
+_resemble_client = None
+_lock_resemble = threading.Lock()
+
+# Internal language code to BCP-47 for Gemini TTS (en-US, hi-IN, etc.)
+LANG_TO_BCP47 = {
+    "en": "en-US",
+    "hi": "hi-IN",
+    "ml": "ml-IN",
+    "ta": "ta-IN",
+    "te": "te-IN",
+    "kn": "kn-IN",
+    "bn": "bn-BD",
+}
 
 # IndicF5 ref audio filenames and ref text per language (must match the ref WAV content)
 INDICF5_REF_FILENAMES = {
@@ -104,8 +125,8 @@ def _generate_presigned_url(s3_key: str) -> Optional[str]:
         return None
 
 
-def _store_audio_cloud(audio_bytes: bytes, filename: str) -> Optional[str]:
-    """Store audio file in S3 and return the S3 key (e.g. 'audio/filename.mp3'), or None."""
+def _store_audio_cloud(audio_bytes: bytes, filename: str, content_type: str = "audio/mpeg") -> Optional[str]:
+    """Store audio file in S3 and return the S3 key (e.g. 'ai/audio/filename.mp3'), or None."""
     if not all([
         settings.aws_access_key_id,
         settings.aws_secret_access_key,
@@ -126,7 +147,7 @@ def _store_audio_cloud(audio_bytes: bytes, filename: str) -> Optional[str]:
             Bucket=settings.s3_bucket_name,
             Key=s3_key,
             Body=audio_bytes,
-            ContentType="audio/mpeg"
+            ContentType=content_type
         )
         return s3_key
     except ImportError:
@@ -135,6 +156,23 @@ def _store_audio_cloud(audio_bytes: bytes, filename: str) -> Optional[str]:
     except Exception as e:
         logger.error(f"Cloud storage error: {e}, falling back to local")
         return None
+
+
+def store_user_voice_wav(audio_bytes: bytes, filename: str) -> str:
+    """
+    Store user voice recording (WAV) in S3 or local and return the playback URL.
+    Used for voice-chat and voice-chat/stream to persist the user's recording.
+    On S3/store failure, falls back to local; if both fail, caller should handle (log and use None).
+    """
+    try:
+        s3_key = _store_audio_cloud(audio_bytes, f"user_voice/{filename}", content_type="audio/wav")
+        if s3_key:
+            presigned = _generate_presigned_url(s3_key)
+            if presigned:
+                return presigned
+    except Exception as e:
+        logger.warning("User voice S3 upload failed: %s, falling back to local", e)
+    return _store_audio_local(audio_bytes, filename)
 
 
 def _parse_audio_mime_type(mime_type: str) -> dict[str, int]:
@@ -216,6 +254,67 @@ def _convert_to_wav(audio_data: bytes, mime_type: str) -> bytes:
     return header + audio_data
 
 
+def _get_gemini_tts_client():
+    """Lazy load Gemini client for TTS (used when Chatterbox is disabled). Same SDK as LLM."""
+    global _gemini_tts_client
+    if _gemini_tts_client is None:
+        if not settings.gemini_api_key:
+            raise ValueError("Gemini API key not configured. Set GEMINI_API_KEY for TTS when Chatterbox is disabled.")
+        from google import genai
+        timeout_ms = getattr(settings, "tts_timeout_seconds", 45) * 1000
+        try:
+            from google.genai.types import HttpOptions
+            _gemini_tts_client = genai.Client(
+                api_key=settings.gemini_api_key,
+                http_options=HttpOptions(timeout=timeout_ms),
+            )
+        except (ImportError, AttributeError):
+            _gemini_tts_client = genai.Client(api_key=settings.gemini_api_key)
+        logger.info("Gemini TTS client initialized (model=%s)", getattr(settings, "tts_gemini_model", "gemini-2.5-flash-lite-preview-tts"))
+    return _gemini_tts_client
+
+
+def _tts_with_gemini(text: str, response_language: str) -> bytes:
+    """
+    Generate TTS audio using Gemini (e.g. gemini-2.5-flash-lite-preview-tts).
+    Used when Chatterbox is disabled. Returns WAV bytes.
+    """
+    from google.genai import types
+    if not text or not text.strip():
+        raise ValueError("Empty text for Gemini TTS")
+    text = text.strip()
+    if len(text) > 4000:
+        text = text[:4000]
+    client = _get_gemini_tts_client()
+    lang_code = LANG_TO_BCP47.get(response_language, "en-US")
+    voice_name = getattr(settings, "tts_gemini_voice", "Puck") or "Puck"
+    model_name = getattr(settings, "tts_gemini_model", "gemini-2.5-flash-lite-preview-tts")
+    contents = f"Say the following: {text}"
+    config = types.GenerateContentConfig(
+        response_modalities=["AUDIO"],
+        speech_config=types.SpeechConfig(
+            language_code=lang_code,
+            voice_config=types.VoiceConfig(
+                prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=voice_name),
+            ),
+        ),
+    )
+    response = client.models.generate_content(
+        model=model_name,
+        contents=contents,
+        config=config,
+    )
+    if not response.candidates or not response.candidates[0].content or not response.candidates[0].content.parts:
+        raise ValueError("No audio content in Gemini TTS response")
+    part = response.candidates[0].content.parts[0]
+    if not getattr(part, "inline_data", None) or not getattr(part.inline_data, "data", None):
+        raise ValueError("Gemini TTS response missing inline_data")
+    pcm_data = part.inline_data.data
+    if not pcm_data:
+        raise ValueError("Gemini TTS returned empty audio")
+    return _convert_to_wav(pcm_data, "audio/L16;rate=24000")
+
+
 def _convert_wav_to_mp3(wav_bytes: bytes) -> bytes:
     """
     Convert WAV audio bytes to MP3 format.
@@ -266,33 +365,167 @@ def _convert_wav_to_mp3(wav_bytes: bytes) -> bytes:
 
 def _get_turbo_model():
     """Lazy load Chatterbox-Turbo (or ChatterboxTTS fallback) for English TTS. Thread-safe. Uses get_infer_device() so STT and TTS share the same GPU in prod."""
+    if not getattr(settings, "tts_chatterbox_enabled", True):
+        raise ValueError("Chatterbox is disabled. Set TTS_CHATTERBOX_ENABLED=true to use Chatterbox-Turbo.")
     global _turbo_model, _turbo_device
     with _lock_turbo:
         if _turbo_model is None:
             device = get_infer_device()
             _turbo_device = device
 
+            # Patch must run before any model instantiation so that watermark weights are not loaded when using the dummy.
             # Both Turbo and ChatterboxTTS use perth.PerthImplicitWatermarker(); in some envs it is None (resemble-ai/chatterbox#198). Patch once before loading either.
             try:
                 import perth
-                if perth.PerthImplicitWatermarker is None and getattr(perth, "DummyWatermarker", None) is not None:
+                use_dummy = (
+                    perth.PerthImplicitWatermarker is None
+                    or getattr(settings, "tts_use_dummy_watermarker", False)
+                )
+                if use_dummy and getattr(perth, "DummyWatermarker", None) is not None:
                     perth.PerthImplicitWatermarker = perth.DummyWatermarker
                     logger.debug("Patched perth.PerthImplicitWatermarker to DummyWatermarker")
             except Exception:
                 pass
 
+            # Prefer SDPA over manual attention on CUDA (faster). Set global backend before loading so the model uses it when instantiated.
+            if device == "cuda":
+                try:
+                    import torch
+                    torch.backends.cuda.enable_flash_sdp(True)
+                    torch.backends.cuda.enable_math_sdp(False)
+                    logger.debug("SDPA backends set for Chatterbox load (flash=True, math=False)")
+                except Exception as e:
+                    logger.debug("Could not set SDPA backends: %s", e)
+
             # Prefer ChatterboxTurboTTS (chatterbox.tts_turbo); PyPI package may only have chatterbox.tts
             try:
                 from chatterbox.tts_turbo import ChatterboxTurboTTS
                 logger.info(f"Loading Chatterbox-Turbo model (device: {device})")
-                _turbo_model = ChatterboxTurboTTS.from_pretrained(device=device)
+                use_bfloat16 = device == "cuda" and getattr(settings, "tts_turbo_use_bfloat16", True)
+                _turbo_model = None
+                if use_bfloat16:
+                    try:
+                        import torch as _torch
+                        _turbo_model = ChatterboxTurboTTS.from_pretrained(device=device, torch_dtype=_torch.bfloat16)
+                    except TypeError:
+                        pass
+                if _turbo_model is None:
+                    try:
+                        _turbo_model = ChatterboxTurboTTS.from_pretrained(device=device, attn_implementation="sdpa")
+                    except TypeError:
+                        _turbo_model = ChatterboxTurboTTS.from_pretrained(device=device)
                 logger.info("Chatterbox-Turbo model loaded successfully")
+                # Force SDPA: wrap transformer forward so output_attentions=False, output_hidden_states=False (avoids manual attention fallback). Depends on transformers version; for max throughput a fork that sets these at call site (e.g. rsxdalv/chatterbox#127) can be used.
+                if device == "cuda" and getattr(settings, "tts_force_sdpa_attention", True) and hasattr(_turbo_model.t3, "tfmr"):
+                    try:
+                        _orig_forward = _turbo_model.t3.tfmr.forward
+                        def _wrapped_forward(*args, **kwargs):
+                            kwargs["output_attentions"] = False
+                            kwargs["output_hidden_states"] = False
+                            return _orig_forward(*args, **kwargs)
+                        _turbo_model.t3.tfmr.forward = _wrapped_forward
+                        logger.debug("Chatterbox-Turbo tfmr.forward wrapped for SDPA (output_attentions=False, output_hidden_states=False)")
+                    except Exception as e:
+                        logger.debug("Could not wrap Turbo tfmr.forward for SDPA: %s", e)
+                # Post-load bfloat16 when not loaded with torch_dtype (e.g. library does not support it).
+                if device == "cuda" and use_bfloat16:
+                    try:
+                        import torch as _torch
+                        if _turbo_model.t3.tfmr.weight.dtype != _torch.bfloat16:
+                            _turbo_model.t3 = _turbo_model.t3.to(_torch.bfloat16).eval()
+                            _turbo_model.s3gen = _turbo_model.s3gen.to(_torch.bfloat16).eval()
+                            _turbo_model.ve = _turbo_model.ve.to(_torch.bfloat16).eval()
+                            logger.debug("Chatterbox-Turbo converted to bfloat16")
+                    except Exception as e:
+                        logger.warning("Could not convert Turbo to bfloat16: %s", e)
+                if device == "cuda" and getattr(settings, "tts_turbo_compile_t3", True):
+                    try:
+                        import torch as _torch
+                        _turbo_model.t3 = _torch.compile(_turbo_model.t3, mode="reduce-overhead", fullgraph=True)
+                        logger.debug("Chatterbox-Turbo t3 compiled with torch.compile (reduce-overhead)")
+                    except Exception as e:
+                        logger.debug("Full t3 compile failed: %s; trying _step_compilation_target if present", e)
+                        step_target = getattr(_turbo_model.t3, "_step_compilation_target", None)
+                        if callable(step_target):
+                            try:
+                                import torch as _torch
+                                _turbo_model.t3._step_compilation_target = _torch.compile(step_target, fullgraph=True, backend="cudagraphs")
+                                logger.debug("Chatterbox-Turbo t3._step_compilation_target compiled with cudagraphs")
+                            except Exception as e2:
+                                logger.debug("Could not compile Turbo step target: %s", e2)
+                max_cache_len = getattr(settings, "tts_turbo_max_cache_len", None)
+                if max_cache_len is not None and hasattr(_turbo_model.t3, "max_cache_len"):
+                    try:
+                        _turbo_model.t3.max_cache_len = max_cache_len
+                        logger.debug("Chatterbox-Turbo max_cache_len set to %s", max_cache_len)
+                    except Exception as e:
+                        logger.debug("Could not set Turbo max_cache_len: %s", e)
+                # Wrap inference_turbo to pass max_gen_len from config or per-call override (reduces loop overhead).
+                t3_obj = _turbo_model.t3
+                _orig_inference_turbo = getattr(t3_obj, "inference_turbo", None)
+                if callable(_orig_inference_turbo):
+                    # Use unbound function so we can pass (t3_obj, *args, **kwargs) without double self.
+                    _orig_inference_turbo = getattr(_orig_inference_turbo, "__func__", _orig_inference_turbo)
+                    _max_gen_len_default = getattr(settings, "tts_turbo_max_gen_len", 400)
+
+                    def _wrapped_inference_turbo(*args, **kwargs):
+                        mg = getattr(t3_obj, "_max_gen_len_override", None)
+                        kwargs["max_gen_len"] = mg if mg is not None else _max_gen_len_default
+                        return _orig_inference_turbo(t3_obj, *args, **kwargs)
+
+                    _turbo_model.t3.inference_turbo = _wrapped_inference_turbo
+                    logger.debug("Chatterbox-Turbo t3.inference_turbo wrapped with max_gen_len from config")
+                # Compile S3 decoder when enabled (CUDA).
+                if device == "cuda" and getattr(settings, "tts_turbo_compile_s3gen", True) and hasattr(_turbo_model, "s3gen"):
+                    try:
+                        import torch as _torch
+                        _turbo_model.s3gen = _torch.compile(_turbo_model.s3gen, mode="reduce-overhead")
+                        logger.debug("Chatterbox-Turbo s3gen compiled with torch.compile (reduce-overhead)")
+                    except Exception as e:
+                        logger.debug("s3gen compile failed: %s; leaving uncompiled", e)
             except ImportError:
                 try:
                     from chatterbox.tts import ChatterboxTTS
                     logger.info(f"Loading ChatterboxTTS (fallback, device: {device})")
-                    _turbo_model = ChatterboxTTS.from_pretrained(device=device)
+                    try:
+                        _turbo_model = ChatterboxTTS.from_pretrained(device=device, attn_implementation="sdpa")
+                    except TypeError:
+                        _turbo_model = ChatterboxTTS.from_pretrained(device=device)
                     logger.info("ChatterboxTTS model loaded successfully (use Turbo from source for lower latency)")
+                    # SDPA wrap for fallback too (non-Turbo uses tfmr in inference loop).
+                    if device == "cuda" and getattr(settings, "tts_force_sdpa_attention", True) and hasattr(_turbo_model.t3, "tfmr"):
+                        try:
+                            _orig_fwd = _turbo_model.t3.tfmr.forward
+                            def _wrap_fwd(*args, **kwargs):
+                                kwargs["output_attentions"] = False
+                                kwargs["output_hidden_states"] = False
+                                return _orig_fwd(*args, **kwargs)
+                            _turbo_model.t3.tfmr.forward = _wrap_fwd
+                            logger.debug("ChatterboxTTS tfmr.forward wrapped for SDPA")
+                        except Exception as e:
+                            logger.debug("Could not wrap ChatterboxTTS tfmr.forward: %s", e)
+                    # Wrap inference to pass max_new_tokens from config or per-call override.
+                    t3_obj = _turbo_model.t3
+                    _orig_inference = getattr(t3_obj, "inference", None)
+                    if callable(_orig_inference):
+                        _orig_inference = getattr(_orig_inference, "__func__", _orig_inference)
+                        _max_new_tokens_default = getattr(settings, "tts_turbo_max_gen_len", 400)
+
+                        def _wrapped_inference(*args, **kwargs):
+                            mn = getattr(t3_obj, "_max_gen_len_override", None)
+                            kwargs["max_new_tokens"] = mn if mn is not None else _max_new_tokens_default
+                            return _orig_inference(t3_obj, *args, **kwargs)
+
+                        _turbo_model.t3.inference = _wrapped_inference
+                        logger.debug("ChatterboxTTS t3.inference wrapped with max_new_tokens from config")
+                    # Compile S3 decoder when enabled (CUDA).
+                    if device == "cuda" and getattr(settings, "tts_turbo_compile_s3gen", True) and hasattr(_turbo_model, "s3gen"):
+                        try:
+                            import torch as _torch
+                            _turbo_model.s3gen = _torch.compile(_turbo_model.s3gen, mode="reduce-overhead")
+                            logger.debug("ChatterboxTTS s3gen compiled with torch.compile (reduce-overhead)")
+                        except Exception as e:
+                            logger.debug("s3gen compile failed: %s; leaving uncompiled", e)
                 except ImportError as e:
                     logger.error(f"Chatterbox dependencies not installed: {e}")
                     raise ValueError(
@@ -319,9 +552,12 @@ def _get_indicf5_ref_audio_dir() -> Optional[str]:
 
 
 def _get_indicf5_model():
-    """Lazy load IndicF5 model and vocoder. On failure set _indicf5_available=False. Thread-safe."""
+    """Lazy load IndicF5 model and vocoder. On failure set _indicf5_available=False. When tts_indicf5_enabled=False, never loads. Thread-safe."""
     global _indicf5_model, _indicf5_vocoder, _indicf5_device, _indicf5_available
     with _lock_indicf5:
+        if not getattr(settings, "tts_indicf5_enabled", False):
+            _indicf5_available = False
+            return None, None, None
         if not _indicf5_available:
             return None, None, None
 
@@ -366,7 +602,8 @@ def _get_indicf5_model():
             logger.info("IndicF5 model loaded successfully")
             return _indicf5_model, _indicf5_vocoder, _indicf5_device
         except Exception as e:
-            logger.warning(f"IndicF5 load failed: {e}. Indic languages will use Turbo fallback.")
+            fallback = "Gemini TTS" if not getattr(settings, "tts_chatterbox_enabled", True) else "Turbo"
+            logger.warning(f"IndicF5 load failed: {e}. Indic languages will use {fallback} fallback.")
             _indicf5_available = False
             return None, None, None
 
@@ -462,6 +699,136 @@ def _resolve_audio_prompt_path() -> Optional[str]:
     return None
 
 
+def _get_resemble_client():
+    """Lazy-load pooled httpx client for Resemble streaming TTS (thread-safe)."""
+    global _resemble_client
+    with _lock_resemble:
+        if _resemble_client is None:
+            if not settings.resemble_api_key:
+                raise ValueError(
+                    "RESEMBLE_API_KEY not set. Set it when TTS_CHATTERBOX_MODE=api."
+                )
+            if not settings.resemble_voice_uuid:
+                raise ValueError(
+                    "RESEMBLE_VOICE_UUID not set. Set it when TTS_CHATTERBOX_MODE=api."
+                )
+            import httpx
+
+            _resemble_client = httpx.Client(
+                base_url="https://f.cluster.resemble.ai",
+                headers={
+                    "Authorization": f"Bearer {settings.resemble_api_key}",
+                    "Content-Type": "application/json",
+                },
+                timeout=httpx.Timeout(
+                    connect=10.0,
+                    read=float(settings.resemble_api_timeout),
+                    write=10.0,
+                    pool=5.0,
+                ),
+                limits=httpx.Limits(
+                    max_connections=10,
+                    max_keepalive_connections=5,
+                ),
+            )
+    return _resemble_client
+
+
+def _parse_resemble_error_body(body: bytes, status_code: int) -> str:
+    """Extract a user-safe message from Resemble JSON error responses."""
+    if not body:
+        return f"Resemble TTS request failed (HTTP {status_code})"
+    try:
+        data = json.loads(body.decode("utf-8", errors="replace"))
+        if isinstance(data, dict):
+            msg = data.get("message") or data.get("error") or data.get("detail")
+            if msg:
+                return str(msg)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        pass
+    preview = body[:500].decode("utf-8", errors="replace")
+    return f"Resemble TTS request failed (HTTP {status_code}): {preview}"
+
+
+def _tts_with_resemble_api(text: str) -> bytes:
+    """
+    Generate WAV via Resemble AI streaming synthesis (POST /stream).
+    https://docs.resemble.ai/api-reference/text-to-speech/stream-synthesize
+    """
+    text = (text or "").strip()
+    if not text:
+        raise ValueError("Empty text for Resemble TTS")
+    if len(text) > 2000:
+        logger.warning("Resemble TTS text length %s, truncating to 2000", len(text))
+        text = text[:2000]
+
+    client = _get_resemble_client()
+    payload = {
+        "voice_uuid": settings.resemble_voice_uuid,
+        "data": text,
+        "model": settings.resemble_api_model,
+        "sample_rate": settings.resemble_sample_rate,
+        "precision": settings.resemble_precision,
+        "use_hd": settings.resemble_use_hd,
+    }
+    max_retries = max(0, int(getattr(settings, "resemble_api_max_retries", 2)))
+
+    import httpx
+
+    last_error_msg: Optional[str] = None
+    for attempt in range(max_retries + 1):
+        try:
+            with client.stream("POST", "/stream", json=payload) as response:
+                if response.status_code != 200:
+                    err_body = response.read()
+                    msg = _parse_resemble_error_body(err_body, response.status_code)
+                    if 400 <= response.status_code < 500:
+                        raise ValueError(msg)
+                    last_error_msg = msg
+                    if attempt < max_retries:
+                        delay = 0.5 * (2**attempt)
+                        logger.warning(
+                            "Resemble TTS HTTP %s, retry %s/%s after %.1fs",
+                            response.status_code,
+                            attempt + 1,
+                            max_retries,
+                            delay,
+                        )
+                        time.sleep(delay)
+                        continue
+                    raise ValueError(msg)
+
+                buf = bytearray()
+                for chunk in response.iter_bytes():
+                    if chunk:
+                        buf.extend(chunk)
+                wav = bytes(buf)
+                if not wav:
+                    raise ValueError("Resemble TTS returned empty audio")
+                logger.debug("Resemble TTS generated %s bytes WAV", len(wav))
+                return wav
+
+        except ValueError:
+            raise
+        except (httpx.TimeoutException, httpx.ConnectError, httpx.TransportError) as e:
+            last_error_msg = str(e)
+            if attempt < max_retries:
+                delay = 0.5 * (2**attempt)
+                logger.warning(
+                    "Resemble TTS transport error, retry %s/%s after %.1fs: %s",
+                    attempt + 1,
+                    max_retries,
+                    delay,
+                    e,
+                )
+                time.sleep(delay)
+                continue
+            logger.error("Resemble TTS failed after retries: %s", e, exc_info=True)
+            raise ValueError("Resemble TTS temporarily unavailable. Please try again.") from e
+
+    raise ValueError(last_error_msg or "Resemble TTS failed.")
+
+
 def _tts_with_turbo(text: str) -> bytes:
     """
     Generate audio using Chatterbox-Turbo (ResembleAI/chatterbox-turbo). English only.
@@ -493,22 +860,83 @@ def _tts_with_turbo(text: str) -> bytes:
         global _turbo_voice_prepared
         with _lock_turbo:
             if getattr(model, "prepare_conditionals", None) and not _turbo_voice_prepared:
-                model.prepare_conditionals(audio_prompt_path)
+                exaggeration = getattr(settings, "tts_turbo_exaggeration", 0.7)
+                try:
+                    model.prepare_conditionals(audio_prompt_path, exaggeration=exaggeration, norm_loudness=True)
+                except TypeError:
+                    try:
+                        model.prepare_conditionals(audio_prompt_path, exaggeration=exaggeration)
+                    except TypeError:
+                        model.prepare_conditionals(audio_prompt_path)
                 _turbo_voice_prepared = True
                 logger.info(
                     "Voice cloning reference loaded once: %s (reusing for subsequent requests)",
                     audio_prompt_path,
                 )
 
-        with torch.no_grad():
-            if _turbo_voice_prepared:
-                wav_tensor = model.generate(text)
-            else:
-                wav_tensor = model.generate(text, audio_prompt_path=audio_prompt_path)
+        gen_kwargs = {
+            "temperature": getattr(settings, "tts_turbo_temperature", 0.8),
+            "top_p": getattr(settings, "tts_turbo_top_p", 0.95),
+            "top_k": getattr(settings, "tts_turbo_top_k", 1000),
+            "repetition_penalty": getattr(settings, "tts_turbo_repetition_penalty", 1.2),
+        }
+        # ChatterboxTTS (non-Turbo fallback) does not accept top_k; it uses temperature, top_p, repetition_penalty, cfg_weight, exaggeration, min_p.
+        gen_kwargs_fallback = {k: v for k, v in gen_kwargs.items() if k != "top_k"}
+        gen_kwargs_fallback["cfg_weight"] = getattr(settings, "tts_turbo_cfg_weight", 0.3)
 
-        wav_array = wav_tensor.cpu().numpy()
-        if wav_array.ndim > 1:
-            wav_array = wav_array.squeeze()
+        def _do_generate():
+            if _turbo_voice_prepared:
+                try:
+                    return model.generate(text, **gen_kwargs)
+                except TypeError:
+                    try:
+                        return model.generate(text, **gen_kwargs_fallback)
+                    except TypeError:
+                        return model.generate(text)
+            else:
+                try:
+                    return model.generate(text, audio_prompt_path=audio_prompt_path, **gen_kwargs)
+                except TypeError:
+                    try:
+                        return model.generate(text, audio_prompt_path=audio_prompt_path, **gen_kwargs_fallback)
+                    except TypeError:
+                        return model.generate(text, audio_prompt_path=audio_prompt_path)
+
+        # generate_stream is not in upstream; requires a streaming-capable fork (e.g. rsxdalv/chatterbox).
+        use_streaming = getattr(settings, "tts_turbo_use_streaming", False) and callable(getattr(model, "generate_stream", None))
+        if use_streaming:
+            chunk_size = getattr(settings, "tts_turbo_stream_chunk_size", 25)
+            chunks = []
+            try:
+                for item in model.generate_stream(text, chunk_size=chunk_size):
+                    if isinstance(item, tuple):
+                        audio_chunk = item[0]
+                    else:
+                        audio_chunk = item
+                    if hasattr(audio_chunk, "cpu"):
+                        audio_chunk = audio_chunk.cpu().numpy()
+                    if isinstance(audio_chunk, np.ndarray):
+                        chunks.append(audio_chunk)
+            except TypeError:
+                use_streaming = False
+            if use_streaming:
+                wav_array = np.concatenate(chunks, axis=0) if chunks else np.array([], dtype=np.float32)
+                if wav_array.ndim > 1:
+                    wav_array = wav_array.squeeze()
+        if not use_streaming:
+            # Dynamic cap: min(config ceiling, max(100, len(text)*3)) for lower latency.
+            max_gen_len_ceiling = getattr(settings, "tts_turbo_max_gen_len", 400) or 400
+            if hasattr(model, "t3"):
+                model.t3._max_gen_len_override = min(max_gen_len_ceiling, max(100, len(text) * 3))
+            try:
+                no_grad_ctx = torch.inference_mode()
+            except AttributeError:
+                no_grad_ctx = torch.no_grad()
+            with no_grad_ctx:
+                wav_tensor = _do_generate()
+            wav_array = wav_tensor.cpu().numpy()
+            if wav_array.ndim > 1:
+                wav_array = wav_array.squeeze()
 
         sample_rate = model.sr
         logger.info(f"Generated audio: {len(wav_array)} samples at {sample_rate}Hz")
@@ -572,23 +1000,34 @@ def generate_tts_bytes(text: str, response_language: str = "en") -> bytes:
     """
     Public entrypoint: generate TTS audio bytes for one sentence (WAV).
     Used by the chat/stream pipeline for sentence-level TTS.
+    When TTS_CHATTERBOX_ENABLED=false, English and Indic fallback use Gemini TTS (no GPU lock).
+    When TTS_CHATTERBOX_MODE=api, English uses Resemble AI streaming API (no local GPU).
     """
     lang = _effective_response_language(text, response_language)
-    use_indicf5 = lang != "en"
+    use_indicf5 = lang != "en" and getattr(settings, "tts_indicf5_enabled", False)
+    chatterbox_enabled = getattr(settings, "tts_chatterbox_enabled", True)
+
     if use_indicf5:
         ref = _get_indicf5_ref(lang)
         model, _, _ = _get_indicf5_model()
         if ref and model is not None:
             try:
-                with _inference_lock:
+                with _inference_semaphore:
                     return _tts_with_indicf5(text, lang)
             except ValueError:
                 raise
             except Exception as e:
-                logger.warning(f"IndicF5 generation failed: {e}. Falling back to Chatterbox-Turbo.")
-        use_indicf5 = False
+                logger.warning(f"IndicF5 generation failed: {e}. Falling back to %s.", "Gemini TTS" if not chatterbox_enabled else "Chatterbox-Turbo")
+                use_indicf5 = False
+        else:
+            use_indicf5 = False
+
     if not use_indicf5:
-        with _inference_lock:
+        if not chatterbox_enabled:
+            return _tts_with_gemini(text, lang)
+        if getattr(settings, "tts_chatterbox_mode", "local") == "api":
+            return _tts_with_resemble_api(text)
+        with _inference_semaphore:
             return _tts_with_turbo(text)
     raise ValueError("Something went wrong generating audio. Please try again.")
 
@@ -673,14 +1112,15 @@ def text_to_speech(text: str, response_language: str = "en") -> str:
             return presigned
         return cached
 
-    use_indicf5 = lang != "en"
+    chatterbox_enabled = getattr(settings, "tts_chatterbox_enabled", True)
+    use_indicf5 = lang != "en" and getattr(settings, "tts_indicf5_enabled", False)
     if use_indicf5:
         ref = _get_indicf5_ref(lang)
         model, _, _ = _get_indicf5_model()
         if ref and model is not None:
             logger.info(f"Using TTS provider: IndicF5 (language: {lang})")
             try:
-                with _inference_lock:
+                with _inference_semaphore:
                     audio_bytes = _tts_with_indicf5(text, lang)
                 audio_bytes = _convert_wav_to_mp3(audio_bytes)
                 filename = f"{lang}_{hashlib.md5(text.encode()).hexdigest()}.mp3"
@@ -696,16 +1136,43 @@ def text_to_speech(text: str, response_language: str = "en") -> str:
             except ValueError:
                 raise
             except Exception as e:
-                logger.warning(f"IndicF5 generation failed: {e}. Falling back to Chatterbox-Turbo.")
+                logger.warning(f"IndicF5 generation failed: {e}. Falling back to %s.", "Gemini TTS" if not chatterbox_enabled else "Chatterbox-Turbo")
+                use_indicf5 = False
         else:
-            logger.warning(f"IndicF5 not configured for {lang}. Using Chatterbox-Turbo.")
-            use_indicf5 = False
+            logger.warning(f"IndicF5 not configured for {lang}. Using %s.", "Gemini TTS" if not chatterbox_enabled else "Chatterbox-Turbo")
+        use_indicf5 = False
 
     if not use_indicf5:
-        logger.info("Using TTS provider: Chatterbox-Turbo")
+        if not chatterbox_enabled:
+            logger.info("Using TTS provider: Gemini TTS (model: %s, voice: %s)", getattr(settings, "tts_gemini_model", "gemini-2.5-flash-lite-preview-tts"), getattr(settings, "tts_gemini_voice", "Puck"))
+            try:
+                audio_bytes = _tts_with_gemini(text, lang)
+                audio_bytes = _convert_wav_to_mp3(audio_bytes)
+                filename = f"{hashlib.md5(text.encode()).hexdigest()}.mp3"
+                s3_key = _store_audio_cloud(audio_bytes, filename)
+                if s3_key:
+                    presigned = _generate_presigned_url(s3_key)
+                    if presigned:
+                        set(cache_key, "s3:" + s3_key, settings.tts_cache_ttl)
+                        return presigned
+                audio_url = _store_audio_local(audio_bytes, filename)
+                set(cache_key, audio_url, settings.tts_cache_ttl)
+                return audio_url
+            except ValueError:
+                raise
+            except Exception as e:
+                logger.error(f"Gemini TTS error: {e}")
+                raise ValueError("Something went wrong generating audio. Please try again.")
+        if getattr(settings, "tts_chatterbox_mode", "local") == "api":
+            logger.info("Using TTS provider: Resemble Chatterbox API")
+        else:
+            logger.info("Using TTS provider: Chatterbox-Turbo")
         try:
-            with _inference_lock:
-                audio_bytes = _tts_with_turbo(text)
+            if getattr(settings, "tts_chatterbox_mode", "local") == "api":
+                audio_bytes = _tts_with_resemble_api(text)
+            else:
+                with _inference_semaphore:
+                    audio_bytes = _tts_with_turbo(text)
             audio_bytes = _convert_wav_to_mp3(audio_bytes)
             filename = f"{hashlib.md5(text.encode()).hexdigest()}.mp3"
             s3_key = _store_audio_cloud(audio_bytes, filename)
@@ -729,19 +1196,53 @@ def text_to_speech(text: str, response_language: str = "en") -> str:
 def init_tts_models() -> dict:
     """
     Load TTS models (Turbo and optionally IndicF5) for warmup.
-    Returns {"turbo": "loaded"|"failed", "indicf5": "loaded"|"skipped"|"failed"}.
+    When TTS_CHATTERBOX_ENABLED=false, Turbo is not loaded.
+    When TTS_CHATTERBOX_MODE=api, local Turbo is not loaded; Resemble API is warmed with a short synthesis.
+    When TTS_INDICF5_ENABLED=false, IndicF5 is not loaded.
+    Runs one short TTS inference after loading Turbo so torch.compile/CUDA kernels are warmed.
+    Returns {"turbo": "loaded"|"api_mode"|"disabled"|"failed", "indicf5": "loaded"|"disabled"|"skipped"|"failed"}.
     """
+    global _turbo_warmup_done
     result: dict = {}
-    try:
-        _get_turbo_model()
-        result["turbo"] = "loaded"
-    except Exception as e:
-        logger.exception("TTS Turbo init failed")
-        result["turbo"] = "failed"
-        result["turbo_error"] = str(e)
-    model, _, _ = _get_indicf5_model()
-    if model is not None:
-        result["indicf5"] = "loaded"
+    if not getattr(settings, "tts_chatterbox_enabled", True):
+        result["turbo"] = "disabled"
+    elif getattr(settings, "tts_chatterbox_mode", "local") == "api":
+        if not settings.resemble_api_key or not settings.resemble_voice_uuid:
+            result["turbo"] = "failed"
+            result["turbo_error"] = (
+                "RESEMBLE_API_KEY and RESEMBLE_VOICE_UUID are required when TTS_CHATTERBOX_MODE=api"
+            )
+        else:
+            try:
+                _tts_with_resemble_api("Hi.")
+                _turbo_warmup_done = True
+                result["turbo"] = "api_mode"
+                logger.info("Resemble TTS API warm-up completed")
+            except Exception as e:
+                logger.exception("Resemble TTS API init failed")
+                result["turbo"] = "failed"
+                result["turbo_error"] = str(e)
     else:
-        result["indicf5"] = "skipped"
+        try:
+            _get_turbo_model()
+            result["turbo"] = "loaded"
+            if not _turbo_warmup_done:
+                try:
+                    generate_tts_bytes("Hello.", "en")
+                    _turbo_warmup_done = True
+                    logger.info("TTS warm-up inference completed (compiled kernels ready)")
+                except Exception as warmup_e:
+                    logger.warning("TTS warm-up inference failed: %s (first user request may be slower)", warmup_e)
+        except Exception as e:
+            logger.exception("TTS Turbo init failed")
+            result["turbo"] = "failed"
+            result["turbo_error"] = str(e)
+    if not getattr(settings, "tts_indicf5_enabled", False):
+        result["indicf5"] = "disabled"
+    else:
+        model, _, _ = _get_indicf5_model()
+        if model is not None:
+            result["indicf5"] = "loaded"
+        else:
+            result["indicf5"] = "skipped"
     return result
