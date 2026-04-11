@@ -128,7 +128,14 @@ async def startup_event():
     if getattr(settings, "tts_indicf5_enabled", False):
         indicf5_dir = getattr(settings, "tts_indicf5_ref_audio_dir", None)
         if indicf5_dir:
-            logger.info(f"TTS: Indic (hi/ml/ta/...) -> IndicF5 (ref_audio_dir: {indicf5_dir}, speed: {getattr(settings, 'tts_indicf5_speed', 0.9)})")
+            from app.services.tts import _get_indicf5_torch_device
+
+            logger.info(
+                "TTS: Indic (hi/ml/ta/...) -> IndicF5 (ref_audio_dir: %s, speed: %s, torch: %s)",
+                indicf5_dir,
+                getattr(settings, "tts_indicf5_speed", 0.9),
+                _get_indicf5_torch_device(),
+            )
         else:
             logger.info("TTS: Indic (hi/ml/ta/...) -> %s fallback (IndicF5 ref dir not set)", indic_fallback)
     else:

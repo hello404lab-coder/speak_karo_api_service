@@ -5,6 +5,7 @@ from pydantic import Field
 from pydantic_settings import BaseSettings
 from typing import Literal, Optional
 
+os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
 
 def _default_cache_enabled() -> bool:
     """In prod default to True when CACHE_ENABLED not set; in dev default False."""
@@ -71,7 +72,7 @@ class Settings(BaseSettings):
     llm_history_max_exchanges: int = 10
     
     # STT Settings
-    stt_mode: Literal["faster_whisper_medium", "faster_whisper_large", "openai_whisper_large_v3"] = "openai_whisper_large_v3"  # Env: STT_MODE (used only when stt_whisper_local_enabled=True)
+    stt_mode: Literal["faster_whisper_medium", "faster_whisper_large", "openai_whisper_large_v3"] = "faster_whisper_large"  # Env: STT_MODE (used only when stt_whisper_local_enabled=True)
     stt_faster_whisper_model_size: str = "medium"  # Used for faster_whisper_medium
     # When False: local Whisper models are never loaded; transcription uses Groq Whisper API (requires GROQ_API_KEY)
     stt_whisper_local_enabled: bool = Field(default=False, description="STT_WHISPER_LOCAL_ENABLED: use local Whisper; if false, use Groq Whisper API")
@@ -87,10 +88,15 @@ class Settings(BaseSettings):
 
     # TTS Settings - IndicF5 (for Indic languages: hi, ml, ta)
     # When False: IndicF5 is never loaded; Indic TTS uses Gemini TTS or Chatterbox-Turbo fallback
-    tts_indicf5_enabled: bool = Field(default=False, description="TTS_INDICF5_ENABLED: enable local IndicF5 for Indic languages")
+    tts_indicf5_enabled: bool = Field(default=True, description="TTS_INDICF5_ENABLED: enable local IndicF5 for Indic languages")
     # Base directory containing ref WAVs (e.g. IndicF5/prompts or backend/assets/indicf5_prompts). Only used when tts_indicf5_enabled=True.
-    tts_indicf5_ref_audio_dir: Optional[str] = None  # Set to path for ref WAVs
+    tts_indicf5_ref_audio_dir: Optional[str] = 'IndicF5/prompts'  # Set to path for ref WAVs
     tts_indicf5_speed: float = 0.9  # Speech speed (0.9 in IndicF5 main.py)
+    # When True, IndicF5 always uses CPU. When False, still uses CPU on MPS (no ComplexFloat); CUDA uses GPU.
+    tts_indicf5_force_cpu: bool = Field(
+        default=False,
+        description="TTS_INDICF5_FORCE_CPU: force IndicF5 on CPU (e.g. to free VRAM on CUDA)",
+    )
 
     # TTS Settings - Chatterbox toggle and Gemini TTS fallback
     # When False: Chatterbox is never loaded; English/Indic fallback use Gemini gemini-2.5-flash-lite-preview-tts

@@ -81,3 +81,18 @@ def get_response_language(text: str, detected_lang: Optional[str] = None) -> str
 
     # Unknown or other language: default to English so we use Chatterbox
     return "en"
+
+
+def resolve_response_language(
+    text: str,
+    detected_lang: Optional[str] = None,
+    override: Optional[str] = None,
+) -> str:
+    """
+    Like get_response_language, but if override is a non-empty code (e.g. from the client),
+    use it for this turn (helps romanized Indic where script detection yields en).
+    """
+    o = (override or "").strip().lower()
+    if o:
+        return o
+    return get_response_language(text, detected_lang)

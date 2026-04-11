@@ -21,6 +21,18 @@ from app.utils.language import _script_to_lang
 
 logger = logging.getLogger(__name__)
 
+
+def _get_indicf5_torch_device() -> str:
+    """
+    Torch device string for IndicF5 only. MPS lacks ComplexFloat and full FFT support for the F5 spectral path.
+    """
+    if getattr(settings, "tts_indicf5_force_cpu", False):
+        return "cpu"
+    infer = get_infer_device()
+    if infer == "mps":
+        return "cpu"
+    return infer
+
 # Lazy-loaded Chatterbox-Turbo model (English, loaded on first use); lock prevents double-load
 _turbo_model = None
 _turbo_device = None
@@ -575,9 +587,15 @@ def _get_indicf5_model():
             from f5_tts.model import DiT
             from f5_tts.infer.utils_infer import load_model, load_vocoder
 
-            device = get_infer_device()
+            device = _get_indicf5_torch_device()
             _indicf5_device = device
-            logger.info(f"Loading IndicF5 model (device: {device})")
+            infer = get_infer_device()
+            if device == "cpu" and infer == "mps":
+                logger.info("Loading IndicF5 model (device: cpu; MPS unsupported for F5 FFT/complex ops)")
+            elif device == "cpu" and getattr(settings, "tts_indicf5_force_cpu", False):
+                logger.info("Loading IndicF5 model (device: cpu; TTS_INDICF5_FORCE_CPU=true)")
+            else:
+                logger.info(f"Loading IndicF5 model (device: {device})")
 
             repo_id = "ai4bharat/IndicF5"
             vocab_path = hf_hub_download(repo_id, filename="checkpoints/vocab.txt")
