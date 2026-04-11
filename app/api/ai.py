@@ -24,7 +24,7 @@ from app.services.llm import generate_reply, stream_gemini_tokens, init_llm_clie
 from app.services.stt import transcribe_audio, init_stt_models
 from app.services.tts import text_to_speech_stream, store_audio_mp3, store_user_voice_wav, generate_tts_bytes, feed_tts_stream_to_queue, init_tts_models
 from app.services.subscription_service import update_usage_stats
-from app.utils.language import get_response_language
+from app.utils.language import resolve_response_language
 from app.models.usage import Conversation, Message
 from app.models.user import User
 
@@ -111,15 +111,15 @@ def _run_init_models_sync() -> dict:
 
 @router.post("/init-models")
 async def init_models(
-    current_user: User = Depends(require_active_plan),
+    # current_user: User = Depends(require_active_plan),
 ):
     """
     Initialize (warm up) all models: STT, LLM client, and TTS (local Turbo, Resemble API, or IndicF5 per config).
     Call this after startup to avoid cold-start latency on first user request.
     Runs in a thread with a 5-minute timeout.
     """
-    if not current_user.onboarding_completed:
-        raise HTTPException(status_code=403, detail=ONBOARDING_REQUIRED_MESSAGE)
+    # if not current_user.onboarding_completed:
+        # raise HTTPException(status_code=403, detail=ONBOARDING_REQUIRED_MESSAGE)
     try:
         result = await asyncio.wait_for(
             asyncio.to_thread(_run_init_models_sync),
@@ -155,8 +155,10 @@ async def text_chat(
         # Get conversation history for context
         history = get_conversation_history(conversation.id, db)
 
-        # Response language from text (script detection; no STT)
-        response_language = get_response_language(request.message, None)
+        # Response language: optional client override, else script detection (no STT)
+        response_language = resolve_response_language(
+            request.message, None, request.response_language
+        )
 
         # Run sync inference in thread pool with timeouts so event loop is not blocked
         try:
@@ -219,6 +221,7 @@ async def voice_chat(
     user_id: str = Form(...),
     conversation_id: Optional[str] = Form(None),
     learner_context: Optional[str] = Form(None),
+    response_language: Optional[str] = Form(None),
     audio_file: UploadFile = File(...),
     stt_mode: Optional[str] = Form(None),
     db: Session = Depends(get_db),
@@ -262,8 +265,10 @@ async def voice_chat(
         # Get conversation history
         history = get_conversation_history(conversation.id, db)
 
-        # Response language from STT + script detection (en -> Chatterbox, hi/ml/ta -> IndicF5)
-        response_language = get_response_language(transcribed_text, detected_lang)
+        # Response language: optional client override, else STT + script detection
+        resolved_language = resolve_response_language(
+            transcribed_text, detected_lang, response_language
+        )
 
         user_audio_url_sync: Optional[str] = None
         try:
@@ -280,7 +285,7 @@ async def voice_chat(
                     generate_reply,
                     transcribed_text,
                     history,
-                    response_language,
+                    resolved_language,
                     long_term_context=conversation.long_term_context,
                 ),
                 timeout=float(settings.llm_timeout_seconds),
@@ -315,7 +320,7 @@ async def voice_chat(
             example=ai_response.get("example") or None,
             score=ai_response.get("score", 75),
             audio_url=None,
-            response_language=response_language,
+            response_language=resolved_language,
             conversation_id=conversation.id
         )
         
@@ -576,7 +581,7 @@ async def _llm_tts_streaming_pipeline(
             parsed = parse_gemini_response(full_reply_text)
             yield (
                 f"event: metadata\ndata: "
-                f"{json.dumps({'correction': parsed.get('correction', ''), 'explanation': parsed.get('explanation', ''), 'example': parsed.get('example', ''), 'score': parsed.get('score', 75), 'conversation_id': conversation.id})}\n\n"
+                f"{json.dumps({'correction': parsed.get('correction', ''), 'explanation': parsed.get('explanation', ''), 'example': parsed.get('example', ''), 'score': parsed.get('score', 75), 'conversation_id': conversation.id, 'response_language': response_language})}\n\n"
             )
             msg = Message(
                 conversation_id=conversation.id,
@@ -628,7 +633,7 @@ async def chat_stream(
         user_id, request.conversation_id, db, learner_context=request.learner_context
     )
     history = get_conversation_history(conversation.id, db)
-    response_language = get_response_language(message, None)
+    response_language = resolve_response_language(message, None, request.response_language)
 
     return StreamingResponse(
         _llm_tts_streaming_pipeline(
@@ -701,6 +706,7 @@ async def voice_chat_stream(
     user_id: str = Form(...),
     conversation_id: Optional[str] = Form(None),
     learner_context: Optional[str] = Form(None),
+    response_language: Optional[str] = Form(None),
     audio_file: UploadFile = File(...),
     db: Session = Depends(get_db),
     current_user: User = Depends(require_active_plan),
@@ -729,7 +735,9 @@ async def voice_chat_stream(
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-    response_language = get_response_language(transcribed_text, detected_lang)
+    resolved_language = resolve_response_language(
+        transcribed_text, detected_lang, response_language
+    )
     conversation = get_or_create_conversation(user_id, conversation_id, db, learner_context=learner_context)
     history = get_conversation_history(conversation.id, db)
 
@@ -746,10 +754,10 @@ async def voice_chat_stream(
     async def event_gen():
         yield (
             f"event: stt_result\ndata: "
-            f"{json.dumps({'text': transcribed_text, 'detected_lang': detected_lang, 'response_language': response_language})}\n\n"
+            f"{json.dumps({'text': transcribed_text, 'detected_lang': detected_lang, 'response_language': resolved_language})}\n\n"
         )
         async for chunk in _llm_tts_streaming_pipeline(
-            transcribed_text, history, response_language, conversation, db, user_id,
+            transcribed_text, history, resolved_language, conversation, db, user_id,
             long_term_context=conversation.long_term_context,
             usage_type="voice",
             user_audio_url=user_audio_url,

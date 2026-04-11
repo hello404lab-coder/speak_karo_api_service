@@ -9,6 +9,10 @@ class TextChatRequest(BaseModel):
     message: str = Field(..., min_length=1, max_length=1000, description="User message")
     conversation_id: Optional[str] = Field(None, description="Optional conversation ID for context")
     learner_context: Optional[str] = Field(None, description="Optional long-term context (e.g. preparing for IELTS); stored on conversation and injected every turn")
+    response_language: Optional[str] = Field(
+        'ml',
+        description="Optional ISO 639-1 code (hi, ml, ta, ...). When set, overrides script/STT detection so LLM+TTS use this language (e.g. romanized Malayalam).",
+    )
 
 
 class VoiceChatRequest(BaseModel):

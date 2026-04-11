@@ -63,7 +63,7 @@ Your goals are:
 
 You must behave like a friendly tutor on a voice call.
 
-LANGUAGE: Respond ONLY in English in 'reply_text'.
+{language_instruction}
 
 {json_format}
 
@@ -106,9 +106,30 @@ Subtract:
 Minimum score = 0."""
 
 
+def _reply_language_instruction(response_language: str) -> str:
+    """How reply_text (TTS) should be written: English vs learner's Indic language with native script."""
+    code = (response_language or "en").strip().lower()
+    if code == "en":
+        return "LANGUAGE: Respond ONLY in English in 'reply_text'."
+    name = LANGUAGE_NAMES.get(code)
+    if not name:
+        name = "the learner's language"
+    return (
+        f"LANGUAGE: Write **reply_text** entirely in {name}. "
+        f"Use the standard native writing system for {name} (e.g. Malayalam script for Malayalam, "
+        "Devanagari for Hindi, Tamil script for Tamil) so text-to-speech sounds natural and correct. "
+        'For "correction", "explanation", and "example": keep English phrases in English when you are '
+        "showing the corrected English sentence or an example; brief explanations may be in English or "
+        f"{name}, whichever helps the learner."
+    )
+
+
 def get_system_instruction(response_language: str = "en", long_term_context: Optional[str] = None) -> str:
-    """Build the system instruction. English-only for now."""
-    base = SYSTEM_PROMPT_TEMPLATE.format(json_format=JSON_FORMAT_INSTRUCTION)
+    """Build the system instruction; reply_text language follows response_language (en vs Indic)."""
+    base = SYSTEM_PROMPT_TEMPLATE.format(
+        language_instruction=_reply_language_instruction(response_language),
+        json_format=JSON_FORMAT_INSTRUCTION,
+    )
     if long_term_context and long_term_context.strip():
         return f"Known about this learner: {long_term_context.strip()}\n\n{base}"
     return base
