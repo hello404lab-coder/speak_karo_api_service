@@ -2,7 +2,8 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, Column, DateTime, Integer, String
+import sqlalchemy as sa
+from sqlalchemy import Boolean, Column, DateTime, Integer, String, text
 
 from app.models.usage import Base
 
@@ -27,13 +28,13 @@ class User(Base):
     occupation = Column(String(32), nullable=True)  # college | work | home_maker | teacher | other
     goal = Column(String(64), nullable=True)
     english_level = Column(String(32), nullable=True)
-    onboarding_step = Column(Integer, default=0, nullable=False)
-    onboarding_completed = Column(Boolean, default=False, nullable=False)
+    onboarding_step = Column(Integer, nullable=False, server_default=text("0"), default=0)
+    onboarding_completed = Column(Boolean, nullable=False, server_default=text("0"), default=False)
 
     # Subscription: free | trial | premium
-    plan = Column(String(32), default="free", nullable=False)
+    plan = Column(String(32), nullable=False, server_default=text("'free'"), default="free")
     trial_expires_at = Column(DateTime, nullable=True)
     subscription_expires_at = Column(DateTime, nullable=True)
-    is_trial_used = Column(Boolean, default=False, nullable=False)
+    is_trial_used = Column(Boolean, nullable=False, server_default=sa.false(), default=False)
 
     __table_args__ = ({"schema": None},)

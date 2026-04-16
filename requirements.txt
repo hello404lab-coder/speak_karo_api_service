@@ -6,6 +6,7 @@ pydantic-settings==2.12.0
 sqlalchemy==2.0.45
 psycopg2-binary==2.9.11
 redis==7.1.0
+agora-token-builder>=1.0.0
 python-multipart==0.0.21
 google-auth>=2.36.0
 python-jose[cryptography]>=3.3.0
@@ -30,3 +31,6 @@ resemble-perth
 # vocos  # dependency of IndicF5
 # pip install peft
 # chatterbox-tts
+
+soundfile==0.13.1
+torch==2.10.0

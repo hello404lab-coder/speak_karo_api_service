@@ -41,6 +41,11 @@ class Settings(BaseSettings):
     # Redis
     redis_url: str = "redis://localhost:6379/0"
 
+    # Agora RTC (social voice matchmaking; tokens minted server-side)
+    agora_app_id: Optional[str] = Field(default=None, description="AGORA_APP_ID")
+    agora_app_certificate: Optional[str] = Field(default=None, description="AGORA_APP_CERTIFICATE")
+    agora_token_ttl_seconds: int = Field(default=3600, description="AGORA_TOKEN_TTL_SECONDS: RTC token lifetime")
+
     # Cache (LLM and TTS). Prod defaults True when CACHE_ENABLED not set.
     cache_enabled: bool = Field(default_factory=_default_cache_enabled, description="CACHE_ENABLED")
     
@@ -63,7 +68,7 @@ class Settings(BaseSettings):
     audio_base_url: str = "http://localhost:8000/audio"  # For local serving
     
     # LLM Settings
-    llm_model: str = "gemini-2.5-flash"  # Gemini model for LLM (fast and efficient)
+    llm_model: str = "gemini-2.5-flash-lite"  # Gemini model for LLM (fast and efficient) gemini-2.5-flash-lite, gemini-2.5-flash
     llm_max_tokens: int = 200  # Increased for complete responses (Gemini 2.5 Flash supports up to 65,536)
     llm_temperature: float = 0.2
     # Context: max input tokens for system + history + current message (trimming drops oldest first)
@@ -77,7 +82,7 @@ class Settings(BaseSettings):
     # When False: local Whisper models are never loaded; transcription uses Groq Whisper API (requires GROQ_API_KEY)
     stt_whisper_local_enabled: bool = Field(default=False, description="STT_WHISPER_LOCAL_ENABLED: use local Whisper; if false, use Groq Whisper API")
     # Groq STT model when local disabled: whisper-large-v3-turbo (faster, cheaper) or whisper-large-v3 (higher accuracy)
-    stt_groq_model: str = Field(default="whisper-large-v3-turbo", description="STT_GROQ_MODEL: Groq transcription model")
+    stt_groq_model: str = Field(default="whisper-large-v3", description="STT_GROQ_MODEL: Groq transcription model")
     # STT outputs raw transcription in the spoken language (no language hint passed; auto-detect).
     # Reserved for optional use: force transcription language (e.g. "en"). When set, could be passed to backends for non-raw mode.
     stt_force_language: Optional[str] = None  # Env: STT_FORCE_LANGUAGE
@@ -138,6 +143,31 @@ class Settings(BaseSettings):
         default=2,
         description="RESEMBLE_API_MAX_RETRIES: max retry attempts on transient failures",
     )
+
+    # Tabbly TTS (cloud, non-English when enabled — replaces IndicF5 for that path)
+    # https://docs.tabbly.io/tts-api/tts-streaming
+    tabbly_api_key: Optional[str] = Field(default=None, description="TABBLY_API_KEY: Tabbly TTS API key (X-API-Key)")
+    tts_tabbly_for_non_english: bool = Field(
+        default=False,
+        description="TTS_TABBLY_FOR_NON_ENGLISH: use Tabbly for all non-English TTS (skip IndicF5) when key set",
+    )
+    tts_tabbly_voice_id: str = Field(
+        default="Mosina",
+        description="TTS_TABBLY_VOICE_ID: Tabbly voice_id (e.g. Hindi voice Mosina)",
+    )
+    tts_tabbly_model_id: str = Field(
+        default="tabbly-tts",
+        description="TTS_TABBLY_MODEL_ID: Tabbly model_id",
+    )
+    tts_tabbly_max_retries: int = Field(
+        default=2,
+        description="TTS_TABBLY_MAX_RETRIES: retries on 5xx / transport errors only",
+    )
+    tts_tabbly_max_concurrent: int = Field(
+        default=6,
+        description="TTS_TABBLY_MAX_CONCURRENT: max concurrent Tabbly HTTP syntheses",
+    )
+
     tts_gemini_model: str = Field(default="gemini-2.5-flash-lite-preview-tts", description="TTS_GEMINI_MODEL: Gemini TTS model when Chatterbox disabled")
     tts_gemini_voice: str = Field(default="Puck", description="TTS_GEMINI_VOICE: prebuilt voice name for Gemini TTS")
     # Max concurrent TTS inferences (1 = strict serialization for low VRAM; 2+ = Semaphore for lower latency)

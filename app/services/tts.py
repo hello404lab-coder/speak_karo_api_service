@@ -50,6 +50,11 @@ _lock_indicf5 = threading.Lock()
 # Inference semaphore: up to N TTS inferences at once (configurable) to reduce latency for multi-sentence responses; set to 1 for strict serialization on low VRAM.
 _inference_semaphore = threading.Semaphore(settings.tts_concurrent_inferences)
 
+# Tabbly HTTP concurrency (no GPU; limits burst against API rate limits)
+_tabbly_semaphore = threading.Semaphore(
+    max(1, int(getattr(settings, "tts_tabbly_max_concurrent", 6) or 6))
+)
+
 # Lazy-loaded Gemini client for TTS (when Chatterbox disabled). API-based, no GPU lock.
 _gemini_tts_client = None
 
@@ -91,9 +96,19 @@ if not os.path.exists(settings.audio_storage_path):
     os.makedirs(settings.audio_storage_path, exist_ok=True)
 
 
-def _generate_cache_key(text: str, response_language: str = "en") -> str:
-    """Generate cache key from text and response language (so en vs Indic don't collide)."""
-    return f"tts:{response_language}:{hashlib.md5(text.encode()).hexdigest()}"
+def _generate_cache_key(
+    text: str,
+    response_language: str = "en",
+    *,
+    tabbly: bool = False,
+) -> str:
+    """Generate cache key from text and language; Tabbly keys include voice/model so config changes invalidate cache."""
+    h = hashlib.md5(text.encode()).hexdigest()
+    if tabbly:
+        vid = getattr(settings, "tts_tabbly_voice_id", "Mosina") or "Mosina"
+        mid = getattr(settings, "tts_tabbly_model_id", "tabbly-tts") or "tabbly-tts"
+        return f"tts:tabbly:{vid}:{mid}:{response_language}:{h}"
+    return f"tts:{response_language}:{h}"
 
 
 def _store_audio_local(audio_bytes: bytes, filename: str) -> str:
@@ -1014,16 +1029,40 @@ def _effective_response_language(text: str, response_language: str) -> str:
     return inferred if inferred else "en"
 
 
-def generate_tts_bytes(text: str, response_language: str = "en") -> bytes:
+def _tabbly_non_english_active(lang: str) -> bool:
+    """True when Tabbly should handle non-English synthesis (replaces IndicF5 for that path)."""
+    return (
+        lang != "en"
+        and getattr(settings, "tts_tabbly_for_non_english", False)
+        and bool(getattr(settings, "tabbly_api_key", None))
+    )
+
+
+def _generate_tts_bytes_impl(
+    text: str,
+    response_language: str = "en",
+    *,
+    allow_tabbly: bool = True,
+) -> bytes:
     """
-    Public entrypoint: generate TTS audio bytes for one sentence (WAV).
-    Used by the chat/stream pipeline for sentence-level TTS.
-    When TTS_CHATTERBOX_ENABLED=false, English and Indic fallback use Gemini TTS (no GPU lock).
-    When TTS_CHATTERBOX_MODE=api, English uses Resemble AI streaming API (no local GPU).
+    Core TTS routing. When allow_tabbly is False, skips Tabbly (used by text_to_speech after Tabbly failure).
     """
     lang = _effective_response_language(text, response_language)
-    use_indicf5 = lang != "en" and getattr(settings, "tts_indicf5_enabled", False)
     chatterbox_enabled = getattr(settings, "tts_chatterbox_enabled", True)
+
+    if allow_tabbly and _tabbly_non_english_active(lang):
+        try:
+            from app.services.tts_backends import tabbly as tabbly_tts
+
+            with _tabbly_semaphore:
+                return tabbly_tts.synthesize_wav(text)
+        except Exception as e:
+            logger.warning(
+                "Tabbly TTS failed (%s), falling back to IndicF5/Gemini/Chatterbox",
+                e,
+            )
+
+    use_indicf5 = lang != "en" and getattr(settings, "tts_indicf5_enabled", False)
 
     if use_indicf5:
         ref = _get_indicf5_ref(lang)
@@ -1048,6 +1087,15 @@ def generate_tts_bytes(text: str, response_language: str = "en") -> bytes:
         with _inference_semaphore:
             return _tts_with_turbo(text)
     raise ValueError("Something went wrong generating audio. Please try again.")
+
+
+def generate_tts_bytes(text: str, response_language: str = "en") -> bytes:
+    """
+    Public entrypoint: generate TTS audio bytes for one sentence (WAV).
+    Used by the chat/stream pipeline for sentence-level TTS.
+    When TTS_TABBLY_FOR_NON_ENGLISH=true and TABBLY_API_KEY set, non-English uses Tabbly first (skips IndicF5).
+    """
+    return _generate_tts_bytes_impl(text, response_language, allow_tabbly=True)
 
 
 def text_to_speech_stream(text: str, response_language: str = "en") -> Iterator[bytes]:
@@ -1117,7 +1165,46 @@ def text_to_speech(text: str, response_language: str = "en") -> str:
         ValueError: If audio generation fails
     """
     lang = _effective_response_language(text, response_language)
-    cache_key = _generate_cache_key(text, lang)
+    chatterbox_enabled = getattr(settings, "tts_chatterbox_enabled", True)
+
+    if _tabbly_non_english_active(lang):
+        tabbly_key = _generate_cache_key(text, lang, tabbly=True)
+        cached_tb = get(tabbly_key)
+        if cached_tb:
+            logger.info("Cache hit for TTS (Tabbly)")
+            if cached_tb.startswith("s3:"):
+                s3_key = cached_tb[3:]
+                presigned = _generate_presigned_url(s3_key)
+                if presigned is None:
+                    logger.error("Presigned URL generation failed on cache hit")
+                    raise ValueError("Audio temporarily unavailable. Please try again.")
+                return presigned
+            return cached_tb
+        try:
+            from app.services.tts_backends import tabbly as tabbly_tts
+
+            logger.info(
+                "Using TTS provider: Tabbly (voice=%s, model=%s)",
+                getattr(settings, "tts_tabbly_voice_id", "Mosina"),
+                getattr(settings, "tts_tabbly_model_id", "tabbly-tts"),
+            )
+            with _tabbly_semaphore:
+                audio_bytes = tabbly_tts.synthesize_wav(text)
+            audio_bytes = _convert_wav_to_mp3(audio_bytes)
+            filename = f"{lang}_{hashlib.md5(text.encode()).hexdigest()}.mp3"
+            s3_key = _store_audio_cloud(audio_bytes, filename)
+            if s3_key:
+                presigned = _generate_presigned_url(s3_key)
+                if presigned:
+                    set(tabbly_key, "s3:" + s3_key, settings.tts_cache_ttl)
+                    return presigned
+            audio_url = _store_audio_local(audio_bytes, filename)
+            set(tabbly_key, audio_url, settings.tts_cache_ttl)
+            return audio_url
+        except Exception as e:
+            logger.warning("Tabbly TTS failed in text_to_speech (%s), falling back", e)
+
+    cache_key = _generate_cache_key(text, lang, tabbly=False)
     cached = get(cache_key)
     if cached:
         logger.info("Cache hit for TTS")
@@ -1130,7 +1217,6 @@ def text_to_speech(text: str, response_language: str = "en") -> str:
             return presigned
         return cached
 
-    chatterbox_enabled = getattr(settings, "tts_chatterbox_enabled", True)
     use_indicf5 = lang != "en" and getattr(settings, "tts_indicf5_enabled", False)
     if use_indicf5:
         ref = _get_indicf5_ref(lang)
@@ -1217,8 +1303,9 @@ def init_tts_models() -> dict:
     When TTS_CHATTERBOX_ENABLED=false, Turbo is not loaded.
     When TTS_CHATTERBOX_MODE=api, local Turbo is not loaded; Resemble API is warmed with a short synthesis.
     When TTS_INDICF5_ENABLED=false, IndicF5 is not loaded.
+    When TTS_TABBLY_FOR_NON_ENGLISH=true and TABBLY_API_KEY set, Tabbly is warmed with a short synthesis.
     Runs one short TTS inference after loading Turbo so torch.compile/CUDA kernels are warmed.
-    Returns {"turbo": "loaded"|"api_mode"|"disabled"|"failed", "indicf5": "loaded"|"disabled"|"skipped"|"failed"}.
+    Returns {"turbo": ..., "indicf5": ..., "tabbly": "ok"|"skipped"|"failed"}.
     """
     global _turbo_warmup_done
     result: dict = {}
@@ -1263,4 +1350,21 @@ def init_tts_models() -> dict:
             result["indicf5"] = "loaded"
         else:
             result["indicf5"] = "skipped"
+
+    if getattr(settings, "tts_tabbly_for_non_english", False) and getattr(
+        settings, "tabbly_api_key", None
+    ):
+        try:
+            from app.services.tts_backends import tabbly as tabbly_tts
+
+            tabbly_tts.warmup()
+            result["tabbly"] = "ok"
+            logger.info("Tabbly TTS API warm-up completed")
+        except Exception as e:
+            logger.exception("Tabbly TTS API init failed")
+            result["tabbly"] = "failed"
+            result["tabbly_error"] = str(e)
+    else:
+        result["tabbly"] = "skipped"
+
     return result

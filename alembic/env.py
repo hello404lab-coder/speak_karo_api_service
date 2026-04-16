@@ -17,6 +17,7 @@ from app.models.usage import Base
 
 # Explicitly import all model classes to ensure they're registered
 from app.models.usage import Usage, Conversation, Message  # noqa: F401
+from app.models.social_session import SocialSession  # noqa: F401
 
 # Verify models are registered (for debugging)
 # Uncomment to debug:

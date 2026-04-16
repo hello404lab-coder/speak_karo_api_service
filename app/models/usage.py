@@ -2,6 +2,7 @@
 import uuid
 from datetime import datetime, date
 
+import sqlalchemy as sa
 from sqlalchemy import Column, String, Integer, Float, DateTime, Date, ForeignKey, Text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import relationship
@@ -18,8 +19,8 @@ class Usage(Base):
     date = Column(Date, default=date.today, nullable=False, index=True)
     minutes_used = Column(Float, default=0.0)
     request_count = Column(Integer, default=0)
-    chat_count = Column(Integer, default=0)
-    voice_count = Column(Integer, default=0)
+    chat_count = Column(Integer, nullable=False, default=0, server_default=sa.text("0"))
+    voice_count = Column(Integer, nullable=False, default=0, server_default=sa.text("0"))
 
     __table_args__ = (
         {"schema": None},

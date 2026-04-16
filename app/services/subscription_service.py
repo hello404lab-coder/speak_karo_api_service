@@ -31,6 +31,27 @@ def resolve_user_plan(user: User) -> str:
     return "free"
 
 
+def get_or_create_today_usage(user_id: str, db: Session) -> Usage:
+    """Return today's Usage row, creating it if missing (caller commits)."""
+    today = date.today()
+    usage = (
+        db.query(Usage)
+        .filter(Usage.user_id == user_id, Usage.date == today)
+        .first()
+    )
+    if not usage:
+        usage = Usage(
+            user_id=user_id,
+            date=today,
+            minutes_used=0.0,
+            request_count=0,
+            chat_count=0,
+            voice_count=0,
+        )
+        db.add(usage)
+    return usage
+
+
 def get_usage_today(user_id: str, db: Session) -> dict[str, int]:
     """Return today's chat_count and voice_count for the user (0 if no row)."""
     today = date.today()

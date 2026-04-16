@@ -39,11 +39,16 @@ def transcribe(
                 "model": model,
                 "response_format": "verbose_json",
                 "temperature": 0.0,
+                "timestamp_granularities": ["word", "segment"],
+                "extra_body": {
+                    "logprobs": True 
+                }
             }
             if language_hint:
                 kwargs["language"] = language_hint
             logger.info("Transcribing with Groq Whisper API (model=%s)", model)
             transcription = client.audio.transcriptions.create(**kwargs)
+        print(transcription.model_dump_json(indent=4))
         text = (getattr(transcription, "text", None) or "").strip()
         if not text:
             raise ValueError("Could not transcribe audio. Please try speaking more clearly.")

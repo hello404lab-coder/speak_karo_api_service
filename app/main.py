@@ -20,6 +20,7 @@ from app.api.ai import router as ai_router
 from app.api.auth import router as auth_router
 from app.api.conversations import router as conversations_router
 from app.api.subscription import router as subscription_router
+from app.api.social import router as social_router
 from app.dependencies.auth import limiter
 
 import torch
@@ -125,7 +126,15 @@ async def startup_event():
     else:
         logger.info("TTS: English -> Gemini TTS (model: %s, voice: %s)", getattr(settings, "tts_gemini_model", "gemini-2.5-flash-lite-preview-tts"), getattr(settings, "tts_gemini_voice", "Puck"))
         indic_fallback = "Gemini TTS"
-    if getattr(settings, "tts_indicf5_enabled", False):
+    if getattr(settings, "tts_tabbly_for_non_english", False) and getattr(
+        settings, "tabbly_api_key", None
+    ):
+        logger.info(
+            "TTS: non-English -> Tabbly (voice=%s, model=%s); IndicF5 skipped when Tabbly succeeds",
+            getattr(settings, "tts_tabbly_voice_id", "Mosina"),
+            getattr(settings, "tts_tabbly_model_id", "tabbly-tts"),
+        )
+    elif getattr(settings, "tts_indicf5_enabled", False):
         indicf5_dir = getattr(settings, "tts_indicf5_ref_audio_dir", None)
         if indicf5_dir:
             from app.services.tts import _get_indicf5_torch_device
@@ -162,11 +171,33 @@ async def startup_event():
     else:
         logger.info("Cache disabled (CACHE_ENABLED=false)")
 
+    # Async Redis for social voice matchmaking (separate from sync cache client)
+    try:
+        from app.services.redis_social import create_social_redis
+
+        app.state.social_redis = create_social_redis()
+        await app.state.social_redis.ping()
+        logger.info("Social matchmaking Redis connected")
+    except Exception as e:
+        logger.warning("Social matchmaking Redis unavailable: %s", e)
+        app.state.social_redis = None
+
+    if settings.is_prod and (not settings.agora_app_id or not settings.agora_app_certificate):
+        logger.warning(
+            "AGORA_APP_ID / AGORA_APP_CERTIFICATE not set; social voice tokens will fail until configured."
+        )
+
 
 @app.on_event("shutdown")
 async def shutdown_event():
     """Cleanup on shutdown."""
     logger.info("Shutting down...")
+    r = getattr(app.state, "social_redis", None)
+    if r is not None:
+        try:
+            await r.aclose()
+        except Exception as e:
+            logger.warning("Social Redis close failed: %s", e)
 
 
 @app.get("/health")
@@ -184,6 +215,7 @@ app.include_router(ai_router, prefix="/api/v1/ai", tags=["AI"])
 app.include_router(auth_router, prefix="/api/v1/auth", tags=["Auth"])
 app.include_router(conversations_router, prefix="/api/v1/conversations", tags=["Conversations"])
 app.include_router(subscription_router, prefix="/api/v1/subscription", tags=["Subscription"])
+app.include_router(social_router, prefix="/api/v1/social", tags=["Social"])
 
 
 # Global exception handler
