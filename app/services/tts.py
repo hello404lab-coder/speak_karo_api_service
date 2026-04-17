@@ -50,11 +50,6 @@ _lock_indicf5 = threading.Lock()
 # Inference semaphore: up to N TTS inferences at once (configurable) to reduce latency for multi-sentence responses; set to 1 for strict serialization on low VRAM.
 _inference_semaphore = threading.Semaphore(settings.tts_concurrent_inferences)
 
-# Tabbly HTTP concurrency (no GPU; limits burst against API rate limits)
-_tabbly_semaphore = threading.Semaphore(
-    max(1, int(getattr(settings, "tts_tabbly_max_concurrent", 6) or 6))
-)
-
 # Lazy-loaded Gemini client for TTS (when Chatterbox disabled). API-based, no GPU lock.
 _gemini_tts_client = None
 
@@ -100,15 +95,16 @@ def _generate_cache_key(
     text: str,
     response_language: str = "en",
     *,
-    tabbly: bool = False,
+    gemini_indic: bool = False,
 ) -> str:
-    """Generate cache key from text and language; Tabbly keys include voice/model so config changes invalidate cache."""
+    """Generate cache key from text and language. Indic Gemini uses a separate key so model changes invalidate cache."""
     h = hashlib.md5(text.encode()).hexdigest()
-    if tabbly:
-        vid = getattr(settings, "tts_tabbly_voice_id", "Mosina") or "Mosina"
-        mid = getattr(settings, "tts_tabbly_model_id", "tabbly-tts") or "tabbly-tts"
-        return f"tts:tabbly:{vid}:{mid}:{response_language}:{h}"
-    return f"tts:{response_language}:{h}"
+    lang = response_language or "en"
+    if gemini_indic:
+        mid = getattr(settings, "tts_gemini_model_indic", None) or "gemini-2.5-flash-preview-tts"
+        tag = hashlib.md5(mid.encode()).hexdigest()[:8]
+        return f"tts:{lang}:gi:{tag}:{h}"
+    return f"tts:{lang}:{h}"
 
 
 def _store_audio_local(audio_bytes: bytes, filename: str) -> str:
@@ -281,6 +277,13 @@ def _convert_to_wav(audio_data: bytes, mime_type: str) -> bytes:
     return header + audio_data
 
 
+def _gemini_tts_model_for_lang(lang: str) -> str:
+    """English uses tts_gemini_model; Indic uses tts_gemini_model_indic (Gemini 2.5 Flash TTS)."""
+    if lang != "en":
+        return getattr(settings, "tts_gemini_model_indic", None) or "gemini-2.5-flash-preview-tts"
+    return getattr(settings, "tts_gemini_model", None) or "gemini-2.5-flash-lite-preview-tts"
+
+
 def _get_gemini_tts_client():
     """Lazy load Gemini client for TTS (used when Chatterbox is disabled). Same SDK as LLM."""
     global _gemini_tts_client
@@ -297,14 +300,18 @@ def _get_gemini_tts_client():
             )
         except (ImportError, AttributeError):
             _gemini_tts_client = genai.Client(api_key=settings.gemini_api_key)
-        logger.info("Gemini TTS client initialized (model=%s)", getattr(settings, "tts_gemini_model", "gemini-2.5-flash-lite-preview-tts"))
+        logger.info(
+            "Gemini TTS client initialized (en=%s, indic=%s)",
+            getattr(settings, "tts_gemini_model", "gemini-2.5-flash-lite-preview-tts"),
+            getattr(settings, "tts_gemini_model_indic", "gemini-2.5-flash-preview-tts"),
+        )
     return _gemini_tts_client
 
 
 def _tts_with_gemini(text: str, response_language: str) -> bytes:
     """
-    Generate TTS audio using Gemini (e.g. gemini-2.5-flash-lite-preview-tts).
-    Used when Chatterbox is disabled. Returns WAV bytes.
+    Generate TTS audio using Gemini TTS. English uses tts_gemini_model; Indic uses tts_gemini_model_indic.
+    Returns WAV bytes.
     """
     from google.genai import types
     if not text or not text.strip():
@@ -315,7 +322,7 @@ def _tts_with_gemini(text: str, response_language: str) -> bytes:
     client = _get_gemini_tts_client()
     lang_code = LANG_TO_BCP47.get(response_language, "en-US")
     voice_name = getattr(settings, "tts_gemini_voice", "Puck") or "Puck"
-    model_name = getattr(settings, "tts_gemini_model", "gemini-2.5-flash-lite-preview-tts")
+    model_name = _gemini_tts_model_for_lang(response_language)
     contents = f"Say the following: {text}"
     config = types.GenerateContentConfig(
         response_modalities=["AUDIO"],
@@ -635,8 +642,10 @@ def _get_indicf5_model():
             logger.info("IndicF5 model loaded successfully")
             return _indicf5_model, _indicf5_vocoder, _indicf5_device
         except Exception as e:
-            fallback = "Gemini TTS" if not getattr(settings, "tts_chatterbox_enabled", True) else "Turbo"
-            logger.warning(f"IndicF5 load failed: {e}. Indic languages will use {fallback} fallback.")
+            logger.warning(
+                "IndicF5 load failed: %s. Indic languages will use Gemini TTS (Indic) if GEMINI_API_KEY is set.",
+                e,
+            )
             _indicf5_available = False
             return None, None, None
 
@@ -1029,38 +1038,12 @@ def _effective_response_language(text: str, response_language: str) -> str:
     return inferred if inferred else "en"
 
 
-def _tabbly_non_english_active(lang: str) -> bool:
-    """True when Tabbly should handle non-English synthesis (replaces IndicF5 for that path)."""
-    return (
-        lang != "en"
-        and getattr(settings, "tts_tabbly_for_non_english", False)
-        and bool(getattr(settings, "tabbly_api_key", None))
-    )
-
-
-def _generate_tts_bytes_impl(
-    text: str,
-    response_language: str = "en",
-    *,
-    allow_tabbly: bool = True,
-) -> bytes:
+def _generate_tts_bytes_impl(text: str, response_language: str = "en") -> bytes:
     """
-    Core TTS routing. When allow_tabbly is False, skips Tabbly (used by text_to_speech after Tabbly failure).
+    Core TTS routing: IndicF5 when enabled, else Gemini Flash TTS for Indic; English Chatterbox or Gemini.
     """
     lang = _effective_response_language(text, response_language)
     chatterbox_enabled = getattr(settings, "tts_chatterbox_enabled", True)
-
-    if allow_tabbly and _tabbly_non_english_active(lang):
-        try:
-            from app.services.tts_backends import tabbly as tabbly_tts
-
-            with _tabbly_semaphore:
-                return tabbly_tts.synthesize_wav(text)
-        except Exception as e:
-            logger.warning(
-                "Tabbly TTS failed (%s), falling back to IndicF5/Gemini/Chatterbox",
-                e,
-            )
 
     use_indicf5 = lang != "en" and getattr(settings, "tts_indicf5_enabled", False)
 
@@ -1074,28 +1057,35 @@ def _generate_tts_bytes_impl(
             except ValueError:
                 raise
             except Exception as e:
-                logger.warning(f"IndicF5 generation failed: {e}. Falling back to %s.", "Gemini TTS" if not chatterbox_enabled else "Chatterbox-Turbo")
+                logger.warning(
+                    "IndicF5 generation failed: %s. Falling back to Gemini TTS (Indic).",
+                    e,
+                )
                 use_indicf5 = False
         else:
             use_indicf5 = False
 
     if not use_indicf5:
+        if lang != "en":
+            if not settings.gemini_api_key:
+                raise ValueError(
+                    "Indic text-to-speech requires GEMINI_API_KEY when IndicF5 is unavailable or disabled."
+                )
+            return _tts_with_gemini(text, lang)
         if not chatterbox_enabled:
             return _tts_with_gemini(text, lang)
         if getattr(settings, "tts_chatterbox_mode", "local") == "api":
             return _tts_with_resemble_api(text)
         with _inference_semaphore:
             return _tts_with_turbo(text)
-    raise ValueError("Something went wrong generating audio. Please try again.")
 
 
 def generate_tts_bytes(text: str, response_language: str = "en") -> bytes:
     """
     Public entrypoint: generate TTS audio bytes for one sentence (WAV).
     Used by the chat/stream pipeline for sentence-level TTS.
-    When TTS_TABBLY_FOR_NON_ENGLISH=true and TABBLY_API_KEY set, non-English uses Tabbly first (skips IndicF5).
     """
-    return _generate_tts_bytes_impl(text, response_language, allow_tabbly=True)
+    return _generate_tts_bytes_impl(text, response_language)
 
 
 def text_to_speech_stream(text: str, response_language: str = "en") -> Iterator[bytes]:
@@ -1152,11 +1142,13 @@ def store_audio_mp3(audio_bytes: bytes, filename: str) -> str:
 
 def text_to_speech(text: str, response_language: str = "en") -> str:
     """
-    Convert text to speech and return audio URL. Routes to Chatterbox-Turbo (English) or IndicF5 (Indic).
+    Convert text to speech and return audio URL.
+    English: Chatterbox-Turbo (or Gemini if Chatterbox disabled).
+    Indic: IndicF5 when enabled, else Gemini 2.5 Flash TTS (requires GEMINI_API_KEY).
 
     Args:
         text: Text to convert
-        response_language: "en" -> Chatterbox-Turbo; "hi"/"ml"/"ta"/etc. -> IndicF5 (fallback to Turbo if unavailable)
+        response_language: "en" or Indic code (hi, ml, ta, ...)
 
     Returns:
         URL to audio file
@@ -1167,62 +1159,24 @@ def text_to_speech(text: str, response_language: str = "en") -> str:
     lang = _effective_response_language(text, response_language)
     chatterbox_enabled = getattr(settings, "tts_chatterbox_enabled", True)
 
-    if _tabbly_non_english_active(lang):
-        tabbly_key = _generate_cache_key(text, lang, tabbly=True)
-        cached_tb = get(tabbly_key)
-        if cached_tb:
-            logger.info("Cache hit for TTS (Tabbly)")
-            if cached_tb.startswith("s3:"):
-                s3_key = cached_tb[3:]
-                presigned = _generate_presigned_url(s3_key)
-                if presigned is None:
-                    logger.error("Presigned URL generation failed on cache hit")
-                    raise ValueError("Audio temporarily unavailable. Please try again.")
-                return presigned
-            return cached_tb
-        try:
-            from app.services.tts_backends import tabbly as tabbly_tts
-
-            logger.info(
-                "Using TTS provider: Tabbly (voice=%s, model=%s)",
-                getattr(settings, "tts_tabbly_voice_id", "Mosina"),
-                getattr(settings, "tts_tabbly_model_id", "tabbly-tts"),
-            )
-            with _tabbly_semaphore:
-                audio_bytes = tabbly_tts.synthesize_wav(text)
-            audio_bytes = _convert_wav_to_mp3(audio_bytes)
-            filename = f"{lang}_{hashlib.md5(text.encode()).hexdigest()}.mp3"
-            s3_key = _store_audio_cloud(audio_bytes, filename)
-            if s3_key:
-                presigned = _generate_presigned_url(s3_key)
-                if presigned:
-                    set(tabbly_key, "s3:" + s3_key, settings.tts_cache_ttl)
-                    return presigned
-            audio_url = _store_audio_local(audio_bytes, filename)
-            set(tabbly_key, audio_url, settings.tts_cache_ttl)
-            return audio_url
-        except Exception as e:
-            logger.warning("Tabbly TTS failed in text_to_speech (%s), falling back", e)
-
-    cache_key = _generate_cache_key(text, lang, tabbly=False)
-    cached = get(cache_key)
-    if cached:
-        logger.info("Cache hit for TTS")
-        if cached.startswith("s3:"):
-            s3_key = cached[3:]
-            presigned = _generate_presigned_url(s3_key)
-            if presigned is None:
-                logger.error("Presigned URL generation failed on cache hit")
-                raise ValueError("Audio temporarily unavailable. Please try again.")
-            return presigned
-        return cached
-
     use_indicf5 = lang != "en" and getattr(settings, "tts_indicf5_enabled", False)
     if use_indicf5:
         ref = _get_indicf5_ref(lang)
         model, _, _ = _get_indicf5_model()
         if ref and model is not None:
-            logger.info(f"Using TTS provider: IndicF5 (language: {lang})")
+            cache_key = _generate_cache_key(text, lang)
+            cached = get(cache_key)
+            if cached:
+                logger.info("Cache hit for TTS (IndicF5)")
+                if cached.startswith("s3:"):
+                    s3_key = cached[3:]
+                    presigned = _generate_presigned_url(s3_key)
+                    if presigned is None:
+                        logger.error("Presigned URL generation failed on cache hit")
+                        raise ValueError("Audio temporarily unavailable. Please try again.")
+                    return presigned
+                return cached
+            logger.info("Using TTS provider: IndicF5 (language: %s)", lang)
             try:
                 with _inference_semaphore:
                     audio_bytes = _tts_with_indicf5(text, lang)
@@ -1240,43 +1194,81 @@ def text_to_speech(text: str, response_language: str = "en") -> str:
             except ValueError:
                 raise
             except Exception as e:
-                logger.warning(f"IndicF5 generation failed: {e}. Falling back to %s.", "Gemini TTS" if not chatterbox_enabled else "Chatterbox-Turbo")
+                logger.warning(
+                    "IndicF5 generation failed: %s. Falling back to Gemini TTS (Indic).",
+                    e,
+                )
                 use_indicf5 = False
         else:
-            logger.warning(f"IndicF5 not configured for {lang}. Using %s.", "Gemini TTS" if not chatterbox_enabled else "Chatterbox-Turbo")
-        use_indicf5 = False
+            logger.warning(
+                "IndicF5 not configured for %s. Using Gemini TTS (Indic).",
+                lang,
+            )
+            use_indicf5 = False
 
-    if not use_indicf5:
-        if not chatterbox_enabled:
-            logger.info("Using TTS provider: Gemini TTS (model: %s, voice: %s)", getattr(settings, "tts_gemini_model", "gemini-2.5-flash-lite-preview-tts"), getattr(settings, "tts_gemini_voice", "Puck"))
-            try:
-                audio_bytes = _tts_with_gemini(text, lang)
-                audio_bytes = _convert_wav_to_mp3(audio_bytes)
-                filename = f"{hashlib.md5(text.encode()).hexdigest()}.mp3"
-                s3_key = _store_audio_cloud(audio_bytes, filename)
-                if s3_key:
-                    presigned = _generate_presigned_url(s3_key)
-                    if presigned:
-                        set(cache_key, "s3:" + s3_key, settings.tts_cache_ttl)
-                        return presigned
-                audio_url = _store_audio_local(audio_bytes, filename)
-                set(cache_key, audio_url, settings.tts_cache_ttl)
-                return audio_url
-            except ValueError:
-                raise
-            except Exception as e:
-                logger.error(f"Gemini TTS error: {e}")
-                raise ValueError("Something went wrong generating audio. Please try again.")
-        if getattr(settings, "tts_chatterbox_mode", "local") == "api":
-            logger.info("Using TTS provider: Resemble Chatterbox API")
-        else:
-            logger.info("Using TTS provider: Chatterbox-Turbo")
+    if lang != "en":
+        cache_key_gi = _generate_cache_key(text, lang, gemini_indic=True)
+        cached_gi = get(cache_key_gi)
+        if cached_gi:
+            logger.info("Cache hit for TTS (Gemini Indic)")
+            if cached_gi.startswith("s3:"):
+                s3_key = cached_gi[3:]
+                presigned = _generate_presigned_url(s3_key)
+                if presigned is None:
+                    logger.error("Presigned URL generation failed on cache hit")
+                    raise ValueError("Audio temporarily unavailable. Please try again.")
+                return presigned
+            return cached_gi
+        if not settings.gemini_api_key:
+            raise ValueError(
+                "Indic text-to-speech requires GEMINI_API_KEY when IndicF5 is unavailable or disabled."
+            )
+        indic_model = getattr(settings, "tts_gemini_model_indic", "gemini-2.5-flash-preview-tts")
+        logger.info(
+            "Using TTS provider: Gemini TTS (Indic, model: %s, voice: %s)",
+            indic_model,
+            getattr(settings, "tts_gemini_voice", "Puck"),
+        )
         try:
-            if getattr(settings, "tts_chatterbox_mode", "local") == "api":
-                audio_bytes = _tts_with_resemble_api(text)
-            else:
-                with _inference_semaphore:
-                    audio_bytes = _tts_with_turbo(text)
+            audio_bytes = _tts_with_gemini(text, lang)
+            audio_bytes = _convert_wav_to_mp3(audio_bytes)
+            filename = f"{lang}_{hashlib.md5(text.encode()).hexdigest()}.mp3"
+            s3_key = _store_audio_cloud(audio_bytes, filename)
+            if s3_key:
+                presigned = _generate_presigned_url(s3_key)
+                if presigned:
+                    set(cache_key_gi, "s3:" + s3_key, settings.tts_cache_ttl)
+                    return presigned
+            audio_url = _store_audio_local(audio_bytes, filename)
+            set(cache_key_gi, audio_url, settings.tts_cache_ttl)
+            return audio_url
+        except ValueError:
+            raise
+        except Exception as e:
+            logger.error("Gemini TTS (Indic) error: %s", e)
+            raise ValueError("Something went wrong generating audio. Please try again.") from e
+
+    cache_key = _generate_cache_key(text, lang)
+    cached = get(cache_key)
+    if cached:
+        logger.info("Cache hit for TTS")
+        if cached.startswith("s3:"):
+            s3_key = cached[3:]
+            presigned = _generate_presigned_url(s3_key)
+            if presigned is None:
+                logger.error("Presigned URL generation failed on cache hit")
+                raise ValueError("Audio temporarily unavailable. Please try again.")
+            return presigned
+        return cached
+
+    if not chatterbox_enabled:
+        logger.info(
+            "Using TTS provider: Gemini TTS (model: %s, voice: %s)",
+            getattr(settings, "tts_gemini_model", "gemini-2.5-flash-lite-preview-tts"),
+            getattr(settings, "tts_gemini_voice", "Puck"),
+        )
+        try:
+            audio_bytes = _tts_with_gemini(text, lang)
             audio_bytes = _convert_wav_to_mp3(audio_bytes)
             filename = f"{hashlib.md5(text.encode()).hexdigest()}.mp3"
             s3_key = _store_audio_cloud(audio_bytes, filename)
@@ -1291,10 +1283,35 @@ def text_to_speech(text: str, response_language: str = "en") -> str:
         except ValueError:
             raise
         except Exception as e:
-            logger.error(f"Unexpected TTS error: {e}")
-            raise ValueError("Something went wrong generating audio. Please try again.")
+            logger.error("Gemini TTS error: %s", e)
+            raise ValueError("Something went wrong generating audio. Please try again.") from e
 
-    raise ValueError("Something went wrong generating audio. Please try again.")
+    if getattr(settings, "tts_chatterbox_mode", "local") == "api":
+        logger.info("Using TTS provider: Resemble Chatterbox API")
+    else:
+        logger.info("Using TTS provider: Chatterbox-Turbo")
+    try:
+        if getattr(settings, "tts_chatterbox_mode", "local") == "api":
+            audio_bytes = _tts_with_resemble_api(text)
+        else:
+            with _inference_semaphore:
+                audio_bytes = _tts_with_turbo(text)
+        audio_bytes = _convert_wav_to_mp3(audio_bytes)
+        filename = f"{hashlib.md5(text.encode()).hexdigest()}.mp3"
+        s3_key = _store_audio_cloud(audio_bytes, filename)
+        if s3_key:
+            presigned = _generate_presigned_url(s3_key)
+            if presigned:
+                set(cache_key, "s3:" + s3_key, settings.tts_cache_ttl)
+                return presigned
+        audio_url = _store_audio_local(audio_bytes, filename)
+        set(cache_key, audio_url, settings.tts_cache_ttl)
+        return audio_url
+    except ValueError:
+        raise
+    except Exception as e:
+        logger.error("Unexpected TTS error: %s", e)
+        raise ValueError("Something went wrong generating audio. Please try again.") from e
 
 
 def init_tts_models() -> dict:
@@ -1303,9 +1320,8 @@ def init_tts_models() -> dict:
     When TTS_CHATTERBOX_ENABLED=false, Turbo is not loaded.
     When TTS_CHATTERBOX_MODE=api, local Turbo is not loaded; Resemble API is warmed with a short synthesis.
     When TTS_INDICF5_ENABLED=false, IndicF5 is not loaded.
-    When TTS_TABBLY_FOR_NON_ENGLISH=true and TABBLY_API_KEY set, Tabbly is warmed with a short synthesis.
     Runs one short TTS inference after loading Turbo so torch.compile/CUDA kernels are warmed.
-    Returns {"turbo": ..., "indicf5": ..., "tabbly": "ok"|"skipped"|"failed"}.
+    Returns {"turbo": ..., "indicf5": ...}.
     """
     global _turbo_warmup_done
     result: dict = {}
@@ -1350,21 +1366,5 @@ def init_tts_models() -> dict:
             result["indicf5"] = "loaded"
         else:
             result["indicf5"] = "skipped"
-
-    if getattr(settings, "tts_tabbly_for_non_english", False) and getattr(
-        settings, "tabbly_api_key", None
-    ):
-        try:
-            from app.services.tts_backends import tabbly as tabbly_tts
-
-            tabbly_tts.warmup()
-            result["tabbly"] = "ok"
-            logger.info("Tabbly TTS API warm-up completed")
-        except Exception as e:
-            logger.exception("Tabbly TTS API init failed")
-            result["tabbly"] = "failed"
-            result["tabbly_error"] = str(e)
-    else:
-        result["tabbly"] = "skipped"
 
     return result

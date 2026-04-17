@@ -145,3 +145,22 @@ def update_usage_stats(
     else:
         usage.voice_count += 1
     db.commit()
+
+
+def finalize_live_session_usage(
+    user_id: str,
+    db: Session,
+    duration_seconds: float,
+    *,
+    increment_request_count: bool = False,
+) -> None:
+    """
+    Record a completed Gemini Live session on today's Usage row: add minutes and one voice_count.
+    Does not increment chat_count. request_count is optional (default off to avoid inflating vs REST).
+    """
+    usage = get_or_create_today_usage(user_id, db)
+    usage.minutes_used += max(0.0, float(duration_seconds)) / 60.0
+    usage.voice_count += 1
+    if increment_request_count:
+        usage.request_count += 1
+    db.commit()

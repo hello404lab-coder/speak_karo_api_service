@@ -1,1 +1,1 @@
-"""Pluggable TTS HTTP backends (Tabbly, etc.)."""
+"""Pluggable TTS HTTP backends."""

@@ -144,31 +144,11 @@ class Settings(BaseSettings):
         description="RESEMBLE_API_MAX_RETRIES: max retry attempts on transient failures",
     )
 
-    # Tabbly TTS (cloud, non-English when enabled — replaces IndicF5 for that path)
-    # https://docs.tabbly.io/tts-api/tts-streaming
-    tabbly_api_key: Optional[str] = Field(default=None, description="TABBLY_API_KEY: Tabbly TTS API key (X-API-Key)")
-    tts_tabbly_for_non_english: bool = Field(
-        default=False,
-        description="TTS_TABBLY_FOR_NON_ENGLISH: use Tabbly for all non-English TTS (skip IndicF5) when key set",
+    tts_gemini_model: str = Field(default="gemini-2.5-flash-lite-preview-tts", description="TTS_GEMINI_MODEL: Gemini TTS model when Chatterbox disabled (English)")
+    tts_gemini_model_indic: str = Field(
+        default="gemini-2.5-flash-preview-tts",
+        description="TTS_GEMINI_MODEL_INDIC: Gemini TTS model for Indic languages (when IndicF5 off or after IndicF5 failure)",
     )
-    tts_tabbly_voice_id: str = Field(
-        default="Mosina",
-        description="TTS_TABBLY_VOICE_ID: Tabbly voice_id (e.g. Hindi voice Mosina)",
-    )
-    tts_tabbly_model_id: str = Field(
-        default="tabbly-tts",
-        description="TTS_TABBLY_MODEL_ID: Tabbly model_id",
-    )
-    tts_tabbly_max_retries: int = Field(
-        default=2,
-        description="TTS_TABBLY_MAX_RETRIES: retries on 5xx / transport errors only",
-    )
-    tts_tabbly_max_concurrent: int = Field(
-        default=6,
-        description="TTS_TABBLY_MAX_CONCURRENT: max concurrent Tabbly HTTP syntheses",
-    )
-
-    tts_gemini_model: str = Field(default="gemini-2.5-flash-lite-preview-tts", description="TTS_GEMINI_MODEL: Gemini TTS model when Chatterbox disabled")
     tts_gemini_voice: str = Field(default="Puck", description="TTS_GEMINI_VOICE: prebuilt voice name for Gemini TTS")
     # Max concurrent TTS inferences (1 = strict serialization for low VRAM; 2+ = Semaphore for lower latency)
     tts_concurrent_inferences: int = Field(default=2, description="TTS_CONCURRENT_INFERENCES: max concurrent TTS inferences")
@@ -199,6 +179,72 @@ class Settings(BaseSettings):
     llm_timeout_seconds: int = 60
     stt_timeout_seconds: int = 30
     tts_timeout_seconds: int = 45
+
+    # Gemini Live (control plane only; client opens WebSocket to Google)
+    gemini_live_model: str = Field(
+        default="gemini-2.5-flash-native-audio-preview-12-2025",
+        description="GEMINI_LIVE_MODEL: Live-capable Gemini model id",
+    )
+    gemini_live_prompt_version: str = Field(
+        default="1",
+        description="GEMINI_LIVE_PROMPT_VERSION: server-side prompt template version",
+    )
+    gemini_live_voice: Optional[str] = Field(
+        default="Puck",
+        description="GEMINI_LIVE_VOICE: prebuilt voice name for Live speech_config",
+    )
+    gemini_live_language_code: Optional[str] = Field(
+        default="en-US",
+        description="GEMINI_LIVE_LANGUAGE_CODE: BCP-47 hint for clients (not sent in Live speech_config; API unsupported)",
+    )
+    gemini_live_temperature: float = Field(
+        default=0.4,
+        description="GEMINI_LIVE_TEMPERATURE: Live generation temperature",
+    )
+    gemini_live_min_plan: Literal["free", "trial", "premium"] = Field(
+        default="free",
+        description="GEMINI_LIVE_MIN_PLAN: minimum subscription tier for Live (free|trial|premium)",
+    )
+    gemini_live_max_session_duration_seconds: int = Field(
+        default=3600,
+        description="GEMINI_LIVE_MAX_SESSION_DURATION_SECONDS: cap for server-computed session length on end",
+    )
+    gemini_live_system_instruction_max_chars: int = Field(
+        default=8000,
+        description="GEMINI_LIVE_SYSTEM_INSTRUCTION_MAX_CHARS: max length for built system_instruction",
+    )
+    gemini_live_token_uses: int = Field(
+        default=1,
+        description="GEMINI_LIVE_TOKEN_USES: uses count for ephemeral Live auth token (0 = unlimited per SDK)",
+    )
+    gemini_live_token_new_session_seconds: int = Field(
+        default=120,
+        description="GEMINI_LIVE_TOKEN_NEW_SESSION_SECONDS: window in which new Live sessions may start with the token",
+    )
+    gemini_live_heartbeat_stale_seconds: int = Field(
+        default=90,
+        description="GEMINI_LIVE_HEARTBEAT_STALE_SECONDS: no heartbeat => session eligible for auto-end",
+    )
+    gemini_live_reaper_enabled: bool = Field(
+        default=True,
+        description="GEMINI_LIVE_REAPER_ENABLED: periodic job to auto-end stale active sessions",
+    )
+    gemini_live_reaper_interval_seconds: int = Field(
+        default=60,
+        description="GEMINI_LIVE_REAPER_INTERVAL_SECONDS: sleep between reaper runs in the app process",
+    )
+    gemini_live_token_requests_per_minute: int = Field(
+        default=3,
+        description="GEMINI_LIVE_TOKEN_REQUESTS_PER_MINUTE: max /live/token mints per user per rolling minute (Redis)",
+    )
+    gemini_live_token_rate_window_seconds: int = Field(
+        default=60,
+        description="GEMINI_LIVE_TOKEN_RATE_WINDOW_SECONDS: Redis TTL for token rate counter",
+    )
+    gemini_live_redis_required_for_token: bool = Field(
+        default=True,
+        description="GEMINI_LIVE_REDIS_REQUIRED_FOR_TOKEN: if true, prod requires Redis for /live/token rate limit",
+    )
     
     @property
     def is_prod(self) -> bool:

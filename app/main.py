@@ -3,6 +3,7 @@
 import os
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
+import asyncio
 import logging
 from pathlib import Path
 
@@ -17,6 +18,7 @@ from slowapi.errors import RateLimitExceeded
 from app.core.config import settings
 from app.database import init_db
 from app.api.ai import router as ai_router
+from app.api.live import router as live_router
 from app.api.auth import router as auth_router
 from app.api.conversations import router as conversations_router
 from app.api.subscription import router as subscription_router
@@ -48,9 +50,9 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request, exc: HTTPException):
-    """Return 402 body as top-level JSON (error + message) for subscription_required."""
-    if exc.status_code == 402 and isinstance(exc.detail, dict):
-        return JSONResponse(status_code=402, content=exc.detail)
+    """Return structured JSON for subscription (402), rate limits (429), and Live session errors (410)."""
+    if isinstance(exc.detail, dict) and exc.status_code in (402, 410, 429):
+        return JSONResponse(status_code=exc.status_code, content=exc.detail)
     return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
 
 # CORS middleware
@@ -118,37 +120,39 @@ async def startup_event():
     else:
         logger.warning("Gemini API key not set. LLM will fail.")
     
-    # Log TTS configuration (dual: English -> Chatterbox-Turbo or Gemini TTS, Indic -> IndicF5 or fallback)
+    # Log TTS configuration (English -> Chatterbox-Turbo or Gemini; Indic -> IndicF5 optional then Gemini Flash TTS)
     if getattr(settings, "tts_chatterbox_enabled", True):
         audio_prompt_info = f"voice cloning: {settings.tts_audio_prompt_path}" if settings.tts_audio_prompt_path else "not set (required for Turbo)"
         logger.info(f"TTS: English -> Chatterbox-Turbo ({audio_prompt_info})")
-        indic_fallback = "Chatterbox-Turbo"
     else:
-        logger.info("TTS: English -> Gemini TTS (model: %s, voice: %s)", getattr(settings, "tts_gemini_model", "gemini-2.5-flash-lite-preview-tts"), getattr(settings, "tts_gemini_voice", "Puck"))
-        indic_fallback = "Gemini TTS"
-    if getattr(settings, "tts_tabbly_for_non_english", False) and getattr(
-        settings, "tabbly_api_key", None
-    ):
         logger.info(
-            "TTS: non-English -> Tabbly (voice=%s, model=%s); IndicF5 skipped when Tabbly succeeds",
-            getattr(settings, "tts_tabbly_voice_id", "Mosina"),
-            getattr(settings, "tts_tabbly_model_id", "tabbly-tts"),
+            "TTS: English -> Gemini TTS (model: %s, voice: %s)",
+            getattr(settings, "tts_gemini_model", "gemini-2.5-flash-lite-preview-tts"),
+            getattr(settings, "tts_gemini_voice", "Puck"),
         )
-    elif getattr(settings, "tts_indicf5_enabled", False):
+    indic_gemini = getattr(settings, "tts_gemini_model_indic", "gemini-2.5-flash-preview-tts")
+    if getattr(settings, "tts_indicf5_enabled", False):
         indicf5_dir = getattr(settings, "tts_indicf5_ref_audio_dir", None)
         if indicf5_dir:
             from app.services.tts import _get_indicf5_torch_device
 
             logger.info(
-                "TTS: Indic (hi/ml/ta/...) -> IndicF5 (ref_audio_dir: %s, speed: %s, torch: %s)",
+                "TTS: Indic (hi/ml/ta/...) -> IndicF5 (ref_audio_dir: %s, speed: %s, torch: %s); fallback Gemini Indic (model: %s)",
                 indicf5_dir,
                 getattr(settings, "tts_indicf5_speed", 0.9),
                 _get_indicf5_torch_device(),
+                indic_gemini,
             )
         else:
-            logger.info("TTS: Indic (hi/ml/ta/...) -> %s fallback (IndicF5 ref dir not set)", indic_fallback)
+            logger.info(
+                "TTS: Indic (hi/ml/ta/...) -> Gemini Indic (model: %s); IndicF5 ref dir not set",
+                indic_gemini,
+            )
     else:
-        logger.info("TTS: Indic (hi/ml/ta/...) -> %s only (IndicF5 disabled)", indic_fallback)
+        logger.info(
+            "TTS: Indic (hi/ml/ta/...) -> Gemini Indic (model: %s; requires GEMINI_API_KEY)",
+            indic_gemini,
+        )
     
     # Initialize database
     try:
@@ -182,6 +186,55 @@ async def startup_event():
         logger.warning("Social matchmaking Redis unavailable: %s", e)
         app.state.social_redis = None
 
+    # Async Redis for Gemini Live token rate limiting
+    try:
+        from app.services.redis_live import create_live_redis
+
+        app.state.live_redis = create_live_redis()
+        await app.state.live_redis.ping()
+        logger.info("Live Redis connected (token rate limit)")
+    except Exception as e:
+        logger.warning("Live Redis unavailable: %s", e)
+        app.state.live_redis = None
+
+    app.state._live_reaper_stop = asyncio.Event()
+    app.state.reaper_task = None
+    if getattr(settings, "gemini_live_reaper_enabled", True):
+        reaper_interval = max(15.0, float(getattr(settings, "gemini_live_reaper_interval_seconds", 60) or 60))
+        reaper_stale_seconds = int(getattr(settings, "gemini_live_heartbeat_stale_seconds", 90) or 90)
+
+        async def _live_reaper_worker() -> None:
+            while True:
+                try:
+                    await asyncio.wait_for(app.state._live_reaper_stop.wait(), timeout=reaper_interval)
+                    break
+                except asyncio.TimeoutError:
+                    pass
+
+                def _reap_once() -> int:
+                    from app.database import SessionLocal
+                    from app.services.live_session_service import reap_stale_live_sessions
+
+                    db = SessionLocal()
+                    try:
+                        return reap_stale_live_sessions(db, stale_seconds=reaper_stale_seconds)
+                    finally:
+                        db.close()
+
+                try:
+                    n = await asyncio.to_thread(_reap_once)
+                    if n:
+                        logger.info("live_reaper closed %s stale session(s)", n)
+                except Exception as ex:
+                    logger.warning("live_reaper error: %s", ex)
+
+        app.state.reaper_task = asyncio.create_task(_live_reaper_worker())
+        logger.info(
+            "Live session reaper started (interval=%ss, stale=%ss)",
+            reaper_interval,
+            reaper_stale_seconds,
+        )
+
     if settings.is_prod and (not settings.agora_app_id or not settings.agora_app_certificate):
         logger.warning(
             "AGORA_APP_ID / AGORA_APP_CERTIFICATE not set; social voice tokens will fail until configured."
@@ -192,12 +245,34 @@ async def startup_event():
 async def shutdown_event():
     """Cleanup on shutdown."""
     logger.info("Shutting down...")
+    evt = getattr(app.state, "_live_reaper_stop", None)
+    if evt is not None and not evt.is_set():
+        evt.set()
+    task = getattr(app.state, "reaper_task", None)
+    if task is not None:
+        try:
+            await asyncio.wait_for(task, timeout=8.0)
+        except (asyncio.TimeoutError, Exception) as e:
+            logger.warning("Live reaper task shutdown: %s", e)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
     r = getattr(app.state, "social_redis", None)
     if r is not None:
         try:
             await r.aclose()
         except Exception as e:
             logger.warning("Social Redis close failed: %s", e)
+
+    lr = getattr(app.state, "live_redis", None)
+    if lr is not None:
+        try:
+            await lr.aclose()
+        except Exception as e:
+            logger.warning("Live Redis close failed: %s", e)
 
 
 @app.get("/health")
@@ -212,6 +287,7 @@ async def health_check():
 
 # Include API routers
 app.include_router(ai_router, prefix="/api/v1/ai", tags=["AI"])
+app.include_router(live_router, prefix="/api/v1/ai")
 app.include_router(auth_router, prefix="/api/v1/auth", tags=["Auth"])
 app.include_router(conversations_router, prefix="/api/v1/conversations", tags=["Conversations"])
 app.include_router(subscription_router, prefix="/api/v1/subscription", tags=["Subscription"])

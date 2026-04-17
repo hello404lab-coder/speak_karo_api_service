@@ -114,7 +114,7 @@ async def init_models(
     # current_user: User = Depends(require_active_plan),
 ):
     """
-    Initialize (warm up) all models: STT, LLM client, and TTS (local Turbo, Resemble API, Tabbly, or IndicF5 per config).
+    Initialize (warm up) all models: STT, LLM client, and TTS (local Turbo, Resemble API, IndicF5, or Gemini per config).
     Call this after startup to avoid cold-start latency on first user request.
     Runs in a thread with a 5-minute timeout.
     """
