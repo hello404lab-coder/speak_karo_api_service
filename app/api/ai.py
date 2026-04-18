@@ -10,7 +10,7 @@ import uuid
 from datetime import datetime
 from typing import Literal, Optional
 from io import BytesIO
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, Response, status
 from fastapi.responses import StreamingResponse
 from pydub import AudioSegment
 from sqlalchemy.orm import Session
@@ -19,14 +19,33 @@ from app.core.prompts import parse_gemini_response
 from app.database import get_db
 from app.dependencies.auth import get_current_user
 from app.dependencies.subscription import require_active_plan
-from app.schemas.ai import TextChatRequest, AIChatResponse, TTSStreamRequest
+from app.schemas.ai import TextChatRequest, AIChatResponse, TTSStreamRequest, VoiceDraftFinalizeResponse
 from app.services.llm import finalize_llm_reply, generate_reply, init_llm_client, stream_gemini_tokens
 from app.services.stt import transcribe_audio, init_stt_models
 from app.services.translation import attach_translated_reply_text
-from app.services.tts import text_to_speech_stream, store_audio_mp3, store_user_voice_wav, generate_tts_bytes, feed_tts_stream_to_queue, init_tts_models
+from app.services.tts import (
+    delete_stored_audio,
+    text_to_speech_stream,
+    store_audio_mp3,
+    store_user_voice_wav,
+    store_user_voice_wav_record,
+    resolve_stored_audio_playback_url,
+    generate_tts_bytes,
+    feed_tts_stream_to_queue,
+    init_tts_models,
+)
+from app.services.voice_drafts import (
+    VOICE_DRAFT_SOURCE_BACKEND_FINAL,
+    VOICE_DRAFT_SOURCE_BROWSER_FALLBACK,
+    VOICE_DRAFT_STATUS_CONSUMED,
+    cleanup_expired_voice_drafts,
+    create_voice_input_draft,
+    discard_voice_input_draft,
+    get_pending_voice_input_draft,
+)
 from app.services.subscription_service import update_usage_stats
-from app.utils.language import resolve_reply_language, resolve_translation_language
-from app.models.usage import Conversation, Message
+from app.utils.language import normalize_language_code, resolve_reply_language, resolve_translation_language
+from app.models.usage import Conversation, Message, VoiceInputDraft
 from app.models.user import User
 
 logger = logging.getLogger(__name__)
@@ -53,7 +72,11 @@ def get_or_create_conversation(
 ) -> Conversation:
     """Get existing conversation or create new one. Optionally set or append learner_context."""
     if conversation_id:
-        conversation = db.query(Conversation).filter(Conversation.id == conversation_id).first()
+        conversation = (
+            db.query(Conversation)
+            .filter(Conversation.id == conversation_id, Conversation.user_id == user_id)
+            .first()
+        )
         if conversation:
             if learner_context and learner_context.strip():
                 existing = (conversation.long_term_context or "").strip()
@@ -75,6 +98,22 @@ def get_or_create_conversation(
     db.commit()
     db.refresh(conversation)
     logger.info("conversation_created", extra={"conversation_id": conversation.id, "user_id": user_id})
+    return conversation
+
+
+def _require_owned_conversation(
+    db: Session,
+    user_id: str,
+    conversation_id: str,
+) -> Conversation:
+    """Return an owned conversation or raise 404."""
+    conversation = (
+        db.query(Conversation)
+        .filter(Conversation.id == conversation_id, Conversation.user_id == user_id)
+        .first()
+    )
+    if not conversation:
+        raise HTTPException(status_code=404, detail="Conversation not found")
     return conversation
 
 
@@ -149,8 +188,20 @@ def _save_exchange_message(
     reply_language: str,
     translation_language: Optional[str],
     user_audio_url: Optional[str] = None,
+    voice_draft: Optional[VoiceInputDraft] = None,
 ) -> Message:
     """Persist one user/assistant exchange."""
+    resolved_user_audio_url = user_audio_url
+    if voice_draft is not None:
+        if voice_draft.conversation_id is None:
+            voice_draft.conversation_id = conversation.id
+        voice_draft.status = VOICE_DRAFT_STATUS_CONSUMED
+        voice_draft.consumed_at = datetime.utcnow()
+        resolved_user_audio_url = resolve_stored_audio_playback_url(
+            voice_draft.user_audio_storage_key,
+            voice_draft.user_audio_url,
+        )
+
     message = Message(
         conversation_id=conversation.id,
         user_message=user_message,
@@ -162,7 +213,7 @@ def _save_exchange_message(
         hinglish_explanation=ai_response.get("explanation", ""),
         example=ai_response.get("example", ""),
         score=ai_response.get("score", 0),
-        user_audio_url=user_audio_url,
+        user_audio_url=resolved_user_audio_url,
     )
     db.add(message)
     conversation.updated_at = datetime.utcnow()
@@ -174,6 +225,28 @@ def _save_exchange_message(
         extra={"conversation_id": conversation.id, "message_id": message.id},
     )
     return message
+
+
+def _resolve_voice_draft_for_send(
+    db: Session,
+    current_user: User,
+    draft_id: Optional[str],
+    requested_conversation_id: Optional[str],
+) -> tuple[Optional[VoiceInputDraft], Optional[str]]:
+    """Resolve a pending voice draft for a text send, validating ownership and conversation consistency."""
+    cleanup_expired_voice_drafts(db)
+    if not draft_id:
+        return None, requested_conversation_id
+
+    draft = get_pending_voice_input_draft(db, current_user.id, draft_id)
+    if not draft:
+        raise HTTPException(status_code=404, detail="Voice draft not found or no longer available")
+
+    if requested_conversation_id and draft.conversation_id and requested_conversation_id != draft.conversation_id:
+        raise HTTPException(status_code=400, detail="Voice draft belongs to a different conversation")
+
+    effective_conversation_id = requested_conversation_id or draft.conversation_id
+    return draft, effective_conversation_id
 
 
 def _build_ai_chat_response(
@@ -268,9 +341,15 @@ async def text_chat(
         raise HTTPException(status_code=403, detail=ONBOARDING_REQUIRED_MESSAGE)
     user_id = current_user.id
     try:
+        voice_draft, effective_conversation_id = _resolve_voice_draft_for_send(
+            db,
+            current_user,
+            request.voice_draft_id,
+            request.conversation_id,
+        )
         # Get or create conversation
         conversation = get_or_create_conversation(
-            user_id, request.conversation_id, db, learner_context=request.learner_context
+            user_id, effective_conversation_id, db, learner_context=request.learner_context
         )
 
         # Get conversation history for context
@@ -278,7 +357,7 @@ async def text_chat(
 
         reply_language, translation_language = _resolve_turn_languages(
             request.message,
-            None,
+            voice_draft.detected_lang if voice_draft else None,
             request.reply_language,
             request.response_language,
             request.translation_language,
@@ -308,10 +387,11 @@ async def text_chat(
             ai_response,
             reply_language,
             translation_language,
+            voice_draft=voice_draft,
         )
         
         # Update usage stats
-        update_usage_stats(user_id, db, 0.0, "chat")
+        update_usage_stats(user_id, db, 0.0, "voice" if voice_draft else "chat")
         
         return _build_ai_chat_response(
             ai_response,
@@ -443,6 +523,107 @@ async def voice_chat(
         raise HTTPException(status_code=500, detail="An error occurred processing your request.")
 
 
+@router.post("/voice-drafts/finalize", response_model=VoiceDraftFinalizeResponse)
+async def finalize_voice_draft(
+    user_id: str = Form(...),
+    conversation_id: Optional[str] = Form(None),
+    browser_draft_text: Optional[str] = Form(None),
+    browser_language: Optional[str] = Form(None),
+    audio_file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_active_plan),
+):
+    """Store a recorded clip, run backend STT, and return a reusable voice draft for review-before-send."""
+    del user_id  # auth user is authoritative
+
+    if not current_user.onboarding_completed:
+        raise HTTPException(status_code=403, detail=ONBOARDING_REQUIRED_MESSAGE)
+    if not audio_file.filename.endswith(".wav"):
+        raise HTTPException(status_code=400, detail="Only WAV files are supported.")
+
+    cleanup_expired_voice_drafts(db)
+
+    if conversation_id:
+        _require_owned_conversation(db, current_user.id, conversation_id)
+
+    audio_bytes = await audio_file.read()
+    stored_audio = await asyncio.to_thread(
+        store_user_voice_wav_record,
+        audio_bytes,
+        f"user_voice_{current_user.id}_{uuid.uuid4().hex[:12]}.wav",
+    )
+
+    transcript_text: Optional[str] = None
+    detected_lang: Optional[str] = None
+    transcript_source = VOICE_DRAFT_SOURCE_BACKEND_FINAL
+    warning: Optional[str] = None
+
+    try:
+        transcript_text, detected_lang = await asyncio.wait_for(
+            asyncio.to_thread(
+                transcribe_audio,
+                audio_bytes,
+                audio_file.filename,
+                settings.stt_mode,
+            ),
+            timeout=float(settings.stt_timeout_seconds),
+        )
+        transcript_text = transcript_text.strip()
+        detected_lang = normalize_language_code(detected_lang) or detected_lang
+    except asyncio.TimeoutError:
+        transcript_text = None
+        warning = "Final transcription timed out. Please review the draft carefully."
+    except ValueError as e:
+        logger.warning("voice_draft_stt_failed: %s", e)
+        transcript_text = None
+        warning = "Final transcription unavailable. Please review the draft carefully."
+    except Exception as e:
+        logger.exception("voice_draft_stt_unexpected_error: %s", e)
+        transcript_text = None
+        warning = "Final transcription unavailable. Please review the draft carefully."
+
+    browser_fallback_text = (browser_draft_text or "").strip()
+    if not transcript_text:
+        if not browser_fallback_text:
+            delete_stored_audio(stored_audio.storage_ref)
+            raise HTTPException(status_code=400, detail="Could not transcribe audio. Please try again.")
+        transcript_text = browser_fallback_text
+        detected_lang = normalize_language_code(browser_language)
+        transcript_source = VOICE_DRAFT_SOURCE_BROWSER_FALLBACK
+        warning = warning or "Final transcription unavailable. Please review the draft carefully."
+
+    draft = create_voice_input_draft(
+        db,
+        user_id=current_user.id,
+        conversation_id=conversation_id,
+        user_audio_url=stored_audio.playback_url,
+        user_audio_storage_key=stored_audio.storage_ref,
+        transcript_text=transcript_text,
+        detected_lang=detected_lang,
+        transcript_source=transcript_source,
+        warning=warning,
+    )
+    return VoiceDraftFinalizeResponse(
+        voice_draft_id=draft.id,
+        transcript_text=draft.transcript_text,
+        detected_lang=draft.detected_lang,
+        transcript_source=draft.transcript_source,
+        warning=draft.warning,
+    )
+
+
+@router.delete("/voice-drafts/{draft_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def discard_voice_draft(
+    draft_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_active_plan),
+):
+    """Discard a pending voice input draft without sending it to the AI."""
+    cleanup_expired_voice_drafts(db)
+    discard_voice_input_draft(db, current_user.id, draft_id)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
 # Heartbeat interval for chat/stream SSE (keep connection alive during long LLM pauses)
 SSE_HEARTBEAT_SECONDS = 0.5
 
@@ -514,6 +695,7 @@ async def _llm_tts_streaming_pipeline(
     long_term_context: Optional[str] = None,
     usage_type: Literal["chat", "voice"] = "chat",
     user_audio_url: Optional[str] = None,
+    voice_draft: Optional[VoiceInputDraft] = None,
 ):
     """
     Reusable async generator: LLM stream -> sentence buffer -> per-sentence TTS -> SSE events.
@@ -724,6 +906,7 @@ async def _llm_tts_streaming_pipeline(
                 reply_language,
                 translation_language,
                 user_audio_url=user_audio_url,
+                voice_draft=voice_draft,
             )
             update_usage_stats(user_id, db, 0.0, usage_type)
         except Exception as e:
@@ -756,13 +939,19 @@ async def chat_stream(
         raise HTTPException(status_code=403, detail=ONBOARDING_REQUIRED_MESSAGE)
     user_id = current_user.id
     message = request.message.strip()
+    voice_draft, effective_conversation_id = _resolve_voice_draft_for_send(
+        db,
+        current_user,
+        request.voice_draft_id,
+        request.conversation_id,
+    )
     conversation = get_or_create_conversation(
-        user_id, request.conversation_id, db, learner_context=request.learner_context
+        user_id, effective_conversation_id, db, learner_context=request.learner_context
     )
     history = get_conversation_history(conversation.id, db)
     reply_language, translation_language = _resolve_turn_languages(
         message,
-        None,
+        voice_draft.detected_lang if voice_draft else None,
         request.reply_language,
         request.response_language,
         request.translation_language,
@@ -779,7 +968,8 @@ async def chat_stream(
             db,
             user_id,
             long_term_context=conversation.long_term_context,
-            usage_type="chat",
+            usage_type="voice" if voice_draft else "chat",
+            voice_draft=voice_draft,
         ),
         media_type="text/event-stream",
         headers=SSE_HEADERS,

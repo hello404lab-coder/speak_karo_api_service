@@ -160,6 +160,23 @@ async def startup_event():
         logger.info("Database initialized")
     except Exception as e:
         logger.error(f"Database initialization failed: {e}")
+
+    try:
+        from app.database import SessionLocal
+        from app.services.voice_drafts import cleanup_expired_voice_drafts
+
+        def _cleanup_voice_drafts_once() -> int:
+            db = SessionLocal()
+            try:
+                return cleanup_expired_voice_drafts(db)
+            finally:
+                db.close()
+
+        cleaned = await asyncio.to_thread(_cleanup_voice_drafts_once)
+        if cleaned:
+            logger.info("Voice draft startup cleanup expired %s draft(s)", cleaned)
+    except Exception as e:
+        logger.warning("Voice draft startup cleanup failed: %s", e)
     
     # Cache and Redis
     cache_enabled = settings.cache_enabled

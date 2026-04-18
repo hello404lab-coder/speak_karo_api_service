@@ -1,6 +1,6 @@
 """Request and response schemas for AI endpoints."""
 from pydantic import BaseModel, Field
-from typing import Optional
+from typing import Literal, Optional
 
 
 class UserAnalysis(BaseModel):
@@ -25,6 +25,10 @@ class TextChatRequest(BaseModel):
     translation_language: Optional[str] = Field(
         None,
         description="Optional ISO 639-1 code for translated display text. Falls back to the user's native language when omitted.",
+    )
+    voice_draft_id: Optional[str] = Field(
+        None,
+        description="Optional one-time voice draft id created by POST /voice-drafts/finalize.",
     )
     response_language: Optional[str] = Field(
         "en",
@@ -71,6 +75,19 @@ class AIChatResponse(BaseModel):
         description="Deprecated alias for reply_language. Pass to POST /api/ai/tts/stream when requesting audio.",
     )
     conversation_id: Optional[str] = Field(None, description="Conversation ID for this session")
+
+
+class VoiceDraftFinalizeResponse(BaseModel):
+    """Response schema for POST /voice-drafts/finalize."""
+
+    voice_draft_id: str = Field(..., description="One-time reusable draft id for a subsequent chat send")
+    transcript_text: str = Field(..., description="Final transcript text for review/edit before send")
+    detected_lang: Optional[str] = Field(None, description="Detected language code from backend STT or browser fallback")
+    transcript_source: Literal["backend_final", "browser_fallback"] = Field(
+        ...,
+        description="Whether transcript_text came from backend STT or browser fallback text",
+    )
+    warning: Optional[str] = Field(None, description="Optional warning when backend STT failed and browser fallback was used")
 
 
 class TTSStreamRequest(BaseModel):

@@ -69,3 +69,28 @@ class Message(Base):
     __table_args__ = (
         {"schema": None},
     )
+
+
+class VoiceInputDraft(Base):
+    """Pending voice transcript draft created before a message is sent to the AI."""
+    __tablename__ = "voice_input_drafts"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id = Column(String, nullable=False, index=True)
+    conversation_id = Column(String, ForeignKey("conversations.id"), nullable=True, index=True)
+    user_audio_url = Column(String(512), nullable=False)
+    user_audio_storage_key = Column(String(1024), nullable=True)
+    transcript_text = Column(Text, nullable=False)
+    detected_lang = Column(String(16), nullable=True)
+    transcript_source = Column(String(32), nullable=False, default="backend_final", server_default=sa.text("'backend_final'"))
+    warning = Column(Text, nullable=True)
+    status = Column(String(16), nullable=False, default="pending", server_default=sa.text("'pending'"), index=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
+    expires_at = Column(DateTime, nullable=False, index=True)
+    consumed_at = Column(DateTime, nullable=True)
+
+    conversation = relationship("Conversation")
+
+    __table_args__ = (
+        {"schema": None},
+    )

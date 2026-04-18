@@ -8,6 +8,7 @@ import re
 import struct
 import threading
 import time
+from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
 from typing import Iterator, Optional
@@ -20,6 +21,18 @@ from app.utils.device import get_infer_device
 from app.utils.language import _script_to_lang
 
 logger = logging.getLogger(__name__)
+
+
+STORAGE_REF_S3_PREFIX = "s3:"
+STORAGE_REF_LOCAL_PREFIX = "local:"
+
+
+@dataclass(frozen=True)
+class StoredAudioRecord:
+    """Durable storage reference plus the best available playback URL."""
+
+    playback_url: str
+    storage_ref: str
 
 
 def _get_indicf5_torch_device() -> str:
@@ -118,6 +131,16 @@ def _store_audio_local(audio_bytes: bytes, filename: str) -> str:
     return f"{settings.audio_base_url}/{filename}"
 
 
+def _storage_ref_for_local(filename: str) -> str:
+    """Encode a local audio file reference."""
+    return f"{STORAGE_REF_LOCAL_PREFIX}{filename}"
+
+
+def _storage_ref_for_s3(s3_key: str) -> str:
+    """Encode an S3 audio file reference."""
+    return f"{STORAGE_REF_S3_PREFIX}{s3_key}"
+
+
 def _generate_presigned_url(s3_key: str) -> Optional[str]:
     """Generate a presigned GET URL for an S3 object. Returns None if S3 not configured or on error."""
     if not all([
@@ -187,15 +210,83 @@ def store_user_voice_wav(audio_bytes: bytes, filename: str) -> str:
     Used for voice-chat and voice-chat/stream to persist the user's recording.
     On S3/store failure, falls back to local; if both fail, caller should handle (log and use None).
     """
+    return store_user_voice_wav_record(audio_bytes, filename).playback_url
+
+
+def store_user_voice_wav_record(audio_bytes: bytes, filename: str) -> StoredAudioRecord:
+    """Store user voice recording and return both playback URL and a durable storage reference."""
     try:
         s3_key = _store_audio_cloud(audio_bytes, f"user_voice/{filename}", content_type="audio/wav")
         if s3_key:
             presigned = _generate_presigned_url(s3_key)
             if presigned:
-                return presigned
+                return StoredAudioRecord(
+                    playback_url=presigned,
+                    storage_ref=_storage_ref_for_s3(s3_key),
+                )
     except Exception as e:
         logger.warning("User voice S3 upload failed: %s, falling back to local", e)
-    return _store_audio_local(audio_bytes, filename)
+
+    playback_url = _store_audio_local(audio_bytes, filename)
+    return StoredAudioRecord(
+        playback_url=playback_url,
+        storage_ref=_storage_ref_for_local(filename),
+    )
+
+
+def resolve_stored_audio_playback_url(storage_ref: Optional[str], fallback_url: Optional[str] = None) -> Optional[str]:
+    """Resolve a durable storage reference into a playback URL."""
+    if not storage_ref:
+        return fallback_url
+
+    if storage_ref.startswith(STORAGE_REF_S3_PREFIX):
+        s3_key = storage_ref[len(STORAGE_REF_S3_PREFIX):]
+        return _generate_presigned_url(s3_key) or fallback_url
+
+    if storage_ref.startswith(STORAGE_REF_LOCAL_PREFIX):
+        filename = storage_ref[len(STORAGE_REF_LOCAL_PREFIX):]
+        return f"{settings.audio_base_url}/{filename}"
+
+    return fallback_url
+
+
+def delete_stored_audio(storage_ref: Optional[str]) -> None:
+    """Delete audio from durable storage. Failures are logged and ignored."""
+    if not storage_ref:
+        return
+
+    if storage_ref.startswith(STORAGE_REF_LOCAL_PREFIX):
+        filename = storage_ref[len(STORAGE_REF_LOCAL_PREFIX):]
+        path = os.path.join(settings.audio_storage_path, filename)
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+        except Exception as e:
+            logger.warning("Failed to delete local audio %s: %s", path, e)
+        return
+
+    if storage_ref.startswith(STORAGE_REF_S3_PREFIX):
+        s3_key = storage_ref[len(STORAGE_REF_S3_PREFIX):]
+        if not all([
+            settings.aws_access_key_id,
+            settings.aws_secret_access_key,
+            settings.s3_bucket_name,
+        ]):
+            return
+        try:
+            import boto3
+
+            s3_client = boto3.client(
+                "s3",
+                aws_access_key_id=settings.aws_access_key_id,
+                aws_secret_access_key=settings.aws_secret_access_key,
+                region_name=settings.aws_region or "ap-south-1",
+            )
+            s3_client.delete_object(Bucket=settings.s3_bucket_name, Key=s3_key)
+        except ImportError:
+            logger.warning("boto3 not installed")
+        except Exception as e:
+            logger.warning("Failed to delete S3 audio %s: %s", s3_key, e)
 
 
 def _parse_audio_mime_type(mime_type: str) -> dict[str, int]:

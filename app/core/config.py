@@ -205,6 +205,10 @@ class Settings(BaseSettings):
     llm_timeout_seconds: int = 60
     stt_timeout_seconds: int = 30
     tts_timeout_seconds: int = 45
+    voice_draft_ttl_hours: int = Field(
+        default=24,
+        description="VOICE_DRAFT_TTL_HOURS: pending voice transcript drafts expire after this many hours",
+    )
 
     # Gemini Live (control plane only; client opens WebSocket to Google)
     gemini_live_model: str = Field(
