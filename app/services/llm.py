@@ -6,8 +6,19 @@ from typing import Iterator, List, Dict, Optional
 from google import genai
 from google.genai import types
 from app.core.config import settings
-from app.core.prompts import get_system_instruction, prepare_history, parse_gemini_response, LLMReplySchema
+from app.core.prompts import (
+    LLMReplySchema,
+    LearnerAnalysisSchema,
+    LEARNER_ANALYSIS_REPAIR_INSTRUCTION,
+    extract_correction_candidate_from_reply,
+    get_system_instruction,
+    parse_gemini_response,
+    postprocess_llm_reply,
+    prepare_history,
+    user_analysis_needs_repair,
+)
 from app.services.cache import get_json, set_json
+from app.services.translation import attach_translated_reply_text
 
 logger = logging.getLogger(__name__)
 
@@ -164,11 +175,31 @@ def _build_trimmed_contents(
 def _generate_cache_key(
     user_message: str,
     conversation_history: List[Dict[str, str]],
-    response_language: str = "en",
+    reply_language: str = "en",
 ) -> str:
     """Deterministic cache key: json.dumps with sort_keys so key is stable across runs."""
-    context = user_message + json.dumps(conversation_history, sort_keys=True) + response_language
-    return f"llm:{hashlib.md5(context.encode()).hexdigest()}"
+    context = (
+        user_message
+        + json.dumps(conversation_history, sort_keys=True)
+        + (reply_language or "en")
+    )
+    return f"llm:v4:{hashlib.md5(context.encode()).hexdigest()}"
+
+
+def _generate_analysis_repair_cache_key(user_message: str, ai_response: Dict[str, any]) -> str:
+    """Cache key for learner-analysis repairs."""
+    context = json.dumps(
+        {
+            "user_message": user_message,
+            "reply_text": ai_response.get("reply_text", ""),
+            "correction": ai_response.get("correction", ""),
+            "explanation": ai_response.get("explanation", ""),
+            "example": ai_response.get("example", ""),
+            "score": ai_response.get("score", 70),
+        },
+        sort_keys=True,
+    )
+    return f"llm:analysis-repair:v1:{hashlib.md5(context.encode()).hexdigest()}"
 
 
 def _contents_to_history_for_cache(contents: List[types.Content]) -> List[Dict[str, str]]:
@@ -208,21 +239,155 @@ def _build_safety_settings():
     return None
 
 
+def _repair_user_analysis(
+    user_message: str,
+    ai_response: Dict[str, any],
+) -> Optional[Dict[str, any]]:
+    """Repair clearly broken learner feedback with a targeted second pass."""
+    client = _get_gemini_client()
+    cache_key = _generate_analysis_repair_cache_key(user_message, ai_response)
+    cached_response = get_json(cache_key)
+    if cached_response:
+        logger.info("Cache hit for learner analysis repair")
+        return cached_response
+
+    contents = [
+        types.Content(
+            role="user",
+            parts=[
+                types.Part.from_text(
+                    text=json.dumps(
+                        {
+                            "learner_message": user_message,
+                            "current_analysis": {
+                                "correction": ai_response.get("correction", ""),
+                                "explanation": ai_response.get("explanation", ""),
+                                "example": ai_response.get("example", ""),
+                                "score": ai_response.get("score", 70),
+                            },
+                        },
+                        ensure_ascii=False,
+                    )
+                )
+            ],
+        )
+    ]
+    config = types.GenerateContentConfig(
+        system_instruction=LEARNER_ANALYSIS_REPAIR_INSTRUCTION,
+        response_mime_type="application/json",
+        response_json_schema=LearnerAnalysisSchema.model_json_schema(),
+        max_output_tokens=min(settings.llm_max_tokens, 160),
+        temperature=0.1,
+    )
+    response = client.models.generate_content(
+        model=settings.llm_model,
+        contents=contents,
+        config=config,
+    )
+    if (
+        not response.candidates
+        or not response.candidates[0].content
+        or not response.candidates[0].content.parts
+    ):
+        return None
+
+    response_text = ""
+    for part in response.candidates[0].content.parts:
+        if hasattr(part, "text") and part.text:
+            response_text += part.text
+    if not response_text.strip():
+        return None
+
+    repaired = parse_gemini_response(response_text)
+    normalized = {
+        "reply_text": ai_response.get("reply_text", ""),
+        "translated_reply_text": ai_response.get("translated_reply_text"),
+        "correction": repaired.get("correction", ""),
+        "explanation": repaired.get("explanation", ""),
+        "example": repaired.get("example", ""),
+        "score": repaired.get("score", ai_response.get("score", 70)),
+    }
+    set_json(cache_key, normalized, settings.llm_cache_ttl)
+    return normalized
+
+
+def finalize_llm_reply(
+    ai_response: Dict[str, any],
+    user_message: str,
+    reply_language: str = "en",
+    translation_language: Optional[str] = None,
+) -> Dict[str, any]:
+    """Normalize AI response and selectively repair bad learner feedback."""
+    normalized = postprocess_llm_reply(
+        ai_response,
+        user_message,
+        reply_language,
+        translation_language,
+    )
+    if not user_analysis_needs_repair(normalized, user_message):
+        return normalized
+
+    try:
+        repaired = _repair_user_analysis(user_message, normalized)
+        if repaired:
+            merged = postprocess_llm_reply(
+                {
+                    "reply_text": normalized.get("reply_text", ""),
+                    "translated_reply_text": normalized.get("translated_reply_text"),
+                    "correction": repaired.get("correction", ""),
+                    "explanation": repaired.get("explanation", ""),
+                    "example": repaired.get("example", ""),
+                    "score": repaired.get("score", normalized.get("score", 70)),
+                },
+                user_message,
+                reply_language,
+                translation_language,
+            )
+            if not user_analysis_needs_repair(merged, user_message):
+                logger.info("Repaired learner analysis successfully")
+                return merged
+    except Exception as e:
+        logger.warning("Learner analysis repair failed: %s", e)
+
+    candidate = extract_correction_candidate_from_reply(normalized.get("reply_text", ""), user_message)
+    if candidate:
+        fallback = {
+            **normalized,
+            "correction": candidate,
+            "explanation": normalized.get("explanation", ""),
+            "example": normalized.get("example", ""),
+        }
+        if not user_analysis_needs_repair(fallback, user_message):
+            logger.info("Recovered learner correction from assistant reply fallback")
+            return fallback
+    return normalized
+
+
+def _build_response_with_translation(
+    ai_response: Dict[str, any],
+    reply_language: str,
+    translation_language: Optional[str],
+) -> Dict[str, any]:
+    """Attach translated display text after LLM finalization using the translation backend."""
+    return attach_translated_reply_text(ai_response, reply_language, translation_language)
+
+
 def stream_gemini_tokens(
     user_message: str,
     conversation_history: List[Dict[str, str]],
-    response_language: str = "en",
+    reply_language: str = "en",
+    translation_language: Optional[str] = None,
     long_term_context: Optional[str] = None,
 ) -> Iterator[str]:
     """
     Stream Gemini response as text deltas (tokens). No caching.
-    No JSON mode for stream; caller parses full reply with parse_gemini_response (tries JSON then fallback).
+    Uses the same JSON contract as sync generation so reply_text and learner analysis stay aligned.
     """
     if conversation_history is None:
         conversation_history = []
     try:
         client = _get_gemini_client()
-        system_instruction = get_system_instruction(response_language, long_term_context)
+        system_instruction = get_system_instruction(reply_language, translation_language, long_term_context)
         contents = _build_trimmed_contents(
             conversation_history,
             user_message,
@@ -234,6 +399,8 @@ def stream_gemini_tokens(
         config_dict = {
             "thinking_config": genai.types.ThinkingConfig(thinking_budget=0),
             "system_instruction": system_instruction,
+            "response_mime_type": "application/json",
+            "response_json_schema": LLMReplySchema.model_json_schema(),
             "max_output_tokens": settings.llm_max_tokens,
             "temperature": settings.llm_temperature,
         }
@@ -271,7 +438,8 @@ def stream_gemini_tokens(
 def generate_reply(
     user_message: str,
     conversation_history: List[Dict[str, str]] = None,
-    response_language: str = "en",
+    reply_language: str = "en",
+    translation_language: Optional[str] = None,
     long_term_context: Optional[str] = None,
 ) -> Dict[str, any]:
     """
@@ -280,7 +448,8 @@ def generate_reply(
     Args:
         user_message: User's message
         conversation_history: Previous messages for context (LLM layer trims by token budget)
-        response_language: "en" for English-only, or "hi"/"ml"/"ta"/etc. for full Indic response
+        reply_language: "en" for English-only, or "hi"/"ml"/"ta"/etc. for full Indic response
+        translation_language: Optional display translation language for translated_reply_text
         long_term_context: Optional learner context injected into system instruction every turn
 
     Returns:
@@ -300,15 +469,22 @@ def generate_reply(
         )
         # Cache key from trimmed history actually sent so cache matches what model saw
         trimmed_history = _contents_to_history_for_cache(contents)
-        cache_key = _generate_cache_key(user_message, trimmed_history, response_language)
+        cache_key = _generate_cache_key(user_message, trimmed_history, reply_language)
         if long_term_context:
             cache_key = cache_key + ":" + hashlib.md5(long_term_context.encode()).hexdigest()
         cached_response = get_json(cache_key)
         if cached_response:
             logger.info("Cache hit for LLM response")
-            return cached_response
+            return _build_response_with_translation(
+                {
+                    **cached_response,
+                    "translated_reply_text": None,
+                },
+                reply_language,
+                translation_language,
+            )
 
-        system_instruction = get_system_instruction(response_language, long_term_context)
+        system_instruction = get_system_instruction(reply_language, translation_language, long_term_context)
 
         logger.info(f"Calling Gemini LLM API with model: {settings.llm_model}")
 
@@ -398,27 +574,59 @@ def generate_reply(
             logger.warning(f"Full response text: {response_text}")
         
         # Parse response (JSON from Gemini)
-        parsed = parse_gemini_response(response_text)
+        parsed = finalize_llm_reply(
+            parse_gemini_response(response_text),
+            user_message,
+            reply_language,
+            translation_language,
+        )
         
-        # Cache result
-        set_json(cache_key, parsed, settings.llm_cache_ttl)
-        return parsed
+        # Cache LLM output only; translated display text is cached separately by translation backend.
+        set_json(
+            cache_key,
+            {
+                **parsed,
+                "translated_reply_text": None,
+            },
+            settings.llm_cache_ttl,
+        )
+        return _build_response_with_translation(parsed, reply_language, translation_language)
         
     except ValueError as e:
         logger.error(f"Gemini LLM validation error: {e}")
-        return {
-            "reply_text": "I'm having trouble responding right now. Please try again in a moment.",
-            "correction": "",
-            "explanation": "",
-            "example": "",
-            "score": 0
-        }
+        return _build_response_with_translation(
+            finalize_llm_reply(
+                {
+                    "reply_text": "I'm having trouble responding right now. Please try again in a moment.",
+                    "translated_reply_text": None,
+                    "correction": "",
+                    "explanation": "",
+                    "example": "",
+                    "score": 0,
+                },
+                user_message,
+                reply_language,
+                translation_language,
+            ),
+            reply_language,
+            translation_language,
+        )
     except Exception as e:
         logger.error(f"Unexpected Gemini LLM error: {e}", exc_info=True)
-        return {
-            "reply_text": "Something went wrong. Please try again.",
-            "correction": "",
-            "explanation": "",
-            "example": "",
-            "score": 0
-        }
+        return _build_response_with_translation(
+            finalize_llm_reply(
+                {
+                    "reply_text": "Something went wrong. Please try again.",
+                    "translated_reply_text": None,
+                    "correction": "",
+                    "explanation": "",
+                    "example": "",
+                    "score": 0,
+                },
+                user_message,
+                reply_language,
+                translation_language,
+            ),
+            reply_language,
+            translation_language,
+        )

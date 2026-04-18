@@ -26,6 +26,7 @@ from app.core.security import create_access_token, create_refresh_token, verify_
 from app.core.security import REFRESH_TOKEN_TYPE
 from app.services.auth_service import get_or_create_user, verify_google_token, verify_apple_token
 from app.services.subscription_service import resolve_user_plan
+from app.utils.language import normalize_language_code
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +70,8 @@ async def oauth_login(
             id=user.id,
             email=user.email,
             name=user.name,
+            native_language=user.native_language,
+            native_language_code=user.native_language_code,
             onboarding_completed=user.onboarding_completed,
             onboarding_step=user.onboarding_step,
             plan=plan,
@@ -108,6 +111,8 @@ async def me(
         id=current_user.id,
         email=current_user.email,
         name=current_user.name,
+        native_language=current_user.native_language,
+        native_language_code=current_user.native_language_code,
         onboarding_completed=current_user.onboarding_completed,
         onboarding_step=current_user.onboarding_step,
         plan=plan,
@@ -174,6 +179,7 @@ async def onboarding_language(
 ) -> dict[str, int]:
     """Step 2: set native language."""
     current_user.native_language = body.native_language
+    current_user.native_language_code = normalize_language_code(body.native_language)
     current_user.onboarding_step = 2
     db.commit()
     db.refresh(current_user)

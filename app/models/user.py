@@ -24,6 +24,7 @@ class User(Base):
     # Onboarding (step 0 = not started, 1-5 = step completed; 5 => onboarding_completed = True)
     nickname = Column(String(100), nullable=True)
     native_language = Column(String(100), nullable=True)
+    native_language_code = Column(String(16), nullable=True)
     student_type = Column(String(32), nullable=True)  # adult | kid
     occupation = Column(String(32), nullable=True)  # college | work | home_maker | teacher | other
     goal = Column(String(64), nullable=True)

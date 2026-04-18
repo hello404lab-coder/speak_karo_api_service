@@ -40,9 +40,9 @@ def transcribe(
                 "response_format": "verbose_json",
                 "temperature": 0.0,
                 "timestamp_granularities": ["word", "segment"],
-                "extra_body": {
-                    "logprobs": True 
-                }
+                # "extra_body": {
+                #     "logprobs": True 
+                # }
             }
             if language_hint:
                 kwargs["language"] = language_hint

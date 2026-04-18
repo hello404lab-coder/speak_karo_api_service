@@ -2,13 +2,18 @@
 import json
 import logging
 from typing import Optional
-import redis
+try:
+    import redis
+except ImportError:  # pragma: no cover - exercised via graceful fallback in runtime/test envs
+    redis = None
 from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
 # Redis client (with graceful degradation)
 try:
+    if redis is None:
+        raise ImportError("redis package is not installed")
     redis_client = redis.from_url(settings.redis_url, decode_responses=True)
     redis_client.ping()  # Test connection
     redis_available = True

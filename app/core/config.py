@@ -75,6 +75,32 @@ class Settings(BaseSettings):
     llm_context_token_budget: int = 16384
     # DB layer: max exchanges to load from conversation (actual context length controlled by token budget)
     llm_history_max_exchanges: int = 10
+
+    # Translation Settings - Google Cloud Translation Advanced v3
+    translation_provider: Literal["google_cloud", "disabled"] = Field(
+        default="google_cloud",
+        description="TRANSLATION_PROVIDER: assistant reply translation backend",
+    )
+    translation_api_key: Optional[str] = Field(
+        default=None,
+        description="TRANSLATION_API_KEY: Google Cloud Translation API key for Basic v2 text translation",
+    )
+    translation_google_project_id: Optional[str] = Field(
+        default=None,
+        description="TRANSLATION_GOOGLE_PROJECT_ID: optional GCP project id override for Cloud Translation",
+    )
+    translation_google_location: str = Field(
+        default="global",
+        description="TRANSLATION_GOOGLE_LOCATION: Cloud Translation location (global unless using region-specific resources)",
+    )
+    translation_timeout_seconds: int = Field(
+        default=10,
+        description="TRANSLATION_TIMEOUT_SECONDS: HTTP timeout in seconds for Cloud Translation",
+    )
+    translation_cache_ttl: int = Field(
+        default=604800,
+        description="TRANSLATION_CACHE_TTL: cache TTL for assistant reply translations",
+    )
     
     # STT Settings
     stt_mode: Literal["faster_whisper_medium", "faster_whisper_large", "openai_whisper_large_v3"] = "faster_whisper_large"  # Env: STT_MODE (used only when stt_whisper_local_enabled=True)

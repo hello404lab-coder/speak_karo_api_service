@@ -18,6 +18,8 @@ class UserResponse(BaseModel):
     id: str = Field(..., description="User UUID")
     email: str = Field(..., description="User email")
     name: str | None = Field(None, description="Display name")
+    native_language: str | None = Field(None, description="Learner's native language as entered during onboarding")
+    native_language_code: str | None = Field(None, description="Normalized native language code used for translation defaults")
     onboarding_completed: bool = Field(default=False, description="Whether user finished onboarding")
     onboarding_step: int = Field(default=0, description="Current onboarding step (0-5)")
     plan: str = Field(default="free", description="Resolved plan: free, trial, or premium")

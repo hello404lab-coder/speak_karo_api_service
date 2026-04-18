@@ -3,6 +3,7 @@ from datetime import datetime
 from typing import Literal, Optional
 
 from pydantic import BaseModel, Field
+from app.schemas.ai import UserAnalysis
 
 
 class ConversationListItem(BaseModel):
@@ -36,11 +37,11 @@ class ChatMessage(BaseModel):
     role: Literal["user", "assistant"] = Field(..., description="Message role")
     content: Optional[str] = Field(None, description="User message text (role=user)")
     user_audio_url: Optional[str] = Field(None, description="URL of user voice recording (role=user, voice-chat only)")
+    user_analysis: Optional[UserAnalysis] = Field(None, description="Feedback attached to the learner's message (role=user)")
     reply_text: Optional[str] = Field(None, description="Assistant reply (role=assistant)")
-    correction: Optional[str] = Field(None, description="Correction text (role=assistant)")
-    explanation: Optional[str] = Field(None, description="Short explanation (role=assistant)")
-    example: Optional[str] = Field(None, description="Example sentence (role=assistant)")
-    score: Optional[int] = Field(None, ge=0, le=100, description="Score 0-100 (role=assistant)")
+    translated_reply_text: Optional[str] = Field(None, description="Translated assistant reply (role=assistant)")
+    reply_language: Optional[str] = Field(None, description="Language code for assistant reply text (role=assistant)")
+    translation_language: Optional[str] = Field(None, description="Language code for translated assistant reply (role=assistant)")
     created_at: datetime = Field(..., description="Message timestamp")
 
 

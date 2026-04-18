@@ -20,11 +20,12 @@ from app.database import get_db
 from app.dependencies.auth import get_current_user
 from app.dependencies.subscription import require_active_plan
 from app.schemas.ai import TextChatRequest, AIChatResponse, TTSStreamRequest
-from app.services.llm import generate_reply, stream_gemini_tokens, init_llm_client
+from app.services.llm import finalize_llm_reply, generate_reply, init_llm_client, stream_gemini_tokens
 from app.services.stt import transcribe_audio, init_stt_models
+from app.services.translation import attach_translated_reply_text
 from app.services.tts import text_to_speech_stream, store_audio_mp3, store_user_voice_wav, generate_tts_bytes, feed_tts_stream_to_queue, init_tts_models
 from app.services.subscription_service import update_usage_stats
-from app.utils.language import resolve_response_language
+from app.utils.language import resolve_reply_language, resolve_translation_language
 from app.models.usage import Conversation, Message
 from app.models.user import User
 
@@ -101,6 +102,126 @@ def get_conversation_history(conversation_id: str, db: Session) -> list:
     return history
 
 
+def _build_user_analysis_payload(ai_response: dict) -> dict:
+    """Normalize learner feedback into the nested API shape."""
+    score = ai_response.get("score", 75)
+    if not isinstance(score, int):
+        try:
+            score = int(score) if score is not None else 75
+        except (TypeError, ValueError):
+            score = 75
+    score = max(0, min(100, score))
+    return {
+        "correction": ai_response.get("correction", "") or "",
+        "explanation": ai_response.get("explanation") or None,
+        "example": ai_response.get("example") or None,
+        "score": score,
+    }
+
+
+def _resolve_turn_languages(
+    text: str,
+    detected_lang: Optional[str],
+    reply_language_override: Optional[str],
+    response_language_override: Optional[str],
+    translation_language_override: Optional[str],
+    current_user: User,
+) -> tuple[str, Optional[str]]:
+    """Resolve reply/TTS language and optional assistant translation language for the turn."""
+    reply_language = resolve_reply_language(
+        text,
+        detected_lang,
+        reply_language_override or response_language_override,
+    )
+    translation_language = resolve_translation_language(
+        translation_language_override,
+        current_user.native_language_code or current_user.native_language,
+        reply_language,
+    )
+    return reply_language, translation_language
+
+
+def _save_exchange_message(
+    db: Session,
+    conversation: Conversation,
+    user_message: str,
+    ai_response: dict,
+    reply_language: str,
+    translation_language: Optional[str],
+    user_audio_url: Optional[str] = None,
+) -> Message:
+    """Persist one user/assistant exchange."""
+    message = Message(
+        conversation_id=conversation.id,
+        user_message=user_message,
+        ai_reply=ai_response["reply_text"],
+        reply_language=reply_language,
+        translated_ai_reply=ai_response.get("translated_reply_text"),
+        translation_language_code=translation_language,
+        correction=ai_response.get("correction", ""),
+        hinglish_explanation=ai_response.get("explanation", ""),
+        example=ai_response.get("example", ""),
+        score=ai_response.get("score", 0),
+        user_audio_url=user_audio_url,
+    )
+    db.add(message)
+    conversation.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(message)
+    logger.info(
+        "Message saved for conversation %s",
+        conversation.id,
+        extra={"conversation_id": conversation.id, "message_id": message.id},
+    )
+    return message
+
+
+def _build_ai_chat_response(
+    ai_response: dict,
+    conversation_id: str,
+    reply_language: str,
+    translation_language: Optional[str],
+) -> AIChatResponse:
+    """Build the sync response payload while preserving flat compatibility fields."""
+    user_analysis = _build_user_analysis_payload(ai_response)
+    return AIChatResponse(
+        reply_text=ai_response["reply_text"],
+        translated_reply_text=ai_response.get("translated_reply_text"),
+        reply_language=reply_language,
+        translation_language=translation_language,
+        user_analysis=user_analysis,
+        correction=user_analysis["correction"],
+        explanation=user_analysis["explanation"],
+        example=user_analysis["example"],
+        score=user_analysis["score"],
+        audio_url=None,
+        response_language=reply_language,
+        conversation_id=conversation_id,
+    )
+
+
+def _build_stream_metadata_payload(
+    ai_response: dict,
+    conversation_id: str,
+    reply_language: str,
+    translation_language: Optional[str],
+) -> dict:
+    """Build final SSE metadata payload for the completed turn."""
+    user_analysis = _build_user_analysis_payload(ai_response)
+    return {
+        "translated_reply_text": ai_response.get("translated_reply_text"),
+        "reply_language": reply_language,
+        "translation_language": translation_language,
+        "user_analysis": user_analysis,
+        "correction": user_analysis["correction"],
+        "explanation": user_analysis["explanation"],
+        "example": user_analysis["example"],
+        "score": user_analysis["score"],
+        "conversation_id": conversation_id,
+        "response_language": reply_language,
+    }
+
+
 def _run_init_models_sync() -> dict:
     """Run all model initializers sequentially (called from thread)."""
     stt = init_stt_models()
@@ -155,9 +276,13 @@ async def text_chat(
         # Get conversation history for context
         history = get_conversation_history(conversation.id, db)
 
-        # Response language: optional client override, else script detection (no STT)
-        response_language = resolve_response_language(
-            request.message, None, request.response_language
+        reply_language, translation_language = _resolve_turn_languages(
+            request.message,
+            None,
+            request.reply_language,
+            request.response_language,
+            request.translation_language,
+            current_user,
         )
 
         # Run sync inference in thread pool with timeouts so event loop is not blocked
@@ -167,7 +292,8 @@ async def text_chat(
                     generate_reply,
                     request.message,
                     history,
-                    response_language,
+                    reply_language,
+                    translation_language,
                     long_term_context=conversation.long_term_context,
                 ),
                 timeout=float(settings.llm_timeout_seconds),
@@ -175,35 +301,23 @@ async def text_chat(
         except asyncio.TimeoutError:
             logger.warning("LLM request timed out")
             raise HTTPException(status_code=504, detail=TIMEOUT_MESSAGE)
-
-        # Save message to database
-        message = Message(
-            conversation_id=conversation.id,
-            user_message=request.message,
-            ai_reply=ai_response["reply_text"],
-            correction=ai_response.get("correction", ""),
-            hinglish_explanation=ai_response.get("explanation", ""),
-            example=ai_response.get("example", ""),
-            score=ai_response.get("score", 0)
+        _save_exchange_message(
+            db,
+            conversation,
+            request.message,
+            ai_response,
+            reply_language,
+            translation_language,
         )
-        db.add(message)
-        conversation.updated_at = datetime.utcnow()
-        db.commit()
-        db.refresh(message)
-        logger.info("Message saved for conversation %s", conversation.id, extra={"conversation_id": conversation.id, "message_id": message.id})
         
         # Update usage stats
         update_usage_stats(user_id, db, 0.0, "chat")
         
-        return AIChatResponse(
-            reply_text=ai_response["reply_text"],
-            correction=ai_response.get("correction", ""),
-            explanation=ai_response.get("explanation") or None,
-            example=ai_response.get("example") or None,
-            score=ai_response.get("score", 75),
-            audio_url=None,
-            response_language=response_language,
-            conversation_id=conversation.id
+        return _build_ai_chat_response(
+            ai_response,
+            conversation.id,
+            reply_language,
+            translation_language,
         )
         
     except ValueError as e:
@@ -221,6 +335,8 @@ async def voice_chat(
     user_id: str = Form(...),
     conversation_id: Optional[str] = Form(None),
     learner_context: Optional[str] = Form(None),
+    reply_language: Optional[str] = Form(None),
+    translation_language: Optional[str] = Form(None),
     response_language: Optional[str] = Form(None),
     audio_file: UploadFile = File(...),
     stt_mode: Optional[str] = Form(None),
@@ -265,9 +381,13 @@ async def voice_chat(
         # Get conversation history
         history = get_conversation_history(conversation.id, db)
 
-        # Response language: optional client override, else STT + script detection
-        resolved_language = resolve_response_language(
-            transcribed_text, detected_lang, response_language
+        reply_language_resolved, translation_language_resolved = _resolve_turn_languages(
+            transcribed_text,
+            detected_lang,
+            reply_language,
+            response_language,
+            translation_language,
+            current_user,
         )
 
         user_audio_url_sync: Optional[str] = None
@@ -285,7 +405,8 @@ async def voice_chat(
                     generate_reply,
                     transcribed_text,
                     history,
-                    resolved_language,
+                    reply_language_resolved,
+                    translation_language_resolved,
                     long_term_context=conversation.long_term_context,
                 ),
                 timeout=float(settings.llm_timeout_seconds),
@@ -293,35 +414,23 @@ async def voice_chat(
         except asyncio.TimeoutError:
             logger.warning("LLM request timed out")
             raise HTTPException(status_code=504, detail=TIMEOUT_MESSAGE)
-
-        # Save message to database
-        message = Message(
-            conversation_id=conversation.id,
-            user_message=transcribed_text,
-            ai_reply=ai_response["reply_text"],
-            correction=ai_response.get("correction", ""),
-            hinglish_explanation=ai_response.get("explanation", ""),
-            example=ai_response.get("example", ""),
-            score=ai_response.get("score", 0),
+        _save_exchange_message(
+            db,
+            conversation,
+            transcribed_text,
+            ai_response,
+            reply_language_resolved,
+            translation_language_resolved,
             user_audio_url=user_audio_url_sync,
         )
-        db.add(message)
-        conversation.updated_at = datetime.utcnow()
-        db.commit()
-        db.refresh(message)
-        logger.info("Message saved for conversation %s", conversation.id, extra={"conversation_id": conversation.id, "message_id": message.id})
         
         update_usage_stats(user_id, db, 0.0, "voice")
         
-        return AIChatResponse(
-            reply_text=ai_response["reply_text"],
-            correction=ai_response.get("correction", ""),
-            explanation=ai_response.get("explanation") or None,
-            example=ai_response.get("example") or None,
-            score=ai_response.get("score", 75),
-            audio_url=None,
-            response_language=resolved_language,
-            conversation_id=conversation.id
+        return _build_ai_chat_response(
+            ai_response,
+            conversation.id,
+            reply_language_resolved,
+            translation_language_resolved,
         )
         
     except ValueError as e:
@@ -397,7 +506,8 @@ def _clean_sentence_for_tts(s: str) -> str:
 async def _llm_tts_streaming_pipeline(
     user_message: str,
     history: list,
-    response_language: str,
+    reply_language: str,
+    translation_language: Optional[str],
     conversation: Conversation,
     db: Session,
     user_id: str,
@@ -420,7 +530,11 @@ async def _llm_tts_streaming_pipeline(
     def gemini_producer() -> None:
         try:
             for token in stream_gemini_tokens(
-                user_message, history, response_language, long_term_context=long_term_context
+                user_message,
+                history,
+                reply_language,
+                translation_language,
+                long_term_context=long_term_context,
             ):
                 loop.call_soon_threadsafe(token_queue.put_nowait, token)
             loop.call_soon_threadsafe(token_queue.put_nowait, None)
@@ -531,7 +645,7 @@ async def _llm_tts_streaming_pipeline(
                     main_queue.put_nowait((None, None))
                     return
                 try:
-                    wav_bytes = await asyncio.to_thread(generate_tts_bytes, sentence, response_language)
+                    wav_bytes = await asyncio.to_thread(generate_tts_bytes, sentence, reply_language)
                     main_queue.put_nowait(("audio", wav_bytes))
                 except Exception as e:
                     logger.exception("TTS worker error")
@@ -578,26 +692,39 @@ async def _llm_tts_streaming_pipeline(
     # Parse full LLM response -> metadata event -> DB save
     if full_reply_text:
         try:
-            parsed = parse_gemini_response(full_reply_text)
+            parsed_base = await asyncio.to_thread(
+                finalize_llm_reply,
+                parse_gemini_response(full_reply_text),
+                user_message,
+                reply_language,
+                translation_language,
+            )
+            parsed = await asyncio.to_thread(
+                attach_translated_reply_text,
+                parsed_base,
+                reply_language,
+                translation_language,
+            )
             yield (
                 f"event: metadata\ndata: "
-                f"{json.dumps({'correction': parsed.get('correction', ''), 'explanation': parsed.get('explanation', ''), 'example': parsed.get('example', ''), 'score': parsed.get('score', 75), 'conversation_id': conversation.id, 'response_language': response_language})}\n\n"
+                f"{json.dumps(_build_stream_metadata_payload(parsed, conversation.id, reply_language, translation_language))}\n\n"
             )
-            msg = Message(
-                conversation_id=conversation.id,
-                user_message=user_message,
-                ai_reply=parsed.get("reply_text", ""),
-                correction=parsed.get("correction", ""),
-                hinglish_explanation=parsed.get("explanation", ""),
-                example=parsed.get("example", ""),
-                score=parsed.get("score", 75),
+            _save_exchange_message(
+                db,
+                conversation,
+                user_message,
+                {
+                    "reply_text": parsed.get("reply_text", ""),
+                    "translated_reply_text": parsed.get("translated_reply_text"),
+                    "correction": parsed.get("correction", ""),
+                    "explanation": parsed.get("explanation", ""),
+                    "example": parsed.get("example", ""),
+                    "score": parsed.get("score", 75),
+                },
+                reply_language,
+                translation_language,
                 user_audio_url=user_audio_url,
             )
-            db.add(msg)
-            conversation.updated_at = datetime.utcnow()
-            db.commit()
-            db.refresh(msg)
-            logger.info("Message saved for conversation %s", conversation.id, extra={"conversation_id": conversation.id, "message_id": msg.id})
             update_usage_stats(user_id, db, 0.0, usage_type)
         except Exception as e:
             logger.exception("streaming pipeline save error: %s", e)
@@ -633,11 +760,24 @@ async def chat_stream(
         user_id, request.conversation_id, db, learner_context=request.learner_context
     )
     history = get_conversation_history(conversation.id, db)
-    response_language = resolve_response_language(message, None, request.response_language)
+    reply_language, translation_language = _resolve_turn_languages(
+        message,
+        None,
+        request.reply_language,
+        request.response_language,
+        request.translation_language,
+        current_user,
+    )
 
     return StreamingResponse(
         _llm_tts_streaming_pipeline(
-            message, history, response_language, conversation, db, user_id,
+            message,
+            history,
+            reply_language,
+            translation_language,
+            conversation,
+            db,
+            user_id,
             long_term_context=conversation.long_term_context,
             usage_type="chat",
         ),
@@ -706,6 +846,8 @@ async def voice_chat_stream(
     user_id: str = Form(...),
     conversation_id: Optional[str] = Form(None),
     learner_context: Optional[str] = Form(None),
+    reply_language: Optional[str] = Form(None),
+    translation_language: Optional[str] = Form(None),
     response_language: Optional[str] = Form(None),
     audio_file: UploadFile = File(...),
     db: Session = Depends(get_db),
@@ -735,8 +877,13 @@ async def voice_chat_stream(
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-    resolved_language = resolve_response_language(
-        transcribed_text, detected_lang, response_language
+    reply_language_resolved, translation_language_resolved = _resolve_turn_languages(
+        transcribed_text,
+        detected_lang,
+        reply_language,
+        response_language,
+        translation_language,
+        current_user,
     )
     conversation = get_or_create_conversation(user_id, conversation_id, db, learner_context=learner_context)
     history = get_conversation_history(conversation.id, db)
@@ -754,10 +901,16 @@ async def voice_chat_stream(
     async def event_gen():
         yield (
             f"event: stt_result\ndata: "
-            f"{json.dumps({'text': transcribed_text, 'detected_lang': detected_lang, 'response_language': resolved_language})}\n\n"
+            f"{json.dumps({'text': transcribed_text, 'detected_lang': detected_lang, 'response_language': reply_language_resolved, 'reply_language': reply_language_resolved, 'translation_language': translation_language_resolved})}\n\n"
         )
         async for chunk in _llm_tts_streaming_pipeline(
-            transcribed_text, history, resolved_language, conversation, db, user_id,
+            transcribed_text,
+            history,
+            reply_language_resolved,
+            translation_language_resolved,
+            conversation,
+            db,
+            user_id,
             long_term_context=conversation.long_term_context,
             usage_type="voice",
             user_audio_url=user_audio_url,

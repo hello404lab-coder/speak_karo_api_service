@@ -10,6 +10,11 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import and_, or_
 from sqlalchemy.orm import Session
 
+from app.core.prompts import (
+    build_display_correction,
+    extract_correction_candidate_from_reply,
+    user_analysis_needs_repair,
+)
 from app.database import get_db
 from app.dependencies.auth import get_current_user
 from app.dependencies.subscription import require_active_plan
@@ -34,6 +39,48 @@ MAX_MESSAGES_LIMIT = 50
 
 # Namespace for deterministic message UUIDs (user/assistant per row)
 MESSAGE_IDS_NAMESPACE = uuid.uuid5(uuid.NAMESPACE_DNS, "ai-english-practice.messages")
+
+
+def _build_user_analysis(row: Message) -> dict:
+    """Build nested learner feedback from a stored message row."""
+    analysis = {
+        "correction": row.correction or build_display_correction(row.user_message),
+        "explanation": row.hinglish_explanation or None,
+        "example": row.example or None,
+        "score": row.score if row.score is not None else 75,
+    }
+    if not user_analysis_needs_repair(
+        {
+            "reply_text": row.ai_reply or "",
+            "correction": analysis["correction"],
+            "explanation": analysis["explanation"] or "",
+            "example": analysis["example"] or "",
+            "score": analysis["score"],
+        },
+        row.user_message or "",
+    ):
+        return analysis
+
+    extracted = extract_correction_candidate_from_reply(row.ai_reply or "", row.user_message or "")
+    if extracted:
+        analysis["correction"] = extracted
+        if not user_analysis_needs_repair(
+            {
+                "reply_text": row.ai_reply or "",
+                "correction": analysis["correction"],
+                "explanation": analysis["explanation"] or "",
+                "example": analysis["example"] or "",
+                "score": analysis["score"],
+            },
+            row.user_message or "",
+        ):
+            return analysis
+
+    analysis["correction"] = build_display_correction(row.user_message)
+    if analysis["explanation"] and analysis["correction"].strip() == (row.user_message or "").strip():
+        analysis["explanation"] = None
+        analysis["example"] = None
+    return analysis
 
 
 def _encode_cursor(created_at: datetime, message_id: str) -> str:
@@ -180,11 +227,11 @@ def list_messages(
                 role="user",
                 content=row.user_message,
                 user_audio_url=row.user_audio_url,
+                user_analysis=_build_user_analysis(row),
                 reply_text=None,
-                correction=None,
-                explanation=None,
-                example=None,
-                score=None,
+                translated_reply_text=None,
+                reply_language=None,
+                translation_language=None,
                 created_at=row.created_at,
             )
         )
@@ -195,11 +242,11 @@ def list_messages(
                 role="assistant",
                 content=None,
                 user_audio_url=None,
+                user_analysis=None,
                 reply_text=row.ai_reply,
-                correction=row.correction,
-                explanation=row.hinglish_explanation,
-                example=row.example,
-                score=row.score,
+                translated_reply_text=row.translated_ai_reply,
+                reply_language=row.reply_language,
+                translation_language=row.translation_language_code,
                 created_at=row.created_at,
             )
         )
