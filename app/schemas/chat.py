@@ -34,6 +34,7 @@ class ChatMessage(BaseModel):
     """Single message in chat history (user or assistant)."""
     index: int = Field(..., ge=0, description="Zero-based display order. Always sort by this field; do not use id for ordering.")
     id: str = Field(..., description="Stable UUID for this message (e.g. React keys). Use index for ordering.")
+    client_turn_id: Optional[str] = Field(None, description="Optional client-generated turn id shared by the user and assistant messages for one exchange.")
     role: Literal["user", "assistant"] = Field(..., description="Message role")
     content: Optional[str] = Field(None, description="User message text (role=user)")
     user_audio_url: Optional[str] = Field(None, description="URL of user voice recording (role=user, voice-chat only)")

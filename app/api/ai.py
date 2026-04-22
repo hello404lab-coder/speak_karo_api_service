@@ -7,7 +7,7 @@ import logging
 import re
 import threading
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Literal, Optional
 from io import BytesIO
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, Response, status
@@ -158,6 +158,12 @@ def _build_user_analysis_payload(ai_response: dict) -> dict:
     }
 
 
+def _iso_z(dt: datetime) -> str:
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z")
+    return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
 def _resolve_turn_languages(
     text: str,
     detected_lang: Optional[str],
@@ -187,6 +193,8 @@ def _save_exchange_message(
     ai_response: dict,
     reply_language: str,
     translation_language: Optional[str],
+    client_turn_id: Optional[str] = None,
+    created_at: Optional[datetime] = None,
     user_audio_url: Optional[str] = None,
     voice_draft: Optional[VoiceInputDraft] = None,
 ) -> Message:
@@ -204,6 +212,7 @@ def _save_exchange_message(
 
     message = Message(
         conversation_id=conversation.id,
+        client_turn_id=client_turn_id,
         user_message=user_message,
         ai_reply=ai_response["reply_text"],
         reply_language=reply_language,
@@ -213,6 +222,7 @@ def _save_exchange_message(
         hinglish_explanation=ai_response.get("explanation", ""),
         example=ai_response.get("example", ""),
         score=ai_response.get("score", 0),
+        created_at=created_at or datetime.utcnow(),
         user_audio_url=resolved_user_audio_url,
     )
     db.add(message)
@@ -254,11 +264,13 @@ def _build_ai_chat_response(
     conversation_id: str,
     reply_language: str,
     translation_language: Optional[str],
+    client_turn_id: Optional[str] = None,
 ) -> AIChatResponse:
     """Build the sync response payload while preserving flat compatibility fields."""
     user_analysis = _build_user_analysis_payload(ai_response)
     return AIChatResponse(
         reply_text=ai_response["reply_text"],
+        client_turn_id=client_turn_id,
         translated_reply_text=ai_response.get("translated_reply_text"),
         reply_language=reply_language,
         translation_language=translation_language,
@@ -278,6 +290,7 @@ def _build_stream_metadata_payload(
     conversation_id: str,
     reply_language: str,
     translation_language: Optional[str],
+    client_turn_id: Optional[str] = None,
 ) -> dict:
     """Build final SSE metadata payload for the completed turn."""
     user_analysis = _build_user_analysis_payload(ai_response)
@@ -291,6 +304,7 @@ def _build_stream_metadata_payload(
         "example": user_analysis["example"],
         "score": user_analysis["score"],
         "conversation_id": conversation_id,
+        "client_turn_id": client_turn_id,
         "response_language": reply_language,
     }
 
@@ -387,6 +401,7 @@ async def text_chat(
             ai_response,
             reply_language,
             translation_language,
+            client_turn_id=request.client_turn_id,
             voice_draft=voice_draft,
         )
         
@@ -398,6 +413,7 @@ async def text_chat(
             conversation.id,
             reply_language,
             translation_language,
+            client_turn_id=request.client_turn_id,
         )
         
     except ValueError as e:
@@ -694,6 +710,8 @@ async def _llm_tts_streaming_pipeline(
     user_id: str,
     long_term_context: Optional[str] = None,
     usage_type: Literal["chat", "voice"] = "chat",
+    client_turn_id: Optional[str] = None,
+    created_at: Optional[datetime] = None,
     user_audio_url: Optional[str] = None,
     voice_draft: Optional[VoiceInputDraft] = None,
 ):
@@ -889,7 +907,7 @@ async def _llm_tts_streaming_pipeline(
             )
             yield (
                 f"event: metadata\ndata: "
-                f"{json.dumps(_build_stream_metadata_payload(parsed, conversation.id, reply_language, translation_language))}\n\n"
+                f"{json.dumps(_build_stream_metadata_payload(parsed, conversation.id, reply_language, translation_language, client_turn_id=client_turn_id))}\n\n"
             )
             _save_exchange_message(
                 db,
@@ -905,6 +923,8 @@ async def _llm_tts_streaming_pipeline(
                 },
                 reply_language,
                 translation_language,
+                client_turn_id=client_turn_id,
+                created_at=created_at,
                 user_audio_url=user_audio_url,
                 voice_draft=voice_draft,
             )
@@ -933,7 +953,7 @@ async def chat_stream(
 ):
     """
     Sentence-level pipelined chat (text input): LLM stream -> sentence buffer -> TTS per sentence.
-    SSE events: text_chunk, audio_chunk, metadata, done, audio_ready.
+    SSE events: turn_ack, text_chunk, audio_chunk, metadata, done, audio_ready.
     """
     if not current_user.onboarding_completed:
         raise HTTPException(status_code=403, detail=ONBOARDING_REQUIRED_MESSAGE)
@@ -957,9 +977,18 @@ async def chat_stream(
         request.translation_language,
         current_user,
     )
+    turn_created_at = datetime.now(timezone.utc)
+    turn_ack_payload = {
+        "conversation_id": conversation.id,
+        "client_turn_id": request.client_turn_id,
+        "created_at": _iso_z(turn_created_at),
+        "reply_language": reply_language,
+        "translation_language": translation_language,
+    }
 
-    return StreamingResponse(
-        _llm_tts_streaming_pipeline(
+    async def event_gen():
+        yield f"event: turn_ack\ndata: {json.dumps(turn_ack_payload)}\n\n"
+        async for chunk in _llm_tts_streaming_pipeline(
             message,
             history,
             reply_language,
@@ -969,8 +998,14 @@ async def chat_stream(
             user_id,
             long_term_context=conversation.long_term_context,
             usage_type="voice" if voice_draft else "chat",
+            client_turn_id=request.client_turn_id,
+            created_at=turn_created_at.replace(tzinfo=None),
             voice_draft=voice_draft,
-        ),
+        ):
+            yield chunk
+
+    return StreamingResponse(
+        event_gen(),
         media_type="text/event-stream",
         headers=SSE_HEADERS,
     )

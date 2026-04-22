@@ -16,6 +16,10 @@ class TextChatRequest(BaseModel):
     """Request schema for text chat endpoint."""
     user_id: str = Field(..., description="User identifier")
     message: str = Field(..., min_length=1, max_length=1000, description="User message")
+    client_turn_id: Optional[str] = Field(
+        None,
+        description="Optional client-generated UUID used to reconcile optimistic chat state.",
+    )
     conversation_id: Optional[str] = Field(None, description="Optional conversation ID for context")
     learner_context: Optional[str] = Field(None, description="Optional long-term context (e.g. preparing for IELTS); stored on conversation and injected every turn")
     reply_language: Optional[str] = Field(
@@ -58,6 +62,7 @@ class VoiceChatRequest(BaseModel):
 class AIChatResponse(BaseModel):
     """Response schema for AI chat endpoints."""
     reply_text: str = Field(..., description="AI's natural reply")
+    client_turn_id: Optional[str] = Field(None, description="Echoed client turn identifier when provided")
     translated_reply_text: Optional[str] = Field(None, description="Saved translation of the assistant reply for display")
     reply_language: str = Field(..., description="Language code of the assistant reply")
     translation_language: Optional[str] = Field(None, description="Language code of the translated reply, if present")

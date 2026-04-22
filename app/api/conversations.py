@@ -224,6 +224,7 @@ def list_messages(
             ChatMessage(
                 index=idx * 2,
                 id=user_msg_id,
+                client_turn_id=row.client_turn_id,
                 role="user",
                 content=row.user_message,
                 user_audio_url=row.user_audio_url,
@@ -239,6 +240,7 @@ def list_messages(
             ChatMessage(
                 index=idx * 2 + 1,
                 id=assistant_msg_id,
+                client_turn_id=row.client_turn_id,
                 role="assistant",
                 content=None,
                 user_audio_url=None,

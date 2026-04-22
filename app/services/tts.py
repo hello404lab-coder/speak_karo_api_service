@@ -412,7 +412,8 @@ def _tts_with_gemini(text: str, response_language: str) -> bytes:
         text = text[:4000]
     client = _get_gemini_tts_client()
     lang_code = LANG_TO_BCP47.get(response_language, "en-US")
-    voice_name = getattr(settings, "tts_gemini_voice", "Puck") or "Puck"
+    # voice_name = getattr(settings, "tts_gemini_voice", "Puck") or "Puck"
+    voice_name = "Zephyr"
     model_name = _gemini_tts_model_for_lang(response_language)
     contents = f"Say the following: {text}"
     config = types.GenerateContentConfig(

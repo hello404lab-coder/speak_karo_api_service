@@ -52,6 +52,7 @@ class Message(Base):
 
     id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     conversation_id = Column(String, ForeignKey("conversations.id"), nullable=False, index=True)
+    client_turn_id = Column(String(36), nullable=True, index=True)
     user_message = Column(Text, nullable=False)
     ai_reply = Column(Text, nullable=False)
     reply_language = Column(String(16), nullable=True)
