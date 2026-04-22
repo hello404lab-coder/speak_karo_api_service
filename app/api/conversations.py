@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session
 from app.core.prompts import (
     build_display_correction,
     extract_correction_candidate_from_reply,
+    has_meaningful_correction,
     user_analysis_needs_repair,
 )
 from app.database import get_db
@@ -43,16 +44,23 @@ MESSAGE_IDS_NAMESPACE = uuid.uuid5(uuid.NAMESPACE_DNS, "ai-english-practice.mess
 
 def _build_user_analysis(row: Message) -> dict:
     """Build nested learner feedback from a stored message row."""
+    explanation = row.hinglish_explanation or None
+    example = row.example or None
+    correction = row.correction or ""
+
+    if not correction and (explanation or example):
+        correction = build_display_correction(row.user_message)
+
     analysis = {
-        "correction": row.correction or build_display_correction(row.user_message),
-        "explanation": row.hinglish_explanation or None,
-        "example": row.example or None,
+        "correction": correction if has_meaningful_correction(correction, row.user_message or "", explanation or "", example or "") else None,
+        "explanation": explanation,
+        "example": example,
         "score": row.score if row.score is not None else 75,
     }
     if not user_analysis_needs_repair(
         {
             "reply_text": row.ai_reply or "",
-            "correction": analysis["correction"],
+            "correction": analysis["correction"] or "",
             "explanation": analysis["explanation"] or "",
             "example": analysis["example"] or "",
             "score": analysis["score"],
@@ -63,11 +71,11 @@ def _build_user_analysis(row: Message) -> dict:
 
     extracted = extract_correction_candidate_from_reply(row.ai_reply or "", row.user_message or "")
     if extracted:
-        analysis["correction"] = extracted
+        analysis["correction"] = extracted if has_meaningful_correction(extracted, row.user_message or "", analysis["explanation"] or "", analysis["example"] or "") else None
         if not user_analysis_needs_repair(
             {
                 "reply_text": row.ai_reply or "",
-                "correction": analysis["correction"],
+                "correction": analysis["correction"] or "",
                 "explanation": analysis["explanation"] or "",
                 "example": analysis["example"] or "",
                 "score": analysis["score"],
@@ -76,8 +84,9 @@ def _build_user_analysis(row: Message) -> dict:
         ):
             return analysis
 
-    analysis["correction"] = build_display_correction(row.user_message)
-    if analysis["explanation"] and analysis["correction"].strip() == (row.user_message or "").strip():
+    fallback_correction = build_display_correction(row.user_message)
+    analysis["correction"] = fallback_correction if has_meaningful_correction(fallback_correction, row.user_message or "", analysis["explanation"] or "", analysis["example"] or "") else None
+    if analysis["explanation"] and not analysis["correction"]:
         analysis["explanation"] = None
         analysis["example"] = None
     return analysis

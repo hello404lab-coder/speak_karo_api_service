@@ -20,6 +20,7 @@ pytest==9.0.2
 boto3==1.42.31
 alembic==1.18.1
 google-genai==1.59.0
+google-cloud-texttospeech>=2.28.0
 pydub==0.25.1
 faster-whisper==1.2.1
 # TTS: Chatterbox-Turbo (English). PyPI chatterbox-tts does NOT include tts_turbo; install from GitHub to get ChatterboxTurboTTS.

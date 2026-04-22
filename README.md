@@ -77,6 +77,8 @@ See `.env.example` for all available configuration options. Key variables:
 
 - `APP_ENV`: `dev` or `prod` — controls GPU usage, cache defaults, and strictness (see DEV vs PROD below).
 - `GEMINI_API_KEY`: Google Gemini API key; **required when APP_ENV=prod**.
+- `TTS_CLOUD_PROVIDER`: `gemini` or `chirp3_hd` — selects the cloud TTS backend used when local TTS backends are unavailable or disabled.
+- `TTS_CHIRP_REGION`, `TTS_CHIRP_ENDPOINT`, `TTS_CHIRP_VOICE`, `TTS_CHIRP_SPEAKING_RATE`, `TTS_CHIRP_SAMPLE_RATE_HZ`, `TTS_CHIRP_TIMEOUT_SECONDS`: Chirp 3 HD settings. The backend now defaults Chirp streaming to `PCM` at `44100 Hz`. Chirp uses Google Cloud ADC / service-account credentials plus Cloud Text-to-Speech, not `GEMINI_API_KEY`.
 - `DATABASE_URL`: PostgreSQL or SQLite connection URL. For local dev without PostgreSQL, set `DATABASE_URL=sqlite:///./data/english_practice.sqlite` and run `alembic upgrade head` to create the file and tables.
 - `REDIS_URL`: Redis connection string (optional; cache degrades gracefully if unavailable).
 - `CACHE_ENABLED`: Override cache; in prod defaults to true when unset.
@@ -95,7 +97,7 @@ The app supports two modes via `APP_ENV`:
 | **GEMINI_API_KEY** | Optional (LLM will fail without it) | **Required** — app will not start without it |
 | **Redis / S3** | Optional | Recommended for latency and scalability |
 
-**Production (e.g. RunPod):** Set `APP_ENV=prod`, provide `GEMINI_API_KEY`, and configure Redis and S3. STT uses faster-whisper large-v3 on GPU when available; TTS uses Chatterbox-Turbo and IndicF5 on GPU. Optional Turbo low-latency env vars: `TTS_TURBO_USE_BFLOAT16` (default true on CUDA), `TTS_TURBO_TEMPERATURE`, `TTS_TURBO_TOP_P`, `TTS_TURBO_EXAGGERATION`, `TTS_TURBO_USE_STREAMING` (for forks with `generate_stream`). If throughput drops over long runs, consider worker restart or a fork that clears AlignmentStreamAnalyzer hooks. All inference runs in a thread pool with configurable timeouts; slow requests return 504 with a user-safe message.
+**Production (e.g. RunPod):** Set `APP_ENV=prod`, provide `GEMINI_API_KEY` for Gemini-backed LLM/TTS paths, and configure Redis and S3. STT uses faster-whisper large-v3 on GPU when available; TTS uses Chatterbox-Turbo and IndicF5 on GPU, with `TTS_CLOUD_PROVIDER` selecting the cloud fallback (`gemini` or `chirp3_hd`). Optional Turbo low-latency env vars: `TTS_TURBO_USE_BFLOAT16` (default true on CUDA), `TTS_TURBO_TEMPERATURE`, `TTS_TURBO_TOP_P`, `TTS_TURBO_EXAGGERATION`, `TTS_TURBO_USE_STREAMING` (for forks with `generate_stream`). Chirp 3 HD streaming requires Google Cloud Text-to-Speech credentials via ADC or a service account. All inference runs in a thread pool with configurable timeouts; slow requests return 504 with a user-safe message.
 
 ### Production (RunPod) — GPU Docker and Gunicorn
 

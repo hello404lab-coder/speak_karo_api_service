@@ -183,7 +183,7 @@ def _generate_cache_key(
         + json.dumps(conversation_history, sort_keys=True)
         + (reply_language or "en")
     )
-    return f"llm:v4:{hashlib.md5(context.encode()).hexdigest()}"
+    return f"llm:v5:{hashlib.md5(context.encode()).hexdigest()}"
 
 
 def _generate_analysis_repair_cache_key(user_message: str, ai_response: Dict[str, any]) -> str:
@@ -199,7 +199,7 @@ def _generate_analysis_repair_cache_key(user_message: str, ai_response: Dict[str
         },
         sort_keys=True,
     )
-    return f"llm:analysis-repair:v1:{hashlib.md5(context.encode()).hexdigest()}"
+    return f"llm:analysis-repair:v2:{hashlib.md5(context.encode()).hexdigest()}"
 
 
 def _contents_to_history_for_cache(contents: List[types.Content]) -> List[Dict[str, str]]:
@@ -260,9 +260,9 @@ def _repair_user_analysis(
                         {
                             "learner_message": user_message,
                             "current_analysis": {
-                                "correction": ai_response.get("correction", ""),
-                                "explanation": ai_response.get("explanation", ""),
-                                "example": ai_response.get("example", ""),
+                                "correction": ai_response.get("correction"),
+                                "explanation": ai_response.get("explanation"),
+                                "example": ai_response.get("example"),
                                 "score": ai_response.get("score", 70),
                             },
                         },
@@ -302,9 +302,9 @@ def _repair_user_analysis(
     normalized = {
         "reply_text": ai_response.get("reply_text", ""),
         "translated_reply_text": ai_response.get("translated_reply_text"),
-        "correction": repaired.get("correction", ""),
-        "explanation": repaired.get("explanation", ""),
-        "example": repaired.get("example", ""),
+        "correction": repaired.get("correction"),
+        "explanation": repaired.get("explanation"),
+        "example": repaired.get("example"),
         "score": repaired.get("score", ai_response.get("score", 70)),
     }
     set_json(cache_key, normalized, settings.llm_cache_ttl)
@@ -334,9 +334,9 @@ def finalize_llm_reply(
                 {
                     "reply_text": normalized.get("reply_text", ""),
                     "translated_reply_text": normalized.get("translated_reply_text"),
-                    "correction": repaired.get("correction", ""),
-                    "explanation": repaired.get("explanation", ""),
-                    "example": repaired.get("example", ""),
+                    "correction": repaired.get("correction"),
+                    "explanation": repaired.get("explanation"),
+                    "example": repaired.get("example"),
                     "score": repaired.get("score", normalized.get("score", 70)),
                 },
                 user_message,
@@ -354,8 +354,8 @@ def finalize_llm_reply(
         fallback = {
             **normalized,
             "correction": candidate,
-            "explanation": normalized.get("explanation", ""),
-            "example": normalized.get("example", ""),
+            "explanation": normalized.get("explanation"),
+            "example": normalized.get("example"),
         }
         if not user_analysis_needs_repair(fallback, user_message):
             logger.info("Recovered learner correction from assistant reply fallback")

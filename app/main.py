@@ -120,16 +120,40 @@ async def startup_event():
     else:
         logger.warning("Gemini API key not set. LLM will fail.")
     
-    # Log TTS configuration (English -> Chatterbox-Turbo or Gemini; Indic -> IndicF5 optional then Gemini Flash TTS)
+    cloud_tts_provider = getattr(settings, "tts_cloud_provider", "gemini")
+    chirp_voice = getattr(settings, "tts_chirp_voice", "Charon")
+    chirp_status = {"available": False, "reason": None}
+    if cloud_tts_provider == "chirp3_hd":
+        try:
+            from app.services.tts import chirp_runtime_status
+
+            chirp_status = chirp_runtime_status()
+        except Exception as e:
+            chirp_status = {"available": False, "reason": str(e)}
+    # Log TTS configuration (English -> Chatterbox-Turbo or configured cloud provider; Indic -> IndicF5 optional then configured cloud provider)
     if getattr(settings, "tts_chatterbox_enabled", True):
         audio_prompt_info = f"voice cloning: {settings.tts_audio_prompt_path}" if settings.tts_audio_prompt_path else "not set (required for Turbo)"
         logger.info(f"TTS: English -> Chatterbox-Turbo ({audio_prompt_info})")
     else:
-        logger.info(
-            "TTS: English -> Gemini TTS (model: %s, voice: %s)",
-            getattr(settings, "tts_gemini_model", "gemini-2.5-flash-lite-preview-tts"),
-            getattr(settings, "tts_gemini_voice", "Puck"),
-        )
+        if cloud_tts_provider == "chirp3_hd":
+            if chirp_status["available"]:
+                logger.info(
+                    "TTS: English -> Chirp 3 HD (voice: %s, region: %s, sample_rate_hz: %s)",
+                    chirp_voice,
+                    getattr(settings, "tts_chirp_region", "global"),
+                    getattr(settings, "tts_chirp_sample_rate_hz", 24000),
+                )
+            else:
+                logger.warning(
+                    "TTS: English Chirp 3 HD configured but unavailable (%s); requests will fall back to Gemini",
+                    chirp_status["reason"] or "unknown reason",
+                )
+        else:
+            logger.info(
+                "TTS: English -> Gemini TTS (model: %s, voice: %s)",
+                getattr(settings, "tts_gemini_model", "gemini-2.5-flash-lite-preview-tts"),
+                getattr(settings, "tts_gemini_voice", "Puck"),
+            )
     indic_gemini = getattr(settings, "tts_gemini_model_indic", "gemini-2.5-flash-preview-tts")
     if getattr(settings, "tts_indicf5_enabled", False):
         indicf5_dir = getattr(settings, "tts_indicf5_ref_audio_dir", None)
@@ -145,14 +169,27 @@ async def startup_event():
             )
         else:
             logger.info(
-                "TTS: Indic (hi/ml/ta/...) -> Gemini Indic (model: %s); IndicF5 ref dir not set",
-                indic_gemini,
+                "TTS: Indic (hi/ml/ta/...) -> configured cloud provider (%s); IndicF5 ref dir not set",
+                cloud_tts_provider,
             )
     else:
-        logger.info(
-            "TTS: Indic (hi/ml/ta/...) -> Gemini Indic (model: %s; requires GEMINI_API_KEY)",
-            indic_gemini,
-        )
+        if cloud_tts_provider == "chirp3_hd":
+            if chirp_status["available"]:
+                logger.info(
+                    "TTS: Indic (hi/ml/ta/...) -> Chirp 3 HD (voice: %s, region: %s)",
+                    chirp_voice,
+                    getattr(settings, "tts_chirp_region", "global"),
+                )
+            else:
+                logger.warning(
+                    "TTS: Indic Chirp 3 HD configured but unavailable (%s); requests will fall back to Gemini",
+                    chirp_status["reason"] or "unknown reason",
+                )
+        else:
+            logger.info(
+                "TTS: Indic (hi/ml/ta/...) -> Gemini Indic (model: %s; requires GEMINI_API_KEY)",
+                indic_gemini,
+            )
     
     # Initialize database
     try:

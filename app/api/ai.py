@@ -4,6 +4,7 @@ import base64
 import hashlib
 import json
 import logging
+import queue as queue_lib
 import re
 import threading
 import uuid
@@ -24,15 +25,20 @@ from app.services.llm import finalize_llm_reply, generate_reply, init_llm_client
 from app.services.stt import transcribe_audio, init_stt_models
 from app.services.translation import attach_translated_reply_text
 from app.services.tts import (
+    CHIRP_STREAM_EVENT_RAW_PCM,
+    chirp_streaming_enabled_for_text,
     delete_stored_audio,
-    text_to_speech_stream,
+    feed_tts_stream_to_queue,
+    feed_chirp_stream_to_queue,
+    generate_tts_bytes,
+    init_tts_models,
+    resolve_stored_audio_playback_url,
+    split_text_for_chirp_stream,
     store_audio_mp3,
+    store_pcm_audio_mp3,
     store_user_voice_wav,
     store_user_voice_wav_record,
-    resolve_stored_audio_playback_url,
-    generate_tts_bytes,
-    feed_tts_stream_to_queue,
-    init_tts_models,
+    text_to_speech_stream,
 )
 from app.services.voice_drafts import (
     VOICE_DRAFT_SOURCE_BACKEND_FINAL,
@@ -151,7 +157,7 @@ def _build_user_analysis_payload(ai_response: dict) -> dict:
             score = 75
     score = max(0, min(100, score))
     return {
-        "correction": ai_response.get("correction", "") or "",
+        "correction": ai_response.get("correction") or None,
         "explanation": ai_response.get("explanation") or None,
         "example": ai_response.get("example") or None,
         "score": score,
@@ -218,9 +224,9 @@ def _save_exchange_message(
         reply_language=reply_language,
         translated_ai_reply=ai_response.get("translated_reply_text"),
         translation_language_code=translation_language,
-        correction=ai_response.get("correction", ""),
-        hinglish_explanation=ai_response.get("explanation", ""),
-        example=ai_response.get("example", ""),
+        correction=ai_response.get("correction"),
+        hinglish_explanation=ai_response.get("explanation"),
+        example=ai_response.get("example"),
         score=ai_response.get("score", 0),
         created_at=created_at or datetime.utcnow(),
         user_audio_url=resolved_user_audio_url,
@@ -668,6 +674,16 @@ def _concat_wav_chunks_and_store(chunks: list[bytes], text: str) -> tuple[Option
         return (None, str(e))
 
 
+def _store_pcm_stream_and_store(audio_bytes: bytes, text: str) -> tuple[Optional[str], Optional[str]]:
+    """Sync helper: convert streamed PCM to MP3 once and store it for replay."""
+    try:
+        filename = f"{hashlib.md5(text.encode()).hexdigest()}.mp3"
+        return (store_pcm_audio_mp3(audio_bytes, filename), None)
+    except Exception as e:
+        logger.exception("TTS PCM stream storage error")
+        return (None, str(e))
+
+
 def _is_section_header(line: str) -> bool:
     """True if line starts with correction/hinglish/explanation/example (reply-only TTS boundary)."""
     lower = line.strip().lower()
@@ -700,6 +716,110 @@ def _clean_sentence_for_tts(s: str) -> str:
     return s
 
 
+_CHIRP_MIN_FRAGMENT_CHARS = 36
+_CHIRP_FRAGMENT_STRONG_BOUNDARIES = (".", "?", "!", ";", ":", "\n", "\u0964")
+_CHIRP_FRAGMENT_WEAK_BOUNDARIES = (",", " ")
+
+
+class _ReplyTextStreamExtractor:
+    """Extract reply_text characters from the streamed JSON response without waiting for full completion."""
+
+    marker = '"reply_text": "'
+
+    def __init__(self) -> None:
+        self._scan_buffer = ""
+        self._json_started = False
+        self._in_reply = False
+        self._plain_text = False
+        self._escaped = False
+        self._done = False
+
+    def feed(self, token: str) -> list[str]:
+        if not token or self._done:
+            return []
+        if self._plain_text:
+            return [token]
+
+        if not self._json_started:
+            self._scan_buffer += token
+            marker_idx = self._scan_buffer.find(self.marker)
+            if marker_idx >= 0:
+                self._json_started = True
+                self._in_reply = True
+                tail = self._scan_buffer[marker_idx + len(self.marker):]
+                self._scan_buffer = ""
+                return self._consume_reply_chars(tail)
+            stripped = self._scan_buffer.lstrip()
+            if stripped and not stripped.startswith("{"):
+                out = self._scan_buffer
+                self._scan_buffer = ""
+                self._plain_text = True
+                return [out]
+            if len(self._scan_buffer) > len(self.marker) * 2:
+                self._scan_buffer = self._scan_buffer[-len(self.marker) :]
+            return []
+
+        if self._in_reply:
+            return self._consume_reply_chars(token)
+        return []
+
+    def flush(self) -> list[str]:
+        if self._plain_text and self._scan_buffer:
+            out = self._scan_buffer
+            self._scan_buffer = ""
+            return [out]
+        return []
+
+    def _consume_reply_chars(self, text: str) -> list[str]:
+        out: list[str] = []
+        for ch in text:
+            if self._escaped:
+                mapping = {"n": "\n", "t": "\t", '"': '"', "\\": "\\"}
+                out.append(mapping.get(ch, ch))
+                self._escaped = False
+                continue
+            if ch == "\\":
+                self._escaped = True
+                continue
+            if ch == '"':
+                self._in_reply = False
+                self._done = True
+                break
+            out.append(ch)
+        return ["".join(out)] if out else []
+
+
+def _pop_chirp_ready_fragments(buffer: str, force: bool = False) -> tuple[list[str], str]:
+    """Flush small phrase chunks for Chirp while keeping display text sentence-based."""
+    ready: list[str] = []
+    working = buffer
+    while working:
+        if force:
+            flushed = working.strip()
+            if flushed:
+                ready.append(flushed)
+            return ready, ""
+
+        condensed = working.strip()
+        if len(condensed) < _CHIRP_MIN_FRAGMENT_CHARS:
+            return ready, working
+
+        strong_split_at = max(working.rfind(sep) for sep in _CHIRP_FRAGMENT_STRONG_BOUNDARIES)
+        weak_split_at = max(working.rfind(sep) for sep in _CHIRP_FRAGMENT_WEAK_BOUNDARIES)
+        split_at = strong_split_at
+        if split_at <= 0 and len(condensed) >= (_CHIRP_MIN_FRAGMENT_CHARS * 2):
+            split_at = weak_split_at
+        if split_at <= 0:
+            return ready, working
+
+        fragment = working[: split_at + 1].strip()
+        if len(fragment) < _CHIRP_MIN_FRAGMENT_CHARS:
+            return ready, working
+        ready.append(fragment)
+        working = working[split_at + 1 :].lstrip()
+    return ready, working
+
+
 async def _llm_tts_streaming_pipeline(
     user_message: str,
     history: list,
@@ -726,6 +846,21 @@ async def _llm_tts_streaming_pipeline(
     sentence_queue: asyncio.Queue = asyncio.Queue()
     main_queue: asyncio.Queue = asyncio.Queue()
     loop = asyncio.get_running_loop()
+    use_chirp_streaming = chirp_streaming_enabled_for_text("", reply_language)
+    chirp_fragment_queue: Optional[queue_lib.Queue] = None
+    chirp_stop_event: Optional[threading.Event] = None
+    chirp_started = False
+
+    def _start_chirp_worker_if_needed() -> None:
+        nonlocal chirp_started, chirp_fragment_queue, chirp_stop_event
+        if not use_chirp_streaming or chirp_started or chirp_fragment_queue is None or chirp_stop_event is None:
+            return
+        threading.Thread(
+            target=feed_chirp_stream_to_queue,
+            args=(chirp_fragment_queue, reply_language, main_queue, loop, chirp_stop_event),
+            daemon=True,
+        ).start()
+        chirp_started = True
 
     def gemini_producer() -> None:
         try:
@@ -747,6 +882,8 @@ async def _llm_tts_streaming_pipeline(
         in_reply = False
         json_reply_started = False
         full_reply_text_parts: list[str] = []
+        chirp_extractor = _ReplyTextStreamExtractor() if use_chirp_streaming else None
+        chirp_pending = ""
         try:
             while True:
                 try:
@@ -757,6 +894,14 @@ async def _llm_tts_streaming_pipeline(
                     break
                 full_reply_text_parts.append(token)
                 buffer += token
+
+                if use_chirp_streaming and chirp_extractor is not None and chirp_fragment_queue is not None:
+                    for extracted in chirp_extractor.feed(token):
+                        chirp_pending += extracted
+                        ready_fragments, chirp_pending = _pop_chirp_ready_fragments(chirp_pending)
+                        for fragment in ready_fragments:
+                            _start_chirp_worker_if_needed()
+                            chirp_fragment_queue.put_nowait(fragment)
 
                 if not json_reply_started and '"reply_text": "' in buffer:
                     json_reply_started = True
@@ -828,14 +973,35 @@ async def _llm_tts_streaming_pipeline(
                 sent = _clean_sentence_for_tts(buffer.strip())
                 if sent:
                     main_queue.put_nowait(("text", sent))
-                    sentence_queue.put_nowait(sent)
+                    if not use_chirp_streaming:
+                        sentence_queue.put_nowait(sent)
+            if use_chirp_streaming and chirp_extractor is not None and chirp_fragment_queue is not None:
+                for extracted in chirp_extractor.flush():
+                    chirp_pending += extracted
+                ready_fragments, chirp_pending = _pop_chirp_ready_fragments(chirp_pending, force=True)
+                for fragment in ready_fragments:
+                    _start_chirp_worker_if_needed()
+                    chirp_fragment_queue.put_nowait(fragment)
             full_reply_text = "".join(full_reply_text_parts)
             main_queue.put_nowait(("full_text", full_reply_text))
-            sentence_queue.put_nowait(None)
+            if use_chirp_streaming and chirp_fragment_queue is not None:
+                if chirp_started:
+                    chirp_fragment_queue.put_nowait(None)
+                else:
+                    main_queue.put_nowait((None, None))
+            else:
+                sentence_queue.put_nowait(None)
         except Exception as e:
             logger.exception("Buffer consumer error")
             main_queue.put_nowait(("error", str(e)))
-            sentence_queue.put_nowait(None)
+            if use_chirp_streaming and chirp_fragment_queue is not None:
+                try:
+                    if chirp_started:
+                        chirp_fragment_queue.put_nowait(None)
+                except Exception:
+                    pass
+            else:
+                sentence_queue.put_nowait(None)
 
     async def tts_worker() -> None:
         try:
@@ -855,11 +1021,16 @@ async def _llm_tts_streaming_pipeline(
             logger.exception("TTS worker error")
             main_queue.put_nowait(("error", str(e)))
 
+    if use_chirp_streaming:
+        chirp_fragment_queue = queue_lib.Queue()
+        chirp_stop_event = threading.Event()
+
     threading.Thread(target=gemini_producer, daemon=True).start()
     buffer_task = asyncio.create_task(buffer_consumer())
-    tts_task = asyncio.create_task(tts_worker())
+    tts_task = asyncio.create_task(tts_worker()) if not use_chirp_streaming else None
 
     audio_chunks_collected: list[bytes] = []
+    raw_pcm_audio: Optional[bytes] = None
     full_reply_text = ""
 
     try:
@@ -880,14 +1051,27 @@ async def _llm_tts_streaming_pipeline(
                 audio_chunks_collected.append(item[1])
                 b64 = base64.b64encode(item[1]).decode("ascii")
                 yield f"event: audio_chunk\ndata: {b64}\n\n"
+            elif item[0] == CHIRP_STREAM_EVENT_RAW_PCM:
+                raw_pcm_audio = item[1] or b""
             elif item[0] == "full_text":
                 full_reply_text = item[1] or ""
 
-        await asyncio.gather(buffer_task, tts_task)
+        if tts_task is not None:
+            await asyncio.gather(buffer_task, tts_task)
+        else:
+            await buffer_task
     except Exception as e:
         logger.exception("streaming pipeline error")
         yield f"event: error\ndata: {json.dumps({'error': str(e)})}\n\n"
         return
+    finally:
+        if chirp_stop_event is not None:
+            chirp_stop_event.set()
+        if chirp_fragment_queue is not None:
+            try:
+                chirp_fragment_queue.put_nowait(None)
+            except Exception:
+                pass
 
     # Parse full LLM response -> metadata event -> DB save
     if full_reply_text:
@@ -916,9 +1100,9 @@ async def _llm_tts_streaming_pipeline(
                 {
                     "reply_text": parsed.get("reply_text", ""),
                     "translated_reply_text": parsed.get("translated_reply_text"),
-                    "correction": parsed.get("correction", ""),
-                    "explanation": parsed.get("explanation", ""),
-                    "example": parsed.get("example", ""),
+                    "correction": parsed.get("correction"),
+                    "explanation": parsed.get("explanation"),
+                    "example": parsed.get("example"),
                     "score": parsed.get("score", 75),
                 },
                 reply_language,
@@ -934,9 +1118,14 @@ async def _llm_tts_streaming_pipeline(
 
     if audio_chunks_collected:
         yield f"event: done\ndata: {json.dumps({'audio_url': None, 'saving_in_background': True})}\n\n"
-        audio_url, err = await asyncio.to_thread(
-            _concat_wav_chunks_and_store, audio_chunks_collected, full_reply_text
-        )
+        if raw_pcm_audio:
+            audio_url, err = await asyncio.to_thread(
+                _store_pcm_stream_and_store, raw_pcm_audio, full_reply_text
+            )
+        else:
+            audio_url, err = await asyncio.to_thread(
+                _concat_wav_chunks_and_store, audio_chunks_collected, full_reply_text
+            )
         if err:
             yield f"event: error\ndata: {json.dumps({'error': err})}\n\n"
         else:
@@ -1028,36 +1217,61 @@ async def tts_stream(
     response_language = request.response_language or "en"
     queue: asyncio.Queue = asyncio.Queue()
     loop = asyncio.get_running_loop()
+    use_chirp_streaming = chirp_streaming_enabled_for_text(text, response_language)
+    chirp_fragment_queue: Optional[queue_lib.Queue] = None
+    chirp_stop_event: Optional[threading.Event] = None
 
-    threading.Thread(
-        target=feed_tts_stream_to_queue,
-        args=(text, response_language, queue, loop),
-        daemon=True,
-    ).start()
+    if use_chirp_streaming:
+        chirp_fragment_queue = queue_lib.Queue()
+        chirp_stop_event = threading.Event()
+        for fragment in split_text_for_chirp_stream(text):
+            chirp_fragment_queue.put_nowait(fragment)
+        chirp_fragment_queue.put_nowait(None)
+        threading.Thread(
+            target=feed_chirp_stream_to_queue,
+            args=(chirp_fragment_queue, response_language, queue, loop, chirp_stop_event),
+            daemon=True,
+        ).start()
+    else:
+        threading.Thread(
+            target=feed_tts_stream_to_queue,
+            args=(text, response_language, queue, loop),
+            daemon=True,
+        ).start()
 
     async def event_gen():
         chunks = []
-        while True:
-            item = await queue.get()
-            if item == (None, None) or (isinstance(item, tuple) and item[0] is None):
-                break
-            if isinstance(item, tuple) and item[0] == "error":
-                yield f"event: error\ndata: {json.dumps({'error': item[1]})}\n\n"
-                return
-            if isinstance(item, tuple) and item[0] == "audio":
-                chunks.append(item[1])
-                b64 = base64.b64encode(item[1]).decode("ascii")
-                yield f"event: audio_chunk\ndata: {b64}\n\n"
+        raw_pcm_audio: Optional[bytes] = None
+        try:
+            while True:
+                item = await queue.get()
+                if item == (None, None) or (isinstance(item, tuple) and item[0] is None):
+                    break
+                if isinstance(item, tuple) and item[0] == "error":
+                    yield f"event: error\ndata: {json.dumps({'error': item[1]})}\n\n"
+                    return
+                if isinstance(item, tuple) and item[0] == "audio":
+                    chunks.append(item[1])
+                    b64 = base64.b64encode(item[1]).decode("ascii")
+                    yield f"event: audio_chunk\ndata: {b64}\n\n"
+                if isinstance(item, tuple) and item[0] == CHIRP_STREAM_EVENT_RAW_PCM:
+                    raw_pcm_audio = item[1] or b""
 
-        if chunks:
-            yield f"event: done\ndata: {json.dumps({'audio_url': None, 'saving_in_background': True})}\n\n"
-            audio_url, err = await asyncio.to_thread(_concat_wav_chunks_and_store, chunks, text)
-            if err:
-                yield f"event: error\ndata: {json.dumps({'error': err})}\n\n"
+            if chunks:
+                yield f"event: done\ndata: {json.dumps({'audio_url': None, 'saving_in_background': True})}\n\n"
+                if raw_pcm_audio:
+                    audio_url, err = await asyncio.to_thread(_store_pcm_stream_and_store, raw_pcm_audio, text)
+                else:
+                    audio_url, err = await asyncio.to_thread(_concat_wav_chunks_and_store, chunks, text)
+                if err:
+                    yield f"event: error\ndata: {json.dumps({'error': err})}\n\n"
+                else:
+                    yield f"event: audio_ready\ndata: {json.dumps({'audio_url': audio_url})}\n\n"
             else:
-                yield f"event: audio_ready\ndata: {json.dumps({'audio_url': audio_url})}\n\n"
-        else:
-            yield f"event: done\ndata: {json.dumps({'audio_url': None})}\n\n"
+                yield f"event: done\ndata: {json.dumps({'audio_url': None})}\n\n"
+        finally:
+            if chirp_stop_event is not None:
+                chirp_stop_event.set()
 
     return StreamingResponse(
         event_gen(),

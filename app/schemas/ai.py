@@ -6,7 +6,7 @@ from typing import Literal, Optional
 class UserAnalysis(BaseModel):
     """Feedback attached to the learner's own message."""
 
-    correction: str = Field(default="", description="One correction for the learner's message")
+    correction: Optional[str] = Field(None, description="A meaningful correction or better natural phrasing for the learner's message")
     explanation: Optional[str] = Field(None, description="Short explanation of the correction")
     example: Optional[str] = Field(None, description="Example sentence for correct usage")
     score: int = Field(default=70, ge=0, le=100, description="Score out of 100")
@@ -67,7 +67,7 @@ class AIChatResponse(BaseModel):
     reply_language: str = Field(..., description="Language code of the assistant reply")
     translation_language: Optional[str] = Field(None, description="Language code of the translated reply, if present")
     user_analysis: UserAnalysis = Field(..., description="Feedback attached to the learner's message")
-    correction: str = Field(..., description="Legacy compatibility alias for user_analysis.correction")
+    correction: Optional[str] = Field(None, description="Legacy compatibility alias for user_analysis.correction")
     explanation: Optional[str] = Field(None, description="Legacy compatibility alias for user_analysis.explanation")
     example: Optional[str] = Field(None, description="Legacy compatibility alias for user_analysis.example")
     score: int = Field(..., ge=0, le=100, description="Legacy compatibility alias for user_analysis.score")

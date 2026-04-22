@@ -176,6 +176,38 @@ class Settings(BaseSettings):
         description="TTS_GEMINI_MODEL_INDIC: Gemini TTS model for Indic languages (when IndicF5 off or after IndicF5 failure)",
     )
     tts_gemini_voice: str = Field(default="Puck", description="TTS_GEMINI_VOICE: prebuilt voice name for Gemini TTS")
+    tts_cloud_provider: Literal["gemini", "chirp3_hd"] = Field(
+        default="gemini",
+        description="TTS_CLOUD_PROVIDER: cloud TTS backend when local providers are unavailable or disabled",
+    )
+    tts_chirp_region: str = Field(
+        default="global",
+        description="TTS_CHIRP_REGION: Cloud TTS Chirp region hint (global, us, eu, asia-southeast1, ...)",
+    )
+    tts_chirp_endpoint: Optional[str] = Field(
+        default=None,
+        description="TTS_CHIRP_ENDPOINT: optional explicit Cloud TTS API endpoint override",
+    )
+    tts_chirp_voice: str = Field(
+        default="Sulafat",
+        description="TTS_CHIRP_VOICE: Chirp 3 HD voice suffix or full voice name override",
+    )
+    tts_chirp_speaking_rate: float = Field(
+        default=1.0,
+        description="TTS_CHIRP_SPEAKING_RATE: speaking rate for Chirp 3 HD synthesis",
+    )
+    tts_chirp_sample_rate_hz: int = Field(
+        default=44100,
+        description="TTS_CHIRP_SAMPLE_RATE_HZ: sample rate for Chirp 3 HD audio",
+    )
+    tts_chirp_stream_encoding: Literal["pcm"] = Field(
+        default="pcm",
+        description="TTS_CHIRP_STREAM_ENCODING: streaming audio encoding for Chirp 3 HD (currently pcm only)",
+    )
+    tts_chirp_timeout_seconds: int = Field(
+        default=30,
+        description="TTS_CHIRP_TIMEOUT_SECONDS: timeout in seconds for Chirp 3 HD streaming and unary requests",
+    )
     # Max concurrent TTS inferences (1 = strict serialization for low VRAM; 2+ = Semaphore for lower latency)
     tts_concurrent_inferences: int = Field(default=2, description="TTS_CONCURRENT_INFERENCES: max concurrent TTS inferences")
     # When True, force DummyWatermarker to skip loading watermark weights (patch must run before model instantiation)

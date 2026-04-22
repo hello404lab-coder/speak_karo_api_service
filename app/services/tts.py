@@ -4,6 +4,7 @@ import hashlib
 import json
 import logging
 import os
+import queue as queue_lib
 import re
 import struct
 import threading
@@ -11,7 +12,7 @@ import time
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
-from typing import Iterator, Optional
+from typing import Iterator, Literal, Optional
 import numpy as np
 import soundfile as sf
 from pydub import AudioSegment
@@ -33,6 +34,14 @@ class StoredAudioRecord:
 
     playback_url: str
     storage_ref: str
+
+
+@dataclass
+class ChirpPCMFilterState:
+    """Streaming filter state so chunk-to-chunk cleanup stays continuous."""
+
+    prev_x: float = 0.0
+    prev_y: float = 0.0
 
 
 def _get_indicf5_torch_device() -> str:
@@ -70,6 +79,11 @@ _gemini_tts_client = None
 _resemble_client = None
 _lock_resemble = threading.Lock()
 
+# Lazy-loaded Google Cloud Text-to-Speech client for Chirp 3 HD.
+_chirp_client = None
+_lock_chirp = threading.Lock()
+_chirp_fallback_warning_logged = False
+
 # Internal language code to BCP-47 for Gemini TTS (en-US, hi-IN, etc.)
 LANG_TO_BCP47 = {
     "en": "en-US",
@@ -80,6 +94,21 @@ LANG_TO_BCP47 = {
     "kn": "kn-IN",
     "bn": "bn-BD",
 }
+
+CHIRP_LANG_TO_BCP47 = {
+    "en": "en-IN",
+    "hi": "hi-IN",
+    "ml": "ml-IN",
+    "ta": "ta-IN",
+    "te": "te-IN",
+    "kn": "kn-IN",
+    "bn": "bn-IN",
+}
+
+CHIRP_STREAM_EVENT_RAW_PCM = "raw_pcm"
+CHIRP_DEFAULT_SAMPLE_RATE_HZ = 24000
+CHIRP_TARGET_PACKET_MS = 240
+TTSBackend = Literal["turbo", "resemble_api", "indicf5", "gemini", "chirp3_hd"]
 
 # IndicF5 ref audio filenames and ref text per language (must match the ref WAV content)
 INDICF5_REF_FILENAMES = {
@@ -109,15 +138,17 @@ def _generate_cache_key(
     response_language: str = "en",
     *,
     gemini_indic: bool = False,
+    provider_tag: Optional[str] = None,
 ) -> str:
     """Generate cache key from text and language. Indic Gemini uses a separate key so model changes invalidate cache."""
     h = hashlib.md5(text.encode()).hexdigest()
     lang = response_language or "en"
+    provider_part = f":{provider_tag}" if provider_tag else ""
     if gemini_indic:
         mid = getattr(settings, "tts_gemini_model_indic", None) or "gemini-2.5-flash-preview-tts"
         tag = hashlib.md5(mid.encode()).hexdigest()[:8]
-        return f"tts:{lang}:gi:{tag}:{h}"
-    return f"tts:{lang}:{h}"
+        return f"tts:{lang}{provider_part}:gi:{tag}:{h}"
+    return f"tts:{lang}{provider_part}:{h}"
 
 
 def _store_audio_local(audio_bytes: bytes, filename: str) -> str:
@@ -368,6 +399,209 @@ def _convert_to_wav(audio_data: bytes, mime_type: str) -> bytes:
     return header + audio_data
 
 
+def chirp_pcm_to_wav(audio_data: bytes, sample_rate_hz: Optional[int] = None) -> bytes:
+    """Wrap raw PCM bytes from Chirp streaming in a WAV container for client playback."""
+    rate = sample_rate_hz or int(getattr(settings, "tts_chirp_sample_rate_hz", CHIRP_DEFAULT_SAMPLE_RATE_HZ))
+    return _convert_to_wav(audio_data, f"audio/L16;rate={rate}")
+
+
+def _postprocess_chirp_pcm_chunk(
+    audio_data: bytes,
+    sample_rate_hz: Optional[int] = None,
+    state: Optional[ChirpPCMFilterState] = None,
+) -> bytes:
+    """
+    Clean up Chirp PCM for streaming playback.
+    Applies a gentle DC/high-pass cleanup plus a very short edge fade to reduce
+    faint clicks/static-like artifacts at chunk boundaries without adding noticeable latency.
+    """
+    if not audio_data:
+        return audio_data
+
+    sample_rate = sample_rate_hz or int(getattr(settings, "tts_chirp_sample_rate_hz", CHIRP_DEFAULT_SAMPLE_RATE_HZ))
+    pcm = np.frombuffer(audio_data, dtype="<i2")
+    if pcm.size == 0:
+        return audio_data
+
+    x = pcm.astype(np.float32) / 32768.0
+
+    # Remove DC offset / very low-frequency rumble with a light one-pole high-pass filter.
+    if state is None:
+        state = ChirpPCMFilterState()
+    dt = 1.0 / float(sample_rate)
+    rc = 1.0 / (2.0 * np.pi * 35.0)
+    alpha = rc / (rc + dt)
+    y = np.empty_like(x)
+    prev_x = state.prev_x
+    prev_y = state.prev_y
+    for i in range(x.size):
+        current_x = x[i]
+        current_y = alpha * (prev_y + current_x - prev_x)
+        y[i] = current_y
+        prev_x = current_x
+        prev_y = current_y
+    state.prev_x = prev_x
+    state.prev_y = prev_y
+
+    # Center any tiny residual DC bias.
+    mean = float(y.mean())
+    if abs(mean) > 1e-5:
+        y = y - mean
+
+    peak = float(np.max(np.abs(y))) if y.size else 0.0
+    if peak > 0.995:
+        y = y / peak * 0.995
+
+    out = np.clip(y * 32767.0, -32768.0, 32767.0).astype("<i2")
+    return out.tobytes()
+
+
+def _import_chirp_texttospeech():
+    """Import Google Cloud Text-to-Speech lazily so the app still boots without Chirp deps."""
+    try:
+        from google.cloud import texttospeech
+    except ImportError as e:
+        raise ValueError(
+            "Google Cloud Text-to-Speech is not installed. Install google-cloud-texttospeech to use Chirp 3 HD."
+        ) from e
+    return texttospeech
+
+
+def chirp_runtime_status() -> dict[str, Optional[str]]:
+    """
+    Return whether Chirp 3 HD is usable in this process.
+    Uses a lightweight ADC check so startup logs reflect real availability.
+    """
+    try:
+        _import_chirp_texttospeech()
+    except ValueError as e:
+        return {"available": False, "reason": str(e)}
+
+    try:
+        from google.auth import default as google_auth_default
+        google_auth_default(scopes=("https://www.googleapis.com/auth/cloud-platform",))
+        return {"available": True, "reason": None}
+    except Exception as e:
+        return {"available": False, "reason": str(e)}
+
+
+def _log_chirp_fallback_once(reason: Exception | str) -> None:
+    """Avoid repeating the same Chirp fallback warning for every sentence/chunk."""
+    global _chirp_fallback_warning_logged
+    if _chirp_fallback_warning_logged:
+        return
+    _chirp_fallback_warning_logged = True
+    logger.warning("Chirp 3 HD unavailable; falling back to Gemini TTS: %s", reason)
+
+
+def _chirp_endpoint() -> Optional[str]:
+    """Return an explicit endpoint when configured, otherwise a best-effort regional endpoint."""
+    explicit = (getattr(settings, "tts_chirp_endpoint", None) or "").strip()
+    if explicit:
+        return explicit
+    region = (getattr(settings, "tts_chirp_region", "global") or "global").strip()
+    if not region or region == "global":
+        return None
+    return f"{region}-texttospeech.googleapis.com"
+
+
+def _chirp_locale_for_lang(lang: str) -> str:
+    """Resolve the preferred Chirp locale for an app language code."""
+    locale = CHIRP_LANG_TO_BCP47.get(lang)
+    if not locale:
+        raise ValueError(f"Chirp 3 HD is not configured for language: {lang}")
+    return locale
+
+
+def _chirp_voice_name_for_lang(lang: str) -> tuple[str, str]:
+    """Return (locale, voice_name) for Chirp 3 HD."""
+    locale = _chirp_locale_for_lang(lang)
+    configured = (getattr(settings, "tts_chirp_voice", "Charon") or "Charon").strip()
+    if not configured:
+        configured = "Charon"
+    if configured.startswith(f"{locale}-") and "Chirp3-HD" in configured:
+        return locale, configured
+    if "Chirp3-HD" in configured and configured.count("-") >= 2:
+        return locale, configured
+    return locale, f"{locale}-Chirp3-HD-{configured}"
+
+
+def _cloud_tts_provider_for_lang(lang: str, allow_fallback: bool = True) -> TTSBackend:
+    """Resolve the configured cloud TTS provider for a language."""
+    preferred = getattr(settings, "tts_cloud_provider", "gemini")
+    if preferred == "chirp3_hd":
+        try:
+            _chirp_locale_for_lang(lang)
+            return "chirp3_hd"
+        except ValueError as e:
+            if allow_fallback:
+                logger.warning("Chirp 3 HD unsupported for %s, falling back to Gemini: %s", lang, e)
+                return "gemini"
+            raise
+    return "gemini"
+
+
+def resolve_tts_backend(text: str, response_language: str = "en") -> TTSBackend:
+    """
+    Resolve the runtime TTS backend for the given text/language without generating audio.
+    Local backends keep priority; cloud routing uses the configured provider switch.
+    """
+    lang = _effective_response_language(text, response_language)
+    chatterbox_enabled = getattr(settings, "tts_chatterbox_enabled", True)
+
+    if lang != "en" and getattr(settings, "tts_indicf5_enabled", False):
+        ref = _get_indicf5_ref(lang)
+        model, _, _ = _get_indicf5_model()
+        if ref and model is not None:
+            return "indicf5"
+
+    if lang == "en" and chatterbox_enabled:
+        if getattr(settings, "tts_chatterbox_mode", "local") == "api":
+            return "resemble_api"
+        return "turbo"
+
+    return _cloud_tts_provider_for_lang(lang)
+
+
+def chirp_streaming_enabled_for_text(text: str, response_language: str = "en") -> bool:
+    """True when this text would route to Chirp 3 HD and can use its bidirectional stream."""
+    try:
+        if resolve_tts_backend(text, response_language) != "chirp3_hd":
+            return False
+        _import_chirp_texttospeech()
+        _get_chirp_client()
+        return True
+    except Exception:
+        return False
+
+
+def _get_chirp_client():
+    """Lazy-load a reusable Cloud TTS client for Chirp 3 HD."""
+    global _chirp_client
+    if _chirp_client is not None:
+        return _chirp_client
+
+    texttospeech = _import_chirp_texttospeech()
+    with _lock_chirp:
+        if _chirp_client is None:
+            kwargs = {}
+            endpoint = _chirp_endpoint()
+            if endpoint:
+                try:
+                    from google.api_core.client_options import ClientOptions
+                    kwargs["client_options"] = ClientOptions(api_endpoint=endpoint)
+                except ImportError:
+                    kwargs["client_options"] = {"api_endpoint": endpoint}
+            _chirp_client = texttospeech.TextToSpeechClient(**kwargs)
+            logger.info(
+                "Chirp 3 HD client initialized (region=%s, endpoint=%s, voice=%s)",
+                getattr(settings, "tts_chirp_region", "global"),
+                endpoint or "default",
+                getattr(settings, "tts_chirp_voice", "Charon"),
+            )
+    return _chirp_client
+
+
 def _gemini_tts_model_for_lang(lang: str) -> str:
     """English uses tts_gemini_model; Indic uses tts_gemini_model_indic (Gemini 2.5 Flash TTS)."""
     if lang != "en":
@@ -412,8 +646,7 @@ def _tts_with_gemini(text: str, response_language: str) -> bytes:
         text = text[:4000]
     client = _get_gemini_tts_client()
     lang_code = LANG_TO_BCP47.get(response_language, "en-US")
-    # voice_name = getattr(settings, "tts_gemini_voice", "Puck") or "Puck"
-    voice_name = "Zephyr"
+    voice_name = getattr(settings, "tts_gemini_voice", "Puck") or "Puck"
     model_name = _gemini_tts_model_for_lang(response_language)
     contents = f"Say the following: {text}"
     config = types.GenerateContentConfig(
@@ -439,6 +672,77 @@ def _tts_with_gemini(text: str, response_language: str) -> bytes:
     if not pcm_data:
         raise ValueError("Gemini TTS returned empty audio")
     return _convert_to_wav(pcm_data, "audio/L16;rate=24000")
+
+
+def _chirp_streaming_audio_encoding(texttospeech):
+    """Resolve the PCM enum for Chirp streaming audio."""
+    pcm = None
+    streaming_audio_encoding = getattr(
+        getattr(texttospeech, "StreamingAudioConfig", None),
+        "AudioEncoding",
+        None,
+    )
+    if streaming_audio_encoding is not None:
+        pcm = getattr(streaming_audio_encoding, "PCM", None)
+    if pcm is None:
+        pcm = getattr(getattr(texttospeech, "AudioEncoding", None), "PCM", None)
+    if pcm is None:
+        raise ValueError(
+            "Installed Cloud TTS library does not expose a PCM audio encoding enum for streaming."
+        )
+    return pcm
+
+
+def _build_chirp_streaming_config(texttospeech, response_language: str):
+    """Build Chirp 3 HD streaming config for a language."""
+    locale, voice_name = _chirp_voice_name_for_lang(response_language)
+    sample_rate = int(getattr(settings, "tts_chirp_sample_rate_hz", CHIRP_DEFAULT_SAMPLE_RATE_HZ))
+    speaking_rate = float(getattr(settings, "tts_chirp_speaking_rate", 1.0) or 1.0)
+    return texttospeech.StreamingSynthesizeConfig(
+        voice=texttospeech.VoiceSelectionParams(
+            language_code=locale,
+            name=voice_name,
+        ),
+        streaming_audio_config=texttospeech.StreamingAudioConfig(
+            audio_encoding=_chirp_streaming_audio_encoding(texttospeech),
+            sample_rate_hertz=sample_rate,
+            speaking_rate=speaking_rate,
+        ),
+    )
+
+
+def _tts_with_chirp(text: str, response_language: str) -> bytes:
+    """
+    Generate audio using Cloud TTS Chirp 3 HD and return WAV bytes.
+    Uses unary synthesize_speech for non-streaming endpoints and storage paths.
+    """
+    text = (text or "").strip()
+    if not text:
+        raise ValueError("Empty text for Chirp 3 HD TTS")
+    if len(text) > 5000:
+        text = text[:5000]
+
+    texttospeech = _import_chirp_texttospeech()
+    client = _get_chirp_client()
+    locale, voice_name = _chirp_voice_name_for_lang(response_language)
+    timeout = float(getattr(settings, "tts_chirp_timeout_seconds", 30) or 30)
+
+    response = client.synthesize_speech(
+        input=texttospeech.SynthesisInput(text=text),
+        voice=texttospeech.VoiceSelectionParams(language_code=locale, name=voice_name),
+        audio_config=texttospeech.AudioConfig(
+            audio_encoding=texttospeech.AudioEncoding.LINEAR16,
+            sample_rate_hertz=int(getattr(settings, "tts_chirp_sample_rate_hz", CHIRP_DEFAULT_SAMPLE_RATE_HZ)),
+            speaking_rate=float(getattr(settings, "tts_chirp_speaking_rate", 1.0) or 1.0),
+        ),
+        timeout=timeout,
+    )
+    audio_content = bytes(getattr(response, "audio_content", b"") or b"")
+    if not audio_content:
+        raise ValueError("Chirp 3 HD returned empty audio")
+    if audio_content[:4] == b"RIFF":
+        return audio_content
+    return chirp_pcm_to_wav(audio_content)
 
 
 def _convert_wav_to_mp3(wav_bytes: bytes) -> bytes:
@@ -1135,41 +1439,45 @@ def _generate_tts_bytes_impl(text: str, response_language: str = "en") -> bytes:
     Core TTS routing: IndicF5 when enabled, else Gemini Flash TTS for Indic; English Chatterbox or Gemini.
     """
     lang = _effective_response_language(text, response_language)
-    chatterbox_enabled = getattr(settings, "tts_chatterbox_enabled", True)
+    backend = resolve_tts_backend(text, lang)
 
-    use_indicf5 = lang != "en" and getattr(settings, "tts_indicf5_enabled", False)
+    if backend == "indicf5":
+        try:
+            with _inference_semaphore:
+                return _tts_with_indicf5(text, lang)
+        except ValueError:
+            raise
+        except Exception as e:
+            logger.warning(
+                "IndicF5 generation failed: %s. Falling back to configured cloud TTS.",
+                e,
+            )
+            backend = _cloud_tts_provider_for_lang(lang)
 
-    if use_indicf5:
-        ref = _get_indicf5_ref(lang)
-        model, _, _ = _get_indicf5_model()
-        if ref and model is not None:
-            try:
-                with _inference_semaphore:
-                    return _tts_with_indicf5(text, lang)
-            except ValueError:
-                raise
-            except Exception as e:
-                logger.warning(
-                    "IndicF5 generation failed: %s. Falling back to Gemini TTS (Indic).",
-                    e,
-                )
-                use_indicf5 = False
-        else:
-            use_indicf5 = False
+    if backend == "gemini":
+        if not settings.gemini_api_key:
+            raise ValueError(
+                "Gemini text-to-speech requires GEMINI_API_KEY when the configured cloud provider is Gemini."
+            )
+        return _tts_with_gemini(text, lang)
 
-    if not use_indicf5:
-        if lang != "en":
-            if not settings.gemini_api_key:
-                raise ValueError(
-                    "Indic text-to-speech requires GEMINI_API_KEY when IndicF5 is unavailable or disabled."
-                )
-            return _tts_with_gemini(text, lang)
-        if not chatterbox_enabled:
-            return _tts_with_gemini(text, lang)
-        if getattr(settings, "tts_chatterbox_mode", "local") == "api":
-            return _tts_with_resemble_api(text)
-        with _inference_semaphore:
-            return _tts_with_turbo(text)
+    if backend == "chirp3_hd":
+        try:
+            return _tts_with_chirp(text, lang)
+        except ValueError:
+            raise
+        except Exception as e:
+            if settings.gemini_api_key:
+                _log_chirp_fallback_once(e)
+                return _tts_with_gemini(text, lang)
+            logger.error("Chirp 3 HD generation failed with no Gemini fallback available: %s", e)
+            raise ValueError("Chirp 3 HD text-to-speech is temporarily unavailable.") from e
+
+    if backend == "resemble_api":
+        return _tts_with_resemble_api(text)
+
+    with _inference_semaphore:
+        return _tts_with_turbo(text)
 
 
 def generate_tts_bytes(text: str, response_language: str = "en") -> bytes:
@@ -1219,6 +1527,123 @@ def feed_tts_stream_to_queue(
         loop.call_soon_threadsafe(queue.put_nowait, ("error", str(e)))
 
 
+def split_text_for_chirp_stream(text: str, max_chars: int = 220) -> list[str]:
+    """Split text into clause/sentence-like fragments for Chirp streaming input."""
+    cleaned = re.sub(r"\s+", " ", (text or "").strip())
+    if not cleaned:
+        return []
+    fragments: list[str] = []
+    remaining = cleaned
+    while remaining:
+        if len(remaining) <= max_chars:
+            fragments.append(remaining)
+            break
+        window = remaining[:max_chars]
+        split_at = max(window.rfind("."), window.rfind("?"), window.rfind("!"), window.rfind(";"), window.rfind(":"))
+        if split_at <= 0:
+            split_at = max(window.rfind(","), window.rfind(" "))
+        if split_at <= 0:
+            split_at = max_chars
+        fragment = remaining[:split_at].strip()
+        if fragment:
+            fragments.append(fragment)
+        remaining = remaining[split_at:].strip()
+    return fragments
+
+
+def feed_chirp_stream_to_queue(
+    fragments: "queue_lib.Queue[Optional[str]]",
+    response_language: str,
+    queue: asyncio.Queue,
+    loop: asyncio.AbstractEventLoop,
+    stop_event: threading.Event,
+) -> None:
+    """
+    Bridge Chirp bidirectional streaming to the async SSE layer.
+    Input comes from a thread-safe fragment queue; output emits WAV-wrapped audio chunks and the
+    final raw PCM buffer for stitched replay audio.
+    """
+    start_time = time.perf_counter()
+    first_chunk_at: Optional[float] = None
+    chunk_count = 0
+    raw_pcm_chunks: list[bytes] = []
+    filter_state = ChirpPCMFilterState()
+    sample_rate_hz = int(getattr(settings, "tts_chirp_sample_rate_hz", CHIRP_DEFAULT_SAMPLE_RATE_HZ))
+    target_packet_bytes = max(4096, int(sample_rate_hz * 2 * (CHIRP_TARGET_PACKET_MS / 1000.0)))
+    pending_emit = bytearray()
+    try:
+        texttospeech = _import_chirp_texttospeech()
+        client = _get_chirp_client()
+        timeout = float(getattr(settings, "tts_chirp_timeout_seconds", 30) or 30)
+
+        def _request_iter():
+            yield texttospeech.StreamingSynthesizeRequest(
+                streaming_config=_build_chirp_streaming_config(texttospeech, response_language),
+            )
+            while not stop_event.is_set():
+                fragment = fragments.get()
+                if fragment is None:
+                    return
+                cleaned = (fragment or "").strip()
+                if not cleaned:
+                    continue
+                yield texttospeech.StreamingSynthesizeRequest(
+                    input=texttospeech.StreamingSynthesisInput(text=cleaned),
+                )
+
+        for response in client.streaming_synthesize(requests=_request_iter(), timeout=timeout):
+            if stop_event.is_set():
+                break
+            audio_content = bytes(getattr(response, "audio_content", b"") or b"")
+            if not audio_content:
+                continue
+            cleaned_audio = _postprocess_chirp_pcm_chunk(
+                audio_content,
+                sample_rate_hz=sample_rate_hz,
+                state=filter_state,
+            )
+            if first_chunk_at is None:
+                first_chunk_at = time.perf_counter()
+            raw_pcm_chunks.append(cleaned_audio)
+            pending_emit.extend(cleaned_audio)
+            while len(pending_emit) >= target_packet_bytes:
+                packet = bytes(pending_emit[:target_packet_bytes])
+                del pending_emit[:target_packet_bytes]
+                chunk_count += 1
+                loop.call_soon_threadsafe(
+                    queue.put_nowait,
+                    ("audio", chirp_pcm_to_wav(packet, sample_rate_hz=sample_rate_hz)),
+                )
+
+        if pending_emit:
+            chunk_count += 1
+            loop.call_soon_threadsafe(
+                queue.put_nowait,
+                ("audio", chirp_pcm_to_wav(bytes(pending_emit), sample_rate_hz=sample_rate_hz)),
+            )
+
+        total_ms = (time.perf_counter() - start_time) * 1000.0
+        ttfa_ms = ((first_chunk_at - start_time) * 1000.0) if first_chunk_at is not None else None
+        logger.info(
+            "Chirp stream completed (lang=%s, chunks=%s, ttfa_ms=%s, total_ms=%.1f)",
+            response_language,
+            chunk_count,
+            f"{ttfa_ms:.1f}" if ttfa_ms is not None else "none",
+            total_ms,
+        )
+        loop.call_soon_threadsafe(queue.put_nowait, (CHIRP_STREAM_EVENT_RAW_PCM, b"".join(raw_pcm_chunks)))
+        loop.call_soon_threadsafe(queue.put_nowait, (None, None))
+    except Exception as e:
+        logger.exception("Chirp stream error")
+        loop.call_soon_threadsafe(queue.put_nowait, ("error", str(e)))
+
+
+def store_pcm_audio_mp3(audio_bytes: bytes, filename: str, sample_rate_hz: Optional[int] = None) -> str:
+    """Convert raw PCM audio to MP3, store it, and return the playback URL."""
+    wav_bytes = chirp_pcm_to_wav(audio_bytes, sample_rate_hz=sample_rate_hz)
+    return store_audio_mp3(_convert_wav_to_mp3(wav_bytes), filename)
+
+
 def store_audio_mp3(audio_bytes: bytes, filename: str) -> str:
     """
     Store MP3 bytes to local or S3 and return the playback URL.
@@ -1249,101 +1674,16 @@ def text_to_speech(text: str, response_language: str = "en") -> str:
         ValueError: If audio generation fails
     """
     lang = _effective_response_language(text, response_language)
-    chatterbox_enabled = getattr(settings, "tts_chatterbox_enabled", True)
-
-    use_indicf5 = lang != "en" and getattr(settings, "tts_indicf5_enabled", False)
-    if use_indicf5:
-        ref = _get_indicf5_ref(lang)
-        model, _, _ = _get_indicf5_model()
-        if ref and model is not None:
-            cache_key = _generate_cache_key(text, lang)
-            cached = get(cache_key)
-            if cached:
-                logger.info("Cache hit for TTS (IndicF5)")
-                if cached.startswith("s3:"):
-                    s3_key = cached[3:]
-                    presigned = _generate_presigned_url(s3_key)
-                    if presigned is None:
-                        logger.error("Presigned URL generation failed on cache hit")
-                        raise ValueError("Audio temporarily unavailable. Please try again.")
-                    return presigned
-                return cached
-            logger.info("Using TTS provider: IndicF5 (language: %s)", lang)
-            try:
-                with _inference_semaphore:
-                    audio_bytes = _tts_with_indicf5(text, lang)
-                audio_bytes = _convert_wav_to_mp3(audio_bytes)
-                filename = f"{lang}_{hashlib.md5(text.encode()).hexdigest()}.mp3"
-                s3_key = _store_audio_cloud(audio_bytes, filename)
-                if s3_key:
-                    presigned = _generate_presigned_url(s3_key)
-                    if presigned:
-                        set(cache_key, "s3:" + s3_key, settings.tts_cache_ttl)
-                        return presigned
-                audio_url = _store_audio_local(audio_bytes, filename)
-                set(cache_key, audio_url, settings.tts_cache_ttl)
-                return audio_url
-            except ValueError:
-                raise
-            except Exception as e:
-                logger.warning(
-                    "IndicF5 generation failed: %s. Falling back to Gemini TTS (Indic).",
-                    e,
-                )
-                use_indicf5 = False
-        else:
-            logger.warning(
-                "IndicF5 not configured for %s. Using Gemini TTS (Indic).",
-                lang,
-            )
-            use_indicf5 = False
-
-    if lang != "en":
-        cache_key_gi = _generate_cache_key(text, lang, gemini_indic=True)
-        cached_gi = get(cache_key_gi)
-        if cached_gi:
-            logger.info("Cache hit for TTS (Gemini Indic)")
-            if cached_gi.startswith("s3:"):
-                s3_key = cached_gi[3:]
-                presigned = _generate_presigned_url(s3_key)
-                if presigned is None:
-                    logger.error("Presigned URL generation failed on cache hit")
-                    raise ValueError("Audio temporarily unavailable. Please try again.")
-                return presigned
-            return cached_gi
-        if not settings.gemini_api_key:
-            raise ValueError(
-                "Indic text-to-speech requires GEMINI_API_KEY when IndicF5 is unavailable or disabled."
-            )
-        indic_model = getattr(settings, "tts_gemini_model_indic", "gemini-2.5-flash-preview-tts")
-        logger.info(
-            "Using TTS provider: Gemini TTS (Indic, model: %s, voice: %s)",
-            indic_model,
-            getattr(settings, "tts_gemini_voice", "Puck"),
-        )
-        try:
-            audio_bytes = _tts_with_gemini(text, lang)
-            audio_bytes = _convert_wav_to_mp3(audio_bytes)
-            filename = f"{lang}_{hashlib.md5(text.encode()).hexdigest()}.mp3"
-            s3_key = _store_audio_cloud(audio_bytes, filename)
-            if s3_key:
-                presigned = _generate_presigned_url(s3_key)
-                if presigned:
-                    set(cache_key_gi, "s3:" + s3_key, settings.tts_cache_ttl)
-                    return presigned
-            audio_url = _store_audio_local(audio_bytes, filename)
-            set(cache_key_gi, audio_url, settings.tts_cache_ttl)
-            return audio_url
-        except ValueError:
-            raise
-        except Exception as e:
-            logger.error("Gemini TTS (Indic) error: %s", e)
-            raise ValueError("Something went wrong generating audio. Please try again.") from e
-
-    cache_key = _generate_cache_key(text, lang)
+    provider = resolve_tts_backend(text, lang)
+    cache_key = _generate_cache_key(
+        text,
+        lang,
+        gemini_indic=(provider == "gemini" and lang != "en"),
+        provider_tag=provider,
+    )
     cached = get(cache_key)
     if cached:
-        logger.info("Cache hit for TTS")
+        logger.info("Cache hit for TTS (%s)", provider)
         if cached.startswith("s3:"):
             s3_key = cached[3:]
             presigned = _generate_presigned_url(s3_key)
@@ -1353,43 +1693,12 @@ def text_to_speech(text: str, response_language: str = "en") -> str:
             return presigned
         return cached
 
-    if not chatterbox_enabled:
-        logger.info(
-            "Using TTS provider: Gemini TTS (model: %s, voice: %s)",
-            getattr(settings, "tts_gemini_model", "gemini-2.5-flash-lite-preview-tts"),
-            getattr(settings, "tts_gemini_voice", "Puck"),
-        )
-        try:
-            audio_bytes = _tts_with_gemini(text, lang)
-            audio_bytes = _convert_wav_to_mp3(audio_bytes)
-            filename = f"{hashlib.md5(text.encode()).hexdigest()}.mp3"
-            s3_key = _store_audio_cloud(audio_bytes, filename)
-            if s3_key:
-                presigned = _generate_presigned_url(s3_key)
-                if presigned:
-                    set(cache_key, "s3:" + s3_key, settings.tts_cache_ttl)
-                    return presigned
-            audio_url = _store_audio_local(audio_bytes, filename)
-            set(cache_key, audio_url, settings.tts_cache_ttl)
-            return audio_url
-        except ValueError:
-            raise
-        except Exception as e:
-            logger.error("Gemini TTS error: %s", e)
-            raise ValueError("Something went wrong generating audio. Please try again.") from e
-
-    if getattr(settings, "tts_chatterbox_mode", "local") == "api":
-        logger.info("Using TTS provider: Resemble Chatterbox API")
-    else:
-        logger.info("Using TTS provider: Chatterbox-Turbo")
+    logger.info("Using TTS provider: %s (language=%s)", provider, lang)
     try:
-        if getattr(settings, "tts_chatterbox_mode", "local") == "api":
-            audio_bytes = _tts_with_resemble_api(text)
-        else:
-            with _inference_semaphore:
-                audio_bytes = _tts_with_turbo(text)
+        audio_bytes = _generate_tts_bytes_impl(text, lang)
         audio_bytes = _convert_wav_to_mp3(audio_bytes)
-        filename = f"{hashlib.md5(text.encode()).hexdigest()}.mp3"
+        filename_prefix = f"{lang}_" if lang != "en" else ""
+        filename = f"{filename_prefix}{hashlib.md5(text.encode()).hexdigest()}.mp3"
         s3_key = _store_audio_cloud(audio_bytes, filename)
         if s3_key:
             presigned = _generate_presigned_url(s3_key)
@@ -1402,7 +1711,7 @@ def text_to_speech(text: str, response_language: str = "en") -> str:
     except ValueError:
         raise
     except Exception as e:
-        logger.error("Unexpected TTS error: %s", e)
+        logger.error("Unexpected TTS error from provider %s: %s", provider, e)
         raise ValueError("Something went wrong generating audio. Please try again.") from e
 
 
@@ -1458,5 +1767,11 @@ def init_tts_models() -> dict:
             result["indicf5"] = "loaded"
         else:
             result["indicf5"] = "skipped"
+
+    if getattr(settings, "tts_cloud_provider", "gemini") == "chirp3_hd":
+        chirp_status = chirp_runtime_status()
+        result["chirp3_hd"] = "available" if chirp_status["available"] else "unavailable"
+        if chirp_status["reason"]:
+            result["chirp3_hd_reason"] = chirp_status["reason"]
 
     return result

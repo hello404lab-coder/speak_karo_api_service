@@ -1,9 +1,12 @@
 from datetime import datetime
 
+import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
+
+pytest.importorskip("slowapi")
 
 from app.api.ai import _build_stream_metadata_payload
 from app.database import get_db
@@ -62,6 +65,27 @@ def test_build_stream_metadata_payload_echoes_client_turn_id():
   assert payload["conversation_id"] == "conv-123"
   assert payload["client_turn_id"] == "turn-123"
   assert payload["translation_language"] == "es"
+
+
+def test_build_stream_metadata_payload_preserves_null_feedback():
+  payload = _build_stream_metadata_payload(
+      {
+          "translated_reply_text": None,
+          "correction": None,
+          "explanation": None,
+          "example": None,
+          "score": 96,
+      },
+      "conv-456",
+      "en",
+      None,
+      client_turn_id="turn-456",
+  )
+
+  assert payload["user_analysis"]["correction"] is None
+  assert payload["correction"] is None
+  assert payload["explanation"] is None
+  assert payload["example"] is None
 
 
 def test_chat_stream_emits_turn_ack_before_text_chunk(monkeypatch):
