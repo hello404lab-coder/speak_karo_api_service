@@ -7,8 +7,10 @@ from sqlalchemy.pool import NullPool
 from app.core.config import settings
 from app.models.usage import Base
 from app.models import user  # noqa: F401 - register User model with Base.metadata
+from app.models import admin  # noqa: F401 - register Admin model with Base.metadata
 from app.models import social_session  # noqa: F401 - register SocialSession
 from app.models import live_session  # noqa: F401 - register LiveSession
+from app.models import billing  # noqa: F401 - register Billing models
 
 
 def _create_engine():

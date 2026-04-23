@@ -22,9 +22,12 @@ class UserResponse(BaseModel):
     native_language_code: str | None = Field(None, description="Normalized native language code used for translation defaults")
     onboarding_completed: bool = Field(default=False, description="Whether user finished onboarding")
     onboarding_step: int = Field(default=0, description="Current onboarding step (0-5)")
-    plan: str = Field(default="free", description="Resolved plan: free, trial, or premium")
+    plan: Literal["free", "trial", "vuvl_plus", "vuvl_pro"] = Field(
+        default="free",
+        description="Resolved plan: free, trial, vuvl_plus, or vuvl_pro",
+    )
     trial_expires_at: datetime | None = Field(None, description="Trial expiration")
-    subscription_expires_at: datetime | None = Field(None, description="Premium expiration")
+    subscription_expires_at: datetime | None = Field(None, description="Paid subscription expiration")
 
     model_config = {"from_attributes": True}
 

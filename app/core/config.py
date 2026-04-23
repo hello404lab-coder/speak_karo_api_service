@@ -31,6 +31,48 @@ class Settings(BaseSettings):
     jwt_refresh_token_expire_days: int = Field(default=30, description="JWT_REFRESH_TOKEN_EXPIRE_DAYS")
     google_client_id: Optional[str] = Field(default=None, description="GOOGLE_CLIENT_ID: for Google OAuth ID token verification")
     apple_client_id: Optional[str] = Field(default=None, description="APPLE_CLIENT_ID: for Apple OAuth ID token verification")
+    admin_bootstrap_email: Optional[str] = Field(
+        default=None,
+        description="ADMIN_BOOTSTRAP_EMAIL: email for the bootstrap admin account",
+    )
+    admin_bootstrap_password: Optional[str] = Field(
+        default=None,
+        description="ADMIN_BOOTSTRAP_PASSWORD: password for the bootstrap admin account",
+    )
+
+    # Billing: Razorpay Subscriptions
+    razorpay_key_id: Optional[str] = Field(default=None, description="RAZORPAY_KEY_ID")
+    razorpay_key_secret: Optional[str] = Field(default=None, description="RAZORPAY_KEY_SECRET")
+    razorpay_webhook_secret: Optional[str] = Field(default=None, description="RAZORPAY_WEBHOOK_SECRET")
+    razorpay_webhook_secret_previous: Optional[str] = Field(
+        default=None,
+        description="RAZORPAY_WEBHOOK_SECRET_PREVIOUS: previous secret accepted for webhook retries during rotation",
+    )
+    razorpay_plan_id_vuvl_plus_test: Optional[str] = Field(
+        default=None,
+        description="RAZORPAY_PLAN_ID_VUVL_PLUS_TEST",
+    )
+    razorpay_plan_id_vuvl_plus_live: Optional[str] = Field(
+        default=None,
+        description="RAZORPAY_PLAN_ID_VUVL_PLUS_LIVE",
+    )
+    razorpay_plan_id_vuvl_pro_test: Optional[str] = Field(
+        default=None,
+        description="RAZORPAY_PLAN_ID_VUVL_PRO_TEST",
+    )
+    razorpay_plan_id_vuvl_pro_live: Optional[str] = Field(
+        default=None,
+        description="RAZORPAY_PLAN_ID_VUVL_PRO_LIVE",
+    )
+    razorpay_timeout_seconds: int = Field(default=15, description="RAZORPAY_TIMEOUT_SECONDS")
+    razorpay_monthly_total_count: int = Field(
+        default=1200,
+        description="RAZORPAY_MONTHLY_TOTAL_COUNT: total recurring billing cycles to model long-running monthly plans",
+    )
+    razorpay_checkout_reuse_minutes: int = Field(
+        default=30,
+        description="RAZORPAY_CHECKOUT_REUSE_MINUTES: reuse a recently-created pending checkout subscription instead of creating duplicates",
+    )
     
     # Database: PostgreSQL (postgresql://user:pass@host:5432/db) or SQLite (sqlite:///./data/english_practice.sqlite or sqlite:///:memory:)
     database_url: str = Field(
@@ -263,9 +305,9 @@ class Settings(BaseSettings):
         default=0.4,
         description="GEMINI_LIVE_TEMPERATURE: Live generation temperature",
     )
-    gemini_live_min_plan: Literal["free", "trial", "premium"] = Field(
-        default="free",
-        description="GEMINI_LIVE_MIN_PLAN: minimum subscription tier for Live (free|trial|premium)",
+    gemini_live_min_plan: Literal["free", "trial", "vuvl_plus", "vuvl_pro"] = Field(
+        default="vuvl_pro",
+        description="GEMINI_LIVE_MIN_PLAN: minimum subscription tier for Live (free|trial|vuvl_plus|vuvl_pro)",
     )
     gemini_live_max_session_duration_seconds: int = Field(
         default=3600,
@@ -311,6 +353,39 @@ class Settings(BaseSettings):
     @property
     def is_prod(self) -> bool:
         return self.app_env == "prod"
+
+    @property
+    def razorpay_live_mode(self) -> bool:
+        """Choose live vs test plan ids from APP_ENV."""
+        return self.is_prod
+
+    @property
+    def razorpay_plan_id_map(self) -> dict[str, str | None]:
+        """Return backend-supported Razorpay plan ids keyed by internal plan code."""
+        if self.razorpay_live_mode:
+            return {
+                "vuvl_plus": self.razorpay_plan_id_vuvl_plus_live,
+                "vuvl_pro": self.razorpay_plan_id_vuvl_pro_live,
+            }
+        return {
+            "vuvl_plus": self.razorpay_plan_id_vuvl_plus_test,
+            "vuvl_pro": self.razorpay_plan_id_vuvl_pro_test,
+        }
+
+    def razorpay_plan_id_for(self, plan_code: str) -> str | None:
+        """Return configured Razorpay plan id for one internal paid plan."""
+        return self.razorpay_plan_id_map.get(plan_code)
+
+    @property
+    def razorpay_enabled(self) -> bool:
+        """Return True when billing secrets and both paid plan ids are configured."""
+        plan_ids = self.razorpay_plan_id_map
+        return bool(
+            self.razorpay_key_id
+            and self.razorpay_key_secret
+            and plan_ids.get("vuvl_plus")
+            and plan_ids.get("vuvl_pro")
+        )
     
     model_config = {
         "env_file": ".env",

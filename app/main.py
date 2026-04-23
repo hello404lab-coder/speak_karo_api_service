@@ -20,6 +20,7 @@ from app.database import init_db
 from app.api.ai import router as ai_router
 from app.api.live import router as live_router
 from app.api.auth import router as auth_router
+from app.api.admin import router as admin_router
 from app.api.conversations import router as conversations_router
 from app.api.subscription import router as subscription_router
 from app.api.social import router as social_router
@@ -200,6 +201,24 @@ async def startup_event():
 
     try:
         from app.database import SessionLocal
+        from app.services.admin_auth_service import bootstrap_admin_account
+
+        def _bootstrap_admin_once() -> str | None:
+            db = SessionLocal()
+            try:
+                admin = bootstrap_admin_account(db)
+                return admin.email if admin else None
+            finally:
+                db.close()
+
+        bootstrapped_email = await asyncio.to_thread(_bootstrap_admin_once)
+        if bootstrapped_email:
+            logger.info("Admin bootstrap ready for email=%s", bootstrapped_email)
+    except Exception as e:
+        logger.warning("Admin bootstrap failed: %s", e)
+
+    try:
+        from app.database import SessionLocal
         from app.services.voice_drafts import cleanup_expired_voice_drafts
 
         def _cleanup_voice_drafts_once() -> int:
@@ -343,6 +362,7 @@ async def health_check():
 app.include_router(ai_router, prefix="/api/v1/ai", tags=["AI"])
 app.include_router(live_router, prefix="/api/v1/ai")
 app.include_router(auth_router, prefix="/api/v1/auth", tags=["Auth"])
+app.include_router(admin_router, prefix="/api/v1/admin", tags=["Admin"])
 app.include_router(conversations_router, prefix="/api/v1/conversations", tags=["Conversations"])
 app.include_router(subscription_router, prefix="/api/v1/subscription", tags=["Subscription"])
 app.include_router(social_router, prefix="/api/v1/social", tags=["Social"])

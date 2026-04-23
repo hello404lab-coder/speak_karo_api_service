@@ -32,7 +32,7 @@ class User(Base):
     onboarding_step = Column(Integer, nullable=False, server_default=text("0"), default=0)
     onboarding_completed = Column(Boolean, nullable=False, server_default=text("0"), default=False)
 
-    # Subscription: free | trial | premium
+    # Subscription: free | trial | vuvl_plus | vuvl_pro
     plan = Column(String(32), nullable=False, server_default=text("'free'"), default="free")
     trial_expires_at = Column(DateTime, nullable=True)
     subscription_expires_at = Column(DateTime, nullable=True)

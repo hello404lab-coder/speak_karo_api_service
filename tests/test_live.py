@@ -18,6 +18,7 @@ from app.main import app
 from app.services.subscription_service import (
     check_usage_limit,
     get_usage_today,
+    plan_rank,
     resolve_user_plan,
 )
 from app.models.live_session import LiveSession
@@ -28,7 +29,8 @@ client = TestClient(app)
 
 
 @pytest.fixture(autouse=True)
-def _clear_dependency_overrides():
+def _clear_dependency_overrides(monkeypatch):
+    monkeypatch.setattr(settings, "gemini_live_min_plan", "free")
     yield
     app.dependency_overrides.clear()
 
@@ -86,8 +88,7 @@ def _make_live_user_override(memory_db: Session, user_id: str):
         check_usage_limit(u, usage_today)
         effective = resolve_user_plan(u)
         minimum = settings.gemini_live_min_plan
-        rank = {"free": 0, "trial": 1, "premium": 2}
-        if rank.get(effective, 0) < rank.get(minimum, 0):
+        if plan_rank(effective) < plan_rank(minimum):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Gemini Live is not available on your current plan.",
@@ -210,6 +211,27 @@ def test_live_token_mint_mocked(memory_db):
         assert r.status_code == 200
         assert r.json()["auth_token"] == "auth-tokens/fake-token-name"
         assert r.json()["new_session_expire_seconds"] >= 10
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_live_config_requires_vuvl_pro_when_min_plan_is_pro(memory_db, monkeypatch):
+    u = memory_db.query(User).filter(User.id == "live-user-1").first()
+    u.onboarding_completed = True
+    u.plan = "vuvl_plus"
+    u.subscription_expires_at = datetime.now(timezone.utc) + timedelta(days=30)
+    u.subscription_expires_at = u.subscription_expires_at.replace(tzinfo=None)
+    memory_db.commit()
+    monkeypatch.setattr(settings, "gemini_live_min_plan", "vuvl_pro")
+    _install_live_test_overrides(memory_db, u)
+    try:
+        blocked = client.get("/api/v1/ai/live/config", headers=_auth_headers())
+        assert blocked.status_code == 403
+
+        u.plan = "vuvl_pro"
+        memory_db.commit()
+        allowed = client.get("/api/v1/ai/live/config", headers=_auth_headers())
+        assert allowed.status_code == 200
     finally:
         app.dependency_overrides.clear()
 

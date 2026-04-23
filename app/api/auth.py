@@ -22,8 +22,13 @@ from app.schemas.onboarding import (
     OnboardingStatusResponse,
     StudentDetailsStep,
 )
-from app.core.security import create_access_token, create_refresh_token, verify_token
-from app.core.security import REFRESH_TOKEN_TYPE
+from app.core.security import (
+    REFRESH_TOKEN_TYPE,
+    USER_PRINCIPAL_TYPE,
+    create_access_token,
+    create_refresh_token,
+    verify_token,
+)
 from app.services.auth_service import get_or_create_user, verify_google_token, verify_apple_token
 from app.services.subscription_service import resolve_user_plan
 from app.utils.language import normalize_language_code
@@ -31,6 +36,23 @@ from app.utils.language import normalize_language_code
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+
+def _build_user_response(user: User) -> UserResponse:
+    """Serialize a user with safe defaults for optional/mock attributes."""
+    plan = resolve_user_plan(user)
+    return UserResponse(
+        id=user.id,
+        email=user.email,
+        name=user.name,
+        native_language=getattr(user, "native_language", None),
+        native_language_code=getattr(user, "native_language_code", None),
+        onboarding_completed=bool(getattr(user, "onboarding_completed", False) or False),
+        onboarding_step=int(getattr(user, "onboarding_step", 0) or 0),
+        plan=plan,
+        trial_expires_at=getattr(user, "trial_expires_at", None),
+        subscription_expires_at=getattr(user, "subscription_expires_at", None),
+    )
 
 
 @router.post("/oauth", response_model=TokenResponse)
@@ -57,27 +79,15 @@ async def oauth_login(
         ) from e
 
     user = get_or_create_user(db, body.provider, provider_info)
-    access_token = create_access_token(subject=user.id)
-    refresh_token = create_refresh_token(subject=user.id)
+    access_token = create_access_token(subject=user.id, principal_type=USER_PRINCIPAL_TYPE)
+    refresh_token = create_refresh_token(subject=user.id, principal_type=USER_PRINCIPAL_TYPE)
 
     logger.info("Login success: user_id=%s provider=%s", user.id, body.provider)
-    plan = resolve_user_plan(user)
     return TokenResponse(
         access_token=access_token,
         refresh_token=refresh_token,
         token_type="bearer",
-        user=UserResponse(
-            id=user.id,
-            email=user.email,
-            name=user.name,
-            native_language=user.native_language,
-            native_language_code=user.native_language_code,
-            onboarding_completed=user.onboarding_completed,
-            onboarding_step=user.onboarding_step,
-            plan=plan,
-            trial_expires_at=user.trial_expires_at,
-            subscription_expires_at=user.subscription_expires_at,
-        ),
+        user=_build_user_response(user),
     )
 
 
@@ -88,14 +98,14 @@ async def refresh(
     body: RefreshTokenRequest,
 ) -> AccessTokenResponse:
     """Exchange a valid refresh token for a new access token."""
-    user_id = verify_token(body.refresh_token, REFRESH_TOKEN_TYPE)
+    user_id = verify_token(body.refresh_token, REFRESH_TOKEN_TYPE, USER_PRINCIPAL_TYPE)
     if not user_id:
         logger.warning("Refresh token verification failed")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid or expired refresh token",
         )
-    access_token = create_access_token(subject=user_id)
+    access_token = create_access_token(subject=user_id, principal_type=USER_PRINCIPAL_TYPE)
     return AccessTokenResponse(access_token=access_token, token_type="bearer")
 
 
@@ -106,19 +116,7 @@ async def me(
     current_user: User = Depends(get_current_user),
 ) -> UserResponse:
     """Return the current authenticated user (requires Bearer token)."""
-    plan = resolve_user_plan(current_user)
-    return UserResponse(
-        id=current_user.id,
-        email=current_user.email,
-        name=current_user.name,
-        native_language=current_user.native_language,
-        native_language_code=current_user.native_language_code,
-        onboarding_completed=current_user.onboarding_completed,
-        onboarding_step=current_user.onboarding_step,
-        plan=plan,
-        trial_expires_at=current_user.trial_expires_at,
-        subscription_expires_at=current_user.subscription_expires_at,
-    )
+    return _build_user_response(current_user)
 
 
 @router.post("/logout")
