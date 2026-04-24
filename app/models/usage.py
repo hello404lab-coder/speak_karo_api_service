@@ -3,7 +3,7 @@ import uuid
 from datetime import datetime, date
 
 import sqlalchemy as sa
-from sqlalchemy import Column, String, Integer, Float, DateTime, Date, ForeignKey, Text
+from sqlalchemy import Column, String, Integer, Float, DateTime, Date, ForeignKey, Index, Text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import relationship
 
@@ -25,10 +25,6 @@ class Usage(Base):
     chat_count = Column(Integer, nullable=False, default=0, server_default=sa.text("0"))
     voice_count = Column(Integer, nullable=False, default=0, server_default=sa.text("0"))
 
-    __table_args__ = (
-        {"schema": None},
-    )
-
 
 class Conversation(Base):
     """Conversation sessions."""
@@ -43,9 +39,9 @@ class Conversation(Base):
     title = Column(String(255), nullable=True)
     
     messages = relationship("Message", back_populates="conversation", cascade="all, delete-orphan")
-    
+
     __table_args__ = (
-        {"schema": None},
+        Index("ix_conversations_user_updated", "user_id", "updated_at"),
     )
 
 
@@ -73,9 +69,10 @@ class Message(Base):
     example_audio_storage_ref = Column(String(1024), nullable=True)
     
     conversation = relationship("Conversation", back_populates="messages")
-    
+
     __table_args__ = (
-        {"schema": None},
+        Index("ix_messages_conversation_created", "conversation_id", "created_at"),
+        Index("ix_messages_conversation_id_id", "conversation_id", "id"),
     )
 
 
@@ -98,7 +95,3 @@ class VoiceInputDraft(Base):
     consumed_at = Column(DateTime, nullable=True)
 
     conversation = relationship("Conversation")
-
-    __table_args__ = (
-        {"schema": None},
-    )

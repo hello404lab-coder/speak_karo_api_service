@@ -3,35 +3,40 @@ import sys
 from pathlib import Path
 
 from alembic import context
+from sqlalchemy import create_engine
 
 # Add the parent directory to the path so we can import app modules
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-# Import our models and database configuration
 from app.core.config import settings
-from app.database import engine
 
-# Import Base and all models - this must happen before target_metadata is set
-# Importing the models registers them with Base.metadata
+# Import Base and all models - this must happen before target_metadata is set.
+# Importing the models registers them with ``Base.metadata``.
 from app.models.usage import Base
 
-# Explicitly import all model classes to ensure they're registered
 from app.models.usage import Usage, Conversation, Message  # noqa: F401
 from app.models.admin import Admin  # noqa: F401
+from app.models.user import User  # noqa: F401
 from app.models.social_session import SocialSession  # noqa: F401
 from app.models.live_session import LiveSession  # noqa: F401
-from app.models.billing import BillingSubscription, BillingWebhookEvent  # noqa: F401
+from app.models.billing import (  # noqa: F401
+    BillingCoupon,
+    BillingCouponRedemption,
+    BillingSubscription,
+    BillingWebhookEvent,
+)
 
-# Verify models are registered (for debugging)
-# Uncomment to debug:
-# print("Registered tables:", list(Base.metadata.tables.keys()))
-
-# this is the Alembic Config object, which provides
-# access to the values within the .ini file in use.
+# this is the Alembic Config object, which provides access to the values
+# within the .ini file in use.
 config = context.config
 
-# Set the database URL from our settings
-config.set_main_option("sqlalchemy.url", settings.database_url)
+# Resolve the target DB URL. If a caller (e.g. tests/conftest.py or
+# ``alembic -x ...``) already set ``sqlalchemy.url`` on this config, keep it so
+# tests can point at a dedicated database. Otherwise fall back to the app
+# settings so interactive ``alembic`` invocations target the dev/prod DB.
+_existing_url = config.get_main_option("sqlalchemy.url")
+if not _existing_url or _existing_url == "driver://user:pass@localhost/dbname":
+    config.set_main_option("sqlalchemy.url", settings.database_url)
 
 # Interpret the config file for Python logging.
 # This line sets up loggers basically.
@@ -78,12 +83,12 @@ def run_migrations_offline() -> None:
 def run_migrations_online() -> None:
     """Run migrations in 'online' mode.
 
-    In this scenario we need to create an Engine
-    and associate a connection with the context.
-
+    Always creates a dedicated engine bound to whatever URL the config resolves
+    to. This keeps Alembic independent of ``app.database.engine`` so tests can
+    point Alembic at a test database without mutating the app-wide engine.
     """
-    # Use our existing engine instead of creating a new one
-    connectable = engine
+    url = config.get_main_option("sqlalchemy.url")
+    connectable = create_engine(url, pool_pre_ping=True)
 
     with connectable.connect() as connection:
         context.configure(
@@ -95,6 +100,8 @@ def run_migrations_online() -> None:
 
         with context.begin_transaction():
             context.run_migrations()
+
+    connectable.dispose()
 
 
 if context.is_offline_mode():

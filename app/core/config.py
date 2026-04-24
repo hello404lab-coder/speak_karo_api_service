@@ -74,10 +74,11 @@ class Settings(BaseSettings):
         description="RAZORPAY_CHECKOUT_REUSE_MINUTES: reuse a recently-created pending checkout subscription instead of creating duplicates",
     )
     
-    # Database: PostgreSQL (postgresql://user:pass@host:5432/db) or SQLite (sqlite:///./data/english_practice.sqlite or sqlite:///:memory:)
+    # Database: PostgreSQL only (sync psycopg2 driver).
+    # Format: postgresql+psycopg2://user:pass@host:5432/db
     database_url: str = Field(
-        default="postgresql://user:password@localhost:5432/english_practice",
-        description="DATABASE_URL: PostgreSQL or SQLite connection URL",
+        default="postgresql+psycopg2://user:password@localhost:5432/english_practice",
+        description="DATABASE_URL: PostgreSQL sync connection URL (postgresql+psycopg2://...)",
     )
     
     # Redis

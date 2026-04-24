@@ -79,7 +79,8 @@ See `.env.example` for all available configuration options. Key variables:
 - `GEMINI_API_KEY`: Google Gemini API key; **required when APP_ENV=prod**.
 - `TTS_CLOUD_PROVIDER`: `gemini`, `chirp3_hd`, or `smallest` — selects the cloud TTS backend when local TTS backends are unavailable or disabled. **Smallest** uses [Smallest.ai Lightning TTS](https://docs.smallest.ai) (set `SMALLEST_API_KEY` and optional `TTS_SMALLEST_*` vars). **Malayalam** is not routed to Smallest; it uses **Chirp 3 HD** (or Gemini) as fallback.
 - `TTS_CHIRP_REGION`, `TTS_CHIRP_ENDPOINT`, `TTS_CHIRP_VOICE`, `TTS_CHIRP_SPEAKING_RATE`, `TTS_CHIRP_SAMPLE_RATE_HZ`, `TTS_CHIRP_TIMEOUT_SECONDS`: Chirp 3 HD settings. The backend now defaults Chirp streaming to `PCM` at `44100 Hz`. Chirp uses Google Cloud ADC / service-account credentials plus Cloud Text-to-Speech, not `GEMINI_API_KEY`.
-- `DATABASE_URL`: PostgreSQL or SQLite connection URL. For local dev without PostgreSQL, set `DATABASE_URL=sqlite:///./data/english_practice.sqlite` and run `alembic upgrade head` to create the file and tables.
+- `DATABASE_URL`: PostgreSQL connection URL (sync psycopg2 driver). Format: `postgresql+psycopg2://user:pass@host:5432/dbname`. Start Postgres locally with `docker compose up -d postgres` or install it natively, then `createdb english_practice && alembic upgrade head`. SQLite is no longer supported for dev or prod.
+- `TEST_DATABASE_URL`: Separate PostgreSQL database used by the pytest fixtures (defaults to `postgresql+psycopg2://postgres:postgres@localhost:5432/english_practice_test`). Create once with `createdb english_practice_test`.
 - `REDIS_URL`: Redis connection string (optional; cache degrades gracefully if unavailable).
 - `CACHE_ENABLED`: Override cache; in prod defaults to true when unset.
 - `LLM_TIMEOUT_SECONDS`, `STT_TIMEOUT_SECONDS`, `TTS_TIMEOUT_SECONDS`: Timeouts for inference (defaults 60, 30, 45).

@@ -2,7 +2,8 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, Column, DateTime, String, text
+import sqlalchemy as sa
+from sqlalchemy import Boolean, Column, DateTime, String
 
 from app.models.usage import Base
 
@@ -15,7 +16,7 @@ class Admin(Base):
     id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     email = Column(String(255), unique=True, nullable=False, index=True)
     password_hash = Column(String(255), nullable=False)
-    is_active = Column(Boolean, nullable=False, server_default=text("1"), default=True)
+    is_active = Column(Boolean, nullable=False, server_default=sa.true(), default=True)
     last_login_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)

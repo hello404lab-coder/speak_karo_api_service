@@ -8,16 +8,14 @@ import json
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
-from sqlalchemy.pool import StaticPool
 
 from app.core.config import settings
 from app.database import get_db
 from app.dependencies.auth import get_current_user
 from app.main import app
 from app.models.billing import BillingCoupon
-from app.models.usage import Base, Usage
+from app.models.usage import Usage
 from app.models.user import User
 from app.services.billing_service import (
     verify_razorpay_checkout_signature,
@@ -52,23 +50,16 @@ def _clear_dependency_overrides():
 
 
 @pytest.fixture
-def memory_db():
-    from app.models import billing as _billing  # noqa: F401
-    from app.models import live_session as _live  # noqa: F401
-    from app.models import social_session as _social  # noqa: F401
-    from app.models import admin as _admin  # noqa: F401
-
-    engine = create_engine(
-        "sqlite:///:memory:",
-        connect_args={"check_same_thread": False},
-        poolclass=StaticPool,
-    )
-    Base.metadata.create_all(bind=engine)
+def memory_db(test_engine):
+    """Transactional PG session seeded with a subscription-ready user."""
+    connection = test_engine.connect()
+    transaction = connection.begin()
     SessionLocal = sessionmaker(
+        bind=connection,
         autocommit=False,
         autoflush=False,
-        bind=engine,
         expire_on_commit=False,
+        join_transaction_mode="create_savepoint",
     )
     db = SessionLocal()
     try:
@@ -85,7 +76,9 @@ def memory_db():
         yield db
     finally:
         db.close()
-        engine.dispose()
+        if transaction.is_active:
+            transaction.rollback()
+        connection.close()
 
 
 def _install_auth_overrides(memory_db: Session, user_id: str = "sub-user-1") -> User:
