@@ -59,3 +59,5 @@ htmlcov/
 
 # Docker
 .dockerignore
+stalwart-yen-485016-q0-8dded83af5ab.json
+*.json # optionally ignore all service account JSONs
