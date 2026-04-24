@@ -18,11 +18,24 @@ class UserResponse(BaseModel):
     id: str = Field(..., description="User UUID")
     email: str = Field(..., description="User email")
     name: str | None = Field(None, description="Display name")
+    native_language: str | None = Field(None, description="Learner's native language as entered during onboarding")
+    native_language_code: str | None = Field(None, description="Normalized native language code used for translation defaults")
     onboarding_completed: bool = Field(default=False, description="Whether user finished onboarding")
     onboarding_step: int = Field(default=0, description="Current onboarding step (0-5)")
-    plan: str = Field(default="free", description="Resolved plan: free, trial, or premium")
+    plan: Literal["free", "trial", "vuvl_plus", "vuvl_pro"] = Field(
+        default="free",
+        description="Resolved plan: free, trial, vuvl_plus, or vuvl_pro",
+    )
+    billing_phase: Literal["free", "trial", "authenticated", "active", "pending", "halted", "paused", "cancelled", "completed", "expired"] = Field(
+        default="free",
+        description="High-level billing phase",
+    )
     trial_expires_at: datetime | None = Field(None, description="Trial expiration")
-    subscription_expires_at: datetime | None = Field(None, description="Premium expiration")
+    subscription_expires_at: datetime | None = Field(None, description="Paid subscription expiration")
+    billing_status: str | None = Field(None, description="Latest provider-backed billing status")
+    active_plan_code: Literal["vuvl_plus", "vuvl_pro"] | None = Field(None, description="Active paid plan code")
+    current_period_end: datetime | None = Field(None, description="Current paid billing period end")
+    coupon_code: str | None = Field(None, description="Applied checkout coupon code")
 
     model_config = {"from_attributes": True}
 

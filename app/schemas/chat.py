@@ -3,6 +3,7 @@ from datetime import datetime
 from typing import Literal, Optional
 
 from pydantic import BaseModel, Field
+from app.schemas.ai import UserAnalysis
 
 
 class ConversationListItem(BaseModel):
@@ -33,14 +34,16 @@ class ChatMessage(BaseModel):
     """Single message in chat history (user or assistant)."""
     index: int = Field(..., ge=0, description="Zero-based display order. Always sort by this field; do not use id for ordering.")
     id: str = Field(..., description="Stable UUID for this message (e.g. React keys). Use index for ordering.")
+    exchange_id: str = Field(..., description="Underlying exchange row id shared by the user and assistant messages for one turn.")
+    client_turn_id: Optional[str] = Field(None, description="Optional client-generated turn id shared by the user and assistant messages for one exchange.")
     role: Literal["user", "assistant"] = Field(..., description="Message role")
     content: Optional[str] = Field(None, description="User message text (role=user)")
     user_audio_url: Optional[str] = Field(None, description="URL of user voice recording (role=user, voice-chat only)")
+    user_analysis: Optional[UserAnalysis] = Field(None, description="Feedback attached to the learner's message (role=user)")
     reply_text: Optional[str] = Field(None, description="Assistant reply (role=assistant)")
-    correction: Optional[str] = Field(None, description="Correction text (role=assistant)")
-    explanation: Optional[str] = Field(None, description="Short explanation (role=assistant)")
-    example: Optional[str] = Field(None, description="Example sentence (role=assistant)")
-    score: Optional[int] = Field(None, ge=0, le=100, description="Score 0-100 (role=assistant)")
+    translated_reply_text: Optional[str] = Field(None, description="Translated assistant reply (role=assistant)")
+    reply_language: Optional[str] = Field(None, description="Language code for assistant reply text (role=assistant)")
+    translation_language: Optional[str] = Field(None, description="Language code for translated assistant reply (role=assistant)")
     created_at: datetime = Field(..., description="Message timestamp")
 
 

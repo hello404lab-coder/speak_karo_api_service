@@ -42,7 +42,7 @@ def transcribe_audio(
     if not getattr(settings, "stt_whisper_local_enabled", True):
         from app.services.stt_backends import groq_whisper_api
         return groq_whisper_api.transcribe(
-            audio_file, filename, language_hint="en"  # raw: auto-detect, transcribe in spoken language
+            audio_file, filename, language_hint=None  # raw: auto-detect, transcribe in spoken language
         )
 
     effective_mode = mode if mode in ALLOWED_STT_MODES else settings.stt_mode
@@ -60,7 +60,7 @@ def transcribe_audio(
         if effective_mode == "openai_whisper_large_v3":
             from app.services.stt_backends import transformers_whisper
             return transformers_whisper.transcribe(
-                audio_file, filename, language_hint="en"  # raw: auto-detect, transcribe in spoken language
+                audio_file, filename, language_hint=None  # raw: auto-detect, transcribe in spoken language
             )
         # Fallback to large if unknown
         from app.services.stt_backends import faster_whisper

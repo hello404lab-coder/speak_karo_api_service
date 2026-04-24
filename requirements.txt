@@ -6,6 +6,7 @@ pydantic-settings==2.12.0
 sqlalchemy==2.0.45
 psycopg2-binary==2.9.11
 redis==7.1.0
+agora-token-builder>=1.0.0
 python-multipart==0.0.21
 google-auth>=2.36.0
 python-jose[cryptography]>=3.3.0
@@ -19,6 +20,7 @@ pytest==9.0.2
 boto3==1.42.31
 alembic==1.18.1
 google-genai==1.59.0
+google-cloud-texttospeech>=2.28.0
 pydub==0.25.1
 faster-whisper==1.2.1
 # TTS: Chatterbox-Turbo (English). PyPI chatterbox-tts does NOT include tts_turbo; install from GitHub to get ChatterboxTurboTTS.
@@ -30,3 +32,7 @@ resemble-perth
 # vocos  # dependency of IndicF5
 # pip install peft
 # chatterbox-tts
+
+soundfile==0.13.1
+torch==2.10.0
+asyncpg

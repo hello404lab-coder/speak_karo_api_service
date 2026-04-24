@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.dependencies.auth import get_current_user, limiter
+from app.models.billing import BillingSubscription
 from app.models.user import User
 from app.schemas.auth import (
     AccessTokenResponse,
@@ -22,14 +23,56 @@ from app.schemas.onboarding import (
     OnboardingStatusResponse,
     StudentDetailsStep,
 )
-from app.core.security import create_access_token, create_refresh_token, verify_token
-from app.core.security import REFRESH_TOKEN_TYPE
+from app.core.security import (
+    REFRESH_TOKEN_TYPE,
+    USER_PRINCIPAL_TYPE,
+    create_access_token,
+    create_refresh_token,
+    verify_token,
+)
 from app.services.auth_service import get_or_create_user, verify_google_token, verify_apple_token
+from app.services.billing_service import get_subscription_for_status, serialize_subscription_summary
 from app.services.subscription_service import resolve_user_plan
+from app.utils.language import normalize_language_code
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+
+def _build_user_response(user: User, db: Session) -> UserResponse:
+    """Serialize a user with safe defaults for optional/mock attributes."""
+    plan = resolve_user_plan(user)
+    summary = {
+        "billing_phase": "free",
+        "billing_status": None,
+        "active_plan_code": None,
+        "current_period_end": None,
+        "coupon_code": None,
+    }
+    try:
+        billing_row = get_subscription_for_status(db, user.id)
+        if isinstance(billing_row, BillingSubscription):
+            summary = serialize_subscription_summary(billing_row, user=user)
+    except Exception:
+        logger.warning("Billing summary unavailable for auth response: user_id=%s", user.id, exc_info=True)
+    return UserResponse(
+        id=user.id,
+        email=user.email,
+        name=user.name,
+        native_language=getattr(user, "native_language", None),
+        native_language_code=getattr(user, "native_language_code", None),
+        onboarding_completed=bool(getattr(user, "onboarding_completed", False) or False),
+        onboarding_step=int(getattr(user, "onboarding_step", 0) or 0),
+        plan=plan,
+        billing_phase=summary["billing_phase"],
+        trial_expires_at=getattr(user, "trial_expires_at", None),
+        subscription_expires_at=getattr(user, "subscription_expires_at", None),
+        billing_status=summary["billing_status"],
+        active_plan_code=summary["active_plan_code"],
+        current_period_end=summary["current_period_end"],
+        coupon_code=summary["coupon_code"],
+    )
 
 
 @router.post("/oauth", response_model=TokenResponse)
@@ -56,25 +99,15 @@ async def oauth_login(
         ) from e
 
     user = get_or_create_user(db, body.provider, provider_info)
-    access_token = create_access_token(subject=user.id)
-    refresh_token = create_refresh_token(subject=user.id)
+    access_token = create_access_token(subject=user.id, principal_type=USER_PRINCIPAL_TYPE)
+    refresh_token = create_refresh_token(subject=user.id, principal_type=USER_PRINCIPAL_TYPE)
 
     logger.info("Login success: user_id=%s provider=%s", user.id, body.provider)
-    plan = resolve_user_plan(user)
     return TokenResponse(
         access_token=access_token,
         refresh_token=refresh_token,
         token_type="bearer",
-        user=UserResponse(
-            id=user.id,
-            email=user.email,
-            name=user.name,
-            onboarding_completed=user.onboarding_completed,
-            onboarding_step=user.onboarding_step,
-            plan=plan,
-            trial_expires_at=user.trial_expires_at,
-            subscription_expires_at=user.subscription_expires_at,
-        ),
+        user=_build_user_response(user, db),
     )
 
 
@@ -85,14 +118,14 @@ async def refresh(
     body: RefreshTokenRequest,
 ) -> AccessTokenResponse:
     """Exchange a valid refresh token for a new access token."""
-    user_id = verify_token(body.refresh_token, REFRESH_TOKEN_TYPE)
+    user_id = verify_token(body.refresh_token, REFRESH_TOKEN_TYPE, USER_PRINCIPAL_TYPE)
     if not user_id:
         logger.warning("Refresh token verification failed")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid or expired refresh token",
         )
-    access_token = create_access_token(subject=user_id)
+    access_token = create_access_token(subject=user_id, principal_type=USER_PRINCIPAL_TYPE)
     return AccessTokenResponse(access_token=access_token, token_type="bearer")
 
 
@@ -101,19 +134,10 @@ async def refresh(
 async def me(
     request: Request,
     current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
 ) -> UserResponse:
     """Return the current authenticated user (requires Bearer token)."""
-    plan = resolve_user_plan(current_user)
-    return UserResponse(
-        id=current_user.id,
-        email=current_user.email,
-        name=current_user.name,
-        onboarding_completed=current_user.onboarding_completed,
-        onboarding_step=current_user.onboarding_step,
-        plan=plan,
-        trial_expires_at=current_user.trial_expires_at,
-        subscription_expires_at=current_user.subscription_expires_at,
-    )
+    return _build_user_response(current_user, db)
 
 
 @router.post("/logout")
@@ -174,6 +198,7 @@ async def onboarding_language(
 ) -> dict[str, int]:
     """Step 2: set native language."""
     current_user.native_language = body.native_language
+    current_user.native_language_code = normalize_language_code(body.native_language)
     current_user.onboarding_step = 2
     db.commit()
     db.refresh(current_user)

@@ -5,7 +5,7 @@ from slowapi import Limiter
 from slowapi.util import get_remote_address
 from sqlalchemy.orm import Session
 
-from app.core.security import ACCESS_TOKEN_TYPE, verify_token
+from app.core.security import ACCESS_TOKEN_TYPE, USER_PRINCIPAL_TYPE, verify_token
 from app.database import get_db
 from app.models.user import User
 
@@ -19,7 +19,7 @@ def get_current_user(
     db: Session = Depends(get_db),
 ) -> User:
     """Decode JWT from Authorization header and return the User. Raises 401 if invalid."""
-    user_id = verify_token(token, ACCESS_TOKEN_TYPE)
+    user_id = verify_token(token, ACCESS_TOKEN_TYPE, USER_PRINCIPAL_TYPE)
     if not user_id:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,

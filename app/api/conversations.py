@@ -10,6 +10,12 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import and_, or_
 from sqlalchemy.orm import Session
 
+from app.core.prompts import (
+    build_display_correction,
+    extract_correction_candidate_from_reply,
+    has_meaningful_correction,
+    user_analysis_needs_repair,
+)
 from app.database import get_db
 from app.dependencies.auth import get_current_user
 from app.dependencies.subscription import require_active_plan
@@ -24,6 +30,8 @@ from app.schemas.chat import (
     TitleResponse,
 )
 from app.services.llm import generate_conversation_title
+from app.schemas.ai import MessageAudioRequest, MessageAudioResponse
+from app.services.tts import resolve_stored_audio_playback_url, text_to_speech_record
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +42,56 @@ MAX_MESSAGES_LIMIT = 50
 
 # Namespace for deterministic message UUIDs (user/assistant per row)
 MESSAGE_IDS_NAMESPACE = uuid.uuid5(uuid.NAMESPACE_DNS, "ai-english-practice.messages")
+
+
+def _build_user_analysis(row: Message) -> dict:
+    """Build nested learner feedback from a stored message row."""
+    explanation = row.hinglish_explanation or None
+    example = row.example or None
+    correction = row.correction or ""
+
+    if not correction and (explanation or example):
+        correction = build_display_correction(row.user_message)
+
+    analysis = {
+        "correction": correction if has_meaningful_correction(correction, row.user_message or "", explanation or "", example or "") else None,
+        "explanation": explanation,
+        "example": example,
+        "score": row.score if row.score is not None else 75,
+    }
+    if not user_analysis_needs_repair(
+        {
+            "reply_text": row.ai_reply or "",
+            "correction": analysis["correction"] or "",
+            "explanation": analysis["explanation"] or "",
+            "example": analysis["example"] or "",
+            "score": analysis["score"],
+        },
+        row.user_message or "",
+    ):
+        return analysis
+
+    extracted = extract_correction_candidate_from_reply(row.ai_reply or "", row.user_message or "")
+    if extracted:
+        analysis["correction"] = extracted if has_meaningful_correction(extracted, row.user_message or "", analysis["explanation"] or "", analysis["example"] or "") else None
+        if not user_analysis_needs_repair(
+            {
+                "reply_text": row.ai_reply or "",
+                "correction": analysis["correction"] or "",
+                "explanation": analysis["explanation"] or "",
+                "example": analysis["example"] or "",
+                "score": analysis["score"],
+            },
+            row.user_message or "",
+        ):
+            return analysis
+
+    fallback_correction = build_display_correction(row.user_message)
+    analysis["correction"] = fallback_correction if has_meaningful_correction(fallback_correction, row.user_message or "", analysis["explanation"] or "", analysis["example"] or "") else None
+    if analysis["explanation"] and not analysis["correction"]:
+        analysis["explanation"] = None
+        analysis["example"] = None
+    return analysis
 
 
 def _encode_cursor(created_at: datetime, message_id: str) -> str:
@@ -68,6 +126,28 @@ def get_conversation_for_user(
     if not conversation:
         raise HTTPException(status_code=404, detail="Conversation not found")
     return conversation
+
+
+def get_exchange_for_user(
+    conversation_id: str,
+    exchange_id: str,
+    user_id: str,
+    db: Session,
+) -> Message:
+    """Return an exchange row if it exists and belongs to the user."""
+    message = (
+        db.query(Message)
+        .join(Conversation, Conversation.id == Message.conversation_id)
+        .filter(
+            Message.id == exchange_id,
+            Message.conversation_id == conversation_id,
+            Conversation.user_id == user_id,
+        )
+        .first()
+    )
+    if not message:
+        raise HTTPException(status_code=404, detail="Message not found")
+    return message
 
 
 @router.get("", response_model=ConversationListResponse)
@@ -177,14 +257,16 @@ def list_messages(
             ChatMessage(
                 index=idx * 2,
                 id=user_msg_id,
+                exchange_id=row_id_str,
+                client_turn_id=row.client_turn_id,
                 role="user",
                 content=row.user_message,
                 user_audio_url=row.user_audio_url,
+                user_analysis=_build_user_analysis(row),
                 reply_text=None,
-                correction=None,
-                explanation=None,
-                example=None,
-                score=None,
+                translated_reply_text=None,
+                reply_language=None,
+                translation_language=None,
                 created_at=row.created_at,
             )
         )
@@ -192,14 +274,16 @@ def list_messages(
             ChatMessage(
                 index=idx * 2 + 1,
                 id=assistant_msg_id,
+                exchange_id=row_id_str,
+                client_turn_id=row.client_turn_id,
                 role="assistant",
                 content=None,
                 user_audio_url=None,
+                user_analysis=None,
                 reply_text=row.ai_reply,
-                correction=row.correction,
-                explanation=row.hinglish_explanation,
-                example=row.example,
-                score=row.score,
+                translated_reply_text=row.translated_ai_reply,
+                reply_language=row.reply_language,
+                translation_language=row.translation_language_code,
                 created_at=row.created_at,
             )
         )
@@ -214,6 +298,67 @@ def list_messages(
         conversation_id,
     )
     return MessagesResponse(messages=messages, next_cursor=next_cursor)
+
+
+@router.post("/{conversation_id}/messages/{exchange_id}/audio", response_model=MessageAudioResponse)
+def get_message_audio(
+    conversation_id: str,
+    exchange_id: str,
+    request: MessageAudioRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_active_plan),
+) -> MessageAudioResponse:
+    """Generate or reuse stored audio for a specific exchange segment."""
+    get_conversation_for_user(conversation_id, current_user.id, db)
+    message = get_exchange_for_user(conversation_id, exchange_id, current_user.id, db)
+
+    segment_map = {
+        "reply": (
+            message.ai_reply,
+            message.reply_language or "en",
+            "ai_reply_audio_storage_ref",
+        ),
+        "translation": (
+            message.translated_ai_reply,
+            message.translation_language_code,
+            "translated_ai_reply_audio_storage_ref",
+        ),
+        "explanation": (
+            message.hinglish_explanation,
+            message.reply_language or "en",
+            "explanation_audio_storage_ref",
+        ),
+        "example": (
+            message.example,
+            message.reply_language or "en",
+            "example_audio_storage_ref",
+        ),
+    }
+    text, response_language, storage_attr = segment_map[request.segment]
+    if not (text or "").strip():
+        raise HTTPException(status_code=404, detail=f"No {request.segment} audio available")
+    if not (response_language or "").strip():
+        raise HTTPException(status_code=400, detail=f"No language available for {request.segment} audio")
+
+    storage_ref = getattr(message, storage_attr)
+    if storage_ref:
+        playback_url = resolve_stored_audio_playback_url(storage_ref)
+        if playback_url:
+            return MessageAudioResponse(
+                audio_url=playback_url,
+                segment=request.segment,
+                generated=False,
+            )
+
+    record = text_to_speech_record(text, response_language)
+    setattr(message, storage_attr, record.storage_ref)
+    db.commit()
+    db.refresh(message)
+    return MessageAudioResponse(
+        audio_url=record.playback_url,
+        segment=request.segment,
+        generated=True,
+    )
 
 
 @router.post("/{conversation_id}/title", response_model=TitleResponse)
