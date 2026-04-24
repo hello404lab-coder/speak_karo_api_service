@@ -150,6 +150,7 @@ def test_tts_stream_endpoint_uses_chirp_streaming_path(monkeypatch):
     _install_overrides(memory_db, user)
     try:
         monkeypatch.setattr("app.api.ai.chirp_streaming_enabled_for_text", lambda *args, **kwargs: True)
+        monkeypatch.setattr("app.api.ai.smallest_streaming_enabled_for_text", lambda *args, **kwargs: False)
         monkeypatch.setattr("app.api.ai.split_text_for_chirp_stream", lambda text: ["Hello", "world"])
         monkeypatch.setattr("app.api.ai._store_pcm_stream_and_store", lambda audio, text: ("https://audio.test/final.mp3", None))
 
@@ -240,6 +241,7 @@ def test_chat_stream_endpoint_keeps_existing_sse_contract_with_chirp(monkeypatch
     _install_overrides(memory_db, user)
     try:
         monkeypatch.setattr("app.api.ai.chirp_streaming_enabled_for_text", lambda *args, **kwargs: True)
+        monkeypatch.setattr("app.api.ai.smallest_streaming_enabled_for_text", lambda *args, **kwargs: False)
         monkeypatch.setattr(
             "app.api.ai.stream_gemini_tokens",
             lambda *args, **kwargs: iter([

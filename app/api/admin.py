@@ -18,6 +18,11 @@ from app.dependencies.auth import limiter
 from app.models.admin import Admin
 from app.schemas.admin import (
     AdminAccessTokenResponse,
+    AdminCouponCreateRequest,
+    AdminCouponRedemptionsListResponse,
+    AdminCouponResponse,
+    AdminCouponsListResponse,
+    AdminCouponUpdateRequest,
     AdminLoginRequest,
     AdminRefreshTokenRequest,
     AdminResponse,
@@ -27,6 +32,16 @@ from app.schemas.admin import (
 )
 from app.services.admin_auth_service import authenticate_admin, record_admin_login
 from app.services.admin_query_service import get_user_detail_for_admin, list_users_for_admin
+from app.services.coupon_service import (
+    create_coupon,
+    disable_coupon,
+    get_coupon_detail_for_admin,
+    list_coupon_redemptions_for_admin,
+    list_coupons_for_admin,
+    serialize_coupon_for_admin,
+    update_coupon,
+)
+from app.models.billing import BillingCoupon
 
 logger = logging.getLogger(__name__)
 
@@ -143,3 +158,102 @@ async def admin_get_user_detail(
     if not payload:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
     return AdminUserDetailResponse.model_validate(payload)
+
+
+@router.get("/coupons", response_model=AdminCouponsListResponse)
+@limiter.limit("30/minute")
+async def admin_list_coupons(
+    request: Request,
+    db: Session = Depends(get_db),
+    current_admin: Admin = Depends(get_current_admin),
+) -> AdminCouponsListResponse:
+    """Return all billing coupons for admin management."""
+    del request, current_admin
+    return AdminCouponsListResponse(items=list_coupons_for_admin(db))
+
+
+@router.post("/coupons", response_model=AdminCouponResponse, status_code=status.HTTP_201_CREATED)
+@limiter.limit("20/minute")
+async def admin_create_coupon(
+    request: Request,
+    body: AdminCouponCreateRequest,
+    db: Session = Depends(get_db),
+    current_admin: Admin = Depends(get_current_admin),
+) -> AdminCouponResponse:
+    """Create one admin-managed coupon."""
+    del request
+    try:
+        coupon = create_coupon(db, admin=current_admin, payload=body.model_dump())
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    return AdminCouponResponse.model_validate(serialize_coupon_for_admin(db, coupon))
+
+
+@router.get("/coupons/{coupon_id}", response_model=AdminCouponResponse)
+@limiter.limit("30/minute")
+async def admin_get_coupon(
+    coupon_id: str,
+    request: Request,
+    db: Session = Depends(get_db),
+    current_admin: Admin = Depends(get_current_admin),
+) -> AdminCouponResponse:
+    """Return one coupon for admin review."""
+    del request, current_admin
+    payload = get_coupon_detail_for_admin(db, coupon_id)
+    if not payload:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Coupon not found")
+    return AdminCouponResponse.model_validate(payload)
+
+
+@router.patch("/coupons/{coupon_id}", response_model=AdminCouponResponse)
+@limiter.limit("20/minute")
+async def admin_update_coupon(
+    coupon_id: str,
+    request: Request,
+    body: AdminCouponUpdateRequest,
+    db: Session = Depends(get_db),
+    current_admin: Admin = Depends(get_current_admin),
+) -> AdminCouponResponse:
+    """Patch an existing coupon."""
+    del request
+    coupon = db.query(BillingCoupon).filter(BillingCoupon.id == coupon_id).first()
+    if not coupon:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Coupon not found")
+    try:
+        coupon = update_coupon(db, coupon=coupon, admin=current_admin, payload=body.model_dump(exclude_unset=True))
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    return AdminCouponResponse.model_validate(serialize_coupon_for_admin(db, coupon))
+
+
+@router.post("/coupons/{coupon_id}/disable", response_model=AdminCouponResponse)
+@limiter.limit("20/minute")
+async def admin_disable_coupon(
+    coupon_id: str,
+    request: Request,
+    db: Session = Depends(get_db),
+    current_admin: Admin = Depends(get_current_admin),
+) -> AdminCouponResponse:
+    """Disable one coupon."""
+    del request
+    coupon = db.query(BillingCoupon).filter(BillingCoupon.id == coupon_id).first()
+    if not coupon:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Coupon not found")
+    coupon = disable_coupon(db, coupon=coupon, admin=current_admin)
+    return AdminCouponResponse.model_validate(serialize_coupon_for_admin(db, coupon))
+
+
+@router.get("/coupons/{coupon_id}/redemptions", response_model=AdminCouponRedemptionsListResponse)
+@limiter.limit("30/minute")
+async def admin_coupon_redemptions(
+    coupon_id: str,
+    request: Request,
+    db: Session = Depends(get_db),
+    current_admin: Admin = Depends(get_current_admin),
+) -> AdminCouponRedemptionsListResponse:
+    """Return redemption history for one coupon."""
+    del request, current_admin
+    coupon = db.query(BillingCoupon).filter(BillingCoupon.id == coupon_id).first()
+    if not coupon:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Coupon not found")
+    return AdminCouponRedemptionsListResponse(items=list_coupon_redemptions_for_admin(db, coupon_id))

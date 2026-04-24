@@ -2,7 +2,7 @@
 import hashlib
 import json
 import logging
-from typing import Iterator, List, Dict, Optional
+from typing import Iterator, List, Dict, Optional, Any
 from google import genai
 from google.genai import types
 from app.core.config import settings
@@ -25,6 +25,10 @@ logger = logging.getLogger(__name__)
 # Initialize Gemini client (lazy loaded)
 _gemini_client = None
 
+_GEMINI_BUSY_MESSAGE = "The AI is busy right now. Please try again in a few seconds."
+_GEMINI_TIMEOUT_MESSAGE = "The AI took too long to respond. Please try again."
+_GEMINI_GENERIC_ERROR_MESSAGE = "Something went wrong. Please try again."
+
 
 def _get_gemini_client():
     """Lazy load Gemini client with request timeout. Client is stateless (HTTP), no lock needed."""
@@ -43,6 +47,45 @@ def _get_gemini_client():
             _gemini_client = genai.Client(api_key=settings.gemini_api_key)
         logger.info("Gemini client initialized for LLM (timeout=%ss)", settings.llm_timeout_seconds)
     return _gemini_client
+
+
+def _extract_exception_status_code(exc: Exception) -> Optional[int]:
+    for attr in ("status_code", "code"):
+        value = getattr(exc, attr, None)
+        if isinstance(value, int):
+            return value
+        if isinstance(value, str) and value.isdigit():
+            return int(value)
+    response = getattr(exc, "response", None)
+    response_status = getattr(response, "status_code", None)
+    if isinstance(response_status, int):
+        return response_status
+    return None
+
+
+def _user_facing_gemini_error_message(exc: Exception) -> str:
+    status_code = _extract_exception_status_code(exc)
+    message = str(exc or "").lower()
+
+    if status_code in {429, 500, 502, 503, 504}:
+        return _GEMINI_BUSY_MESSAGE
+    if any(
+        marker in message
+        for marker in (
+            "503",
+            "429",
+            "unavailable",
+            "high demand",
+            "resource exhausted",
+            "rate limit",
+            "overloaded",
+            "try again later",
+        )
+    ):
+        return _GEMINI_BUSY_MESSAGE
+    if "timeout" in message or "timed out" in message:
+        return _GEMINI_TIMEOUT_MESSAGE
+    return _GEMINI_GENERIC_ERROR_MESSAGE
 
 
 def init_llm_client() -> dict:
@@ -148,6 +191,33 @@ def _count_contents_tokens(client, model: str, contents: List[types.Content]) ->
             for p in c.parts:
                 total += _estimate_tokens_text(getattr(p, "text", None) or "")
     return total
+
+
+def _extract_output_tokens_from_usage_metadata(usage_metadata: Any) -> int:
+    """Return candidate/output token count from Gemini usage metadata."""
+    if usage_metadata is None:
+        return 0
+    candidates = getattr(usage_metadata, "candidates_token_count", None)
+    if isinstance(candidates, int):
+        return max(0, candidates)
+    return 0
+
+
+def estimate_output_tokens_for_text(text: str, model: Optional[str] = None, client=None) -> int:
+    """Estimate output token count for generated text, preferring Gemini count_tokens."""
+    normalized = (text or "").strip()
+    if not normalized:
+        return 0
+    model_name = model or settings.llm_model
+    try:
+        active_client = client or _get_gemini_client()
+        resp = active_client.models.count_tokens(model=model_name, contents=normalized)
+        total = getattr(resp, "total_tokens", None)
+        if isinstance(total, int):
+            return max(0, total)
+    except Exception:
+        pass
+    return _estimate_tokens_text(normalized)
 
 
 def _build_trimmed_contents(
@@ -378,6 +448,7 @@ def stream_gemini_tokens(
     reply_language: str = "en",
     translation_language: Optional[str] = None,
     long_term_context: Optional[str] = None,
+    usage_sink: Optional[dict[str, int]] = None,
 ) -> Iterator[str]:
     """
     Stream Gemini response as text deltas (tokens). No caching.
@@ -408,11 +479,16 @@ def stream_gemini_tokens(
             config_dict["safety_settings"] = safety_settings
         config = types.GenerateContentConfig(**config_dict)
         logger.info("Starting Gemini stream (model=%s)", settings.llm_model)
+        output_tokens_from_usage = 0
         for chunk in client.models.generate_content_stream(
             model=settings.llm_model,
             contents=contents,
             config=config,
         ):
+            output_tokens_from_usage = max(
+                output_tokens_from_usage,
+                _extract_output_tokens_from_usage_metadata(getattr(chunk, "usage_metadata", None)),
+            )
             # Avoid chunk.text when AFC may emit function_call parts (raises ValueError)
             text = None
             try:
@@ -430,18 +506,20 @@ def stream_gemini_tokens(
                         t = getattr(part, "text", None)
                         if t and isinstance(t, str) and t.strip():
                             yield t
+        if usage_sink is not None:
+            usage_sink["output_tokens"] = max(0, int(output_tokens_from_usage or 0))
     except Exception as e:
         logger.exception("Gemini stream error: %s", e)
-        raise
+        raise RuntimeError(_user_facing_gemini_error_message(e)) from e
 
 
-def generate_reply(
+def generate_reply_with_usage(
     user_message: str,
     conversation_history: List[Dict[str, str]] = None,
     reply_language: str = "en",
     translation_language: Optional[str] = None,
     long_term_context: Optional[str] = None,
-) -> Dict[str, any]:
+) -> tuple[Dict[str, any], int]:
     """
     Generate AI reply with correction and explanation using Gemini.
 
@@ -482,7 +560,7 @@ def generate_reply(
                 },
                 reply_language,
                 translation_language,
-            )
+            ), 0
 
         system_instruction = get_system_instruction(reply_language, translation_language, long_term_context)
 
@@ -510,6 +588,7 @@ def generate_reply(
             contents=contents,
             config=types.GenerateContentConfig(**config_dict)
         )
+        output_tokens = _extract_output_tokens_from_usage_metadata(getattr(response, "usage_metadata", None))
         
         # Log full response metadata for debugging
         logger.debug(f"Response object: candidates={len(response.candidates) if response.candidates else 0}")
@@ -590,7 +669,7 @@ def generate_reply(
             },
             settings.llm_cache_ttl,
         )
-        return _build_response_with_translation(parsed, reply_language, translation_language)
+        return _build_response_with_translation(parsed, reply_language, translation_language), int(output_tokens or 0)
         
     except ValueError as e:
         logger.error(f"Gemini LLM validation error: {e}")
@@ -610,13 +689,13 @@ def generate_reply(
             ),
             reply_language,
             translation_language,
-        )
+        ), 0
     except Exception as e:
         logger.error(f"Unexpected Gemini LLM error: {e}", exc_info=True)
         return _build_response_with_translation(
             finalize_llm_reply(
                 {
-                    "reply_text": "Something went wrong. Please try again.",
+                    "reply_text": _user_facing_gemini_error_message(e),
                     "translated_reply_text": None,
                     "correction": "",
                     "explanation": "",
@@ -629,4 +708,22 @@ def generate_reply(
             ),
             reply_language,
             translation_language,
-        )
+        ), 0
+
+
+def generate_reply(
+    user_message: str,
+    conversation_history: List[Dict[str, str]] = None,
+    reply_language: str = "en",
+    translation_language: Optional[str] = None,
+    long_term_context: Optional[str] = None,
+) -> Dict[str, any]:
+    """Backward-compatible wrapper that returns only the response payload."""
+    result, _ = generate_reply_with_usage(
+        user_message,
+        conversation_history,
+        reply_language,
+        translation_language,
+        long_term_context,
+    )
+    return result

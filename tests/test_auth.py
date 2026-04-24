@@ -3,6 +3,7 @@ import pytest
 from fastapi.testclient import TestClient
 from unittest.mock import patch, MagicMock
 
+from app.database import get_db
 from app.main import app
 from app.core.security import create_access_token, create_refresh_token
 from app.models.user import User
@@ -121,8 +122,7 @@ def test_me_without_token():
     assert response.status_code == 401
 
 
-@patch("app.database.get_db")
-def test_me_with_valid_token(mock_get_db):
+def test_me_with_valid_token():
     """GET /me with valid Bearer token returns current user."""
     user = User(
         id="user-me-1",
@@ -131,24 +131,26 @@ def test_me_with_valid_token(mock_get_db):
         provider="google",
         provider_id="google-me",
     )
-    mock_get_db.return_value = _mock_db_with_user(user)
+    # Must override the same get_db object used by get_current_user (import-time ref ignores @patch)
+    app.dependency_overrides[get_db] = _mock_db_with_user(user)
+    try:
+        access_token = create_access_token(subject=user.id)
+        response = client.get(
+            "/api/v1/auth/me",
+            headers={"Authorization": f"Bearer {access_token}"},
+        )
 
-    access_token = create_access_token(subject=user.id)
-    response = client.get(
-        "/api/v1/auth/me",
-        headers={"Authorization": f"Bearer {access_token}"},
-    )
-
-    assert response.status_code == 200
-    data = response.json()
-    assert data["id"] == "user-me-1"
-    assert data["email"] == "me@example.com"
-    assert data["name"] == "Me User"
+        assert response.status_code == 200
+        data = response.json()
+        assert data["id"] == "user-me-1"
+        assert data["email"] == "me@example.com"
+        assert data["name"] == "Me User"
+    finally:
+        app.dependency_overrides.pop(get_db, None)
 
 
-@patch("app.database.get_db")
-def test_me_with_expired_token(mock_get_db):
-    """GET /me with expired access token returns 401."""
+def test_me_with_expired_token():
+    """GET /me with expired access token returns 401 (before any DB access)."""
     from datetime import datetime, timezone, timedelta
     from jose import jwt
     from app.core.config import settings
@@ -161,12 +163,6 @@ def test_me_with_expired_token(mock_get_db):
         settings.jwt_secret,
         algorithm="HS256",
     )
-
-    mock_session = MagicMock()
-    mock_session.query.return_value.filter.return_value.first.return_value = None
-    def get_db():
-        yield mock_session
-    mock_get_db.return_value = get_db()
 
     response = client.get(
         "/api/v1/auth/me",

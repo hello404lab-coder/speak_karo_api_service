@@ -218,7 +218,7 @@ class Settings(BaseSettings):
         description="TTS_GEMINI_MODEL_INDIC: Gemini TTS model for Indic languages (when IndicF5 off or after IndicF5 failure)",
     )
     tts_gemini_voice: str = Field(default="Puck", description="TTS_GEMINI_VOICE: prebuilt voice name for Gemini TTS")
-    tts_cloud_provider: Literal["gemini", "chirp3_hd"] = Field(
+    tts_cloud_provider: Literal["gemini", "chirp3_hd", "smallest"] = Field(
         default="gemini",
         description="TTS_CLOUD_PROVIDER: cloud TTS backend when local providers are unavailable or disabled",
     )
@@ -250,6 +250,49 @@ class Settings(BaseSettings):
         default=30,
         description="TTS_CHIRP_TIMEOUT_SECONDS: timeout in seconds for Chirp 3 HD streaming and unary requests",
     )
+
+    # Smallest.ai Waves (Lightning TTS) — https://docs.smallest.ai
+    smallest_api_key: Optional[str] = Field(
+        default=None,
+        description="SMALLEST_API_KEY: Smallest.ai Waves API key",
+    )
+    tts_smallest_model: str = Field(
+        default="lightning-v3.1",
+        description="TTS_SMALLEST_MODEL: model id (path segment, e.g. lightning-v3.1)",
+    )
+    tts_smallest_voice: str = Field(
+        default="magnus",
+        description="TTS_SMALLEST_VOICE: default Smallest voice_id",
+    )
+    tts_smallest_voice_per_lang: Optional[str] = Field(
+        default=None,
+        description="TTS_SMALLEST_VOICE_PER_LANG: optional comma-separated lang:voice (e.g. ta:magnus,hi:xyz); Malayalam is not routed to Smallest",
+    )
+    tts_smallest_sample_rate_hz: int = Field(
+        default=24000,
+        description="TTS_SMALLEST_SAMPLE_RATE_HZ: sample rate for Smallest TTS (8000–44100 per API)",
+    )
+    tts_smallest_speed: float = Field(
+        default=1.0,
+        description="TTS_SMALLEST_SPEED: speech speed 0.5–2.0",
+    )
+    tts_smallest_output_format: Literal["wav", "mp3", "pcm", "mulaw"] = Field(
+        default="wav",
+        description="TTS_SMALLEST_OUTPUT_FORMAT: output format for unary /get_speech",
+    )
+    tts_smallest_streaming_enabled: bool = Field(
+        default=True,
+        description="TTS_SMALLEST_STREAMING_ENABLED: use SSE /stream in LLM voice pipeline when provider is Smallest",
+    )
+    tts_smallest_timeout_seconds: int = Field(
+        default=30,
+        description="TTS_SMALLEST_TIMEOUT_SECONDS: HTTP timeout for Smallest TTS",
+    )
+    tts_smallest_base_url: str = Field(
+        default="https://api.smallest.ai/waves/v1",
+        description="TTS_SMALLEST_BASE_URL: Smallest Waves API base URL",
+    )
+
     # Max concurrent TTS inferences (1 = strict serialization for low VRAM; 2+ = Semaphore for lower latency)
     tts_concurrent_inferences: int = Field(default=2, description="TTS_CONCURRENT_INFERENCES: max concurrent TTS inferences")
     # When True, force DummyWatermarker to skip loading watermark weights (patch must run before model instantiation)

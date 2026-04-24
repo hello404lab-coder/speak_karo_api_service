@@ -59,3 +59,23 @@ def validate_wav_file(audio_bytes: bytes, max_size_mb: int = 10, max_duration_se
             raise
         # Otherwise, just log and continue (basic validation passed)
         pass
+
+
+def wav_bytes_duration_seconds(audio_bytes: bytes) -> float:
+    """Return WAV duration in seconds from RIFF headers, or 0.0 when unknown."""
+    if len(audio_bytes) < 44:
+        return 0.0
+    if audio_bytes[:4] != b"RIFF" or audio_bytes[8:12] != b"WAVE":
+        return 0.0
+    try:
+        fmt_pos = audio_bytes.find(b"fmt ")
+        data_pos = audio_bytes.find(b"data")
+        if fmt_pos < 0 or data_pos < 0:
+            return 0.0
+        byte_rate = struct.unpack("<I", audio_bytes[fmt_pos + 16:fmt_pos + 20])[0]
+        data_size = struct.unpack("<I", audio_bytes[data_pos + 4:data_pos + 8])[0]
+        if byte_rate <= 0:
+            return 0.0
+        return max(0.0, float(data_size) / float(byte_rate))
+    except Exception:
+        return 0.0

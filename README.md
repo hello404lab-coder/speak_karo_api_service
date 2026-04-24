@@ -77,7 +77,7 @@ See `.env.example` for all available configuration options. Key variables:
 
 - `APP_ENV`: `dev` or `prod` — controls GPU usage, cache defaults, and strictness (see DEV vs PROD below).
 - `GEMINI_API_KEY`: Google Gemini API key; **required when APP_ENV=prod**.
-- `TTS_CLOUD_PROVIDER`: `gemini` or `chirp3_hd` — selects the cloud TTS backend used when local TTS backends are unavailable or disabled.
+- `TTS_CLOUD_PROVIDER`: `gemini`, `chirp3_hd`, or `smallest` — selects the cloud TTS backend when local TTS backends are unavailable or disabled. **Smallest** uses [Smallest.ai Lightning TTS](https://docs.smallest.ai) (set `SMALLEST_API_KEY` and optional `TTS_SMALLEST_*` vars). **Malayalam** is not routed to Smallest; it uses **Chirp 3 HD** (or Gemini) as fallback.
 - `TTS_CHIRP_REGION`, `TTS_CHIRP_ENDPOINT`, `TTS_CHIRP_VOICE`, `TTS_CHIRP_SPEAKING_RATE`, `TTS_CHIRP_SAMPLE_RATE_HZ`, `TTS_CHIRP_TIMEOUT_SECONDS`: Chirp 3 HD settings. The backend now defaults Chirp streaming to `PCM` at `44100 Hz`. Chirp uses Google Cloud ADC / service-account credentials plus Cloud Text-to-Speech, not `GEMINI_API_KEY`.
 - `DATABASE_URL`: PostgreSQL or SQLite connection URL. For local dev without PostgreSQL, set `DATABASE_URL=sqlite:///./data/english_practice.sqlite` and run `alembic upgrade head` to create the file and tables.
 - `REDIS_URL`: Redis connection string (optional; cache degrades gracefully if unavailable).

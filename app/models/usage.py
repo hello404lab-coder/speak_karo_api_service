@@ -18,6 +18,9 @@ class Usage(Base):
     user_id = Column(String, nullable=False, index=True)
     date = Column(Date, default=date.today, nullable=False, index=True)
     minutes_used = Column(Float, default=0.0)
+    llm_output_tokens = Column(Integer, nullable=False, default=0, server_default=sa.text("0"))
+    stt_seconds = Column(Float, nullable=False, default=0.0, server_default=sa.text("0"))
+    tts_seconds = Column(Float, nullable=False, default=0.0, server_default=sa.text("0"))
     request_count = Column(Integer, default=0)
     chat_count = Column(Integer, nullable=False, default=0, server_default=sa.text("0"))
     voice_count = Column(Integer, nullable=False, default=0, server_default=sa.text("0"))
@@ -64,6 +67,10 @@ class Message(Base):
     score = Column(Integer, nullable=True)  # 0-100
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
     user_audio_url = Column(String(512), nullable=True)  # URL for user voice recording (voice-chat only)
+    ai_reply_audio_storage_ref = Column(String(1024), nullable=True)
+    translated_ai_reply_audio_storage_ref = Column(String(1024), nullable=True)
+    explanation_audio_storage_ref = Column(String(1024), nullable=True)
+    example_audio_storage_ref = Column(String(1024), nullable=True)
     
     conversation = relationship("Conversation", back_populates="messages")
     

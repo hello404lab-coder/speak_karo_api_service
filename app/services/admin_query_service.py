@@ -40,6 +40,9 @@ def _usage_totals_subquery(db: Session):
             func.coalesce(func.sum(Usage.chat_count), 0).label("total_chat_count"),
             func.coalesce(func.sum(Usage.voice_count), 0).label("total_voice_count"),
             func.coalesce(func.sum(Usage.minutes_used), 0.0).label("total_minutes_used"),
+            func.coalesce(func.sum(Usage.llm_output_tokens), 0).label("total_llm_output_tokens"),
+            func.coalesce(func.sum(Usage.stt_seconds), 0.0).label("total_stt_seconds"),
+            func.coalesce(func.sum(Usage.tts_seconds), 0.0).label("total_tts_seconds"),
         )
         .group_by(Usage.user_id)
         .subquery()
@@ -93,6 +96,9 @@ def list_users_for_admin(
             func.coalesce(usage_totals.c.total_chat_count, 0).label("total_chat_count"),
             func.coalesce(usage_totals.c.total_voice_count, 0).label("total_voice_count"),
             func.coalesce(usage_totals.c.total_minutes_used, 0.0).label("total_minutes_used"),
+            func.coalesce(usage_totals.c.total_llm_output_tokens, 0).label("total_llm_output_tokens"),
+            func.coalesce(usage_totals.c.total_stt_seconds, 0.0).label("total_stt_seconds"),
+            func.coalesce(usage_totals.c.total_tts_seconds, 0.0).label("total_tts_seconds"),
         )
         .outerjoin(usage_totals, usage_totals.c.user_id == User.id)
         .outerjoin(last_activity, last_activity.c.user_id == User.id)
@@ -144,6 +150,9 @@ def list_users_for_admin(
             "total_chat_count": int(row.total_chat_count or 0),
             "total_voice_count": int(row.total_voice_count or 0),
             "total_minutes_used": float(row.total_minutes_used or 0.0),
+            "total_llm_output_tokens": int(row.total_llm_output_tokens or 0),
+            "total_stt_seconds": float(row.total_stt_seconds or 0.0),
+            "total_tts_seconds": float(row.total_tts_seconds or 0.0),
         }
         for row in rows
     ]
@@ -172,6 +181,9 @@ def get_user_detail_for_admin(db: Session, user_id: str) -> dict | None:
             func.coalesce(usage_totals.c.total_chat_count, 0).label("total_chat_count"),
             func.coalesce(usage_totals.c.total_voice_count, 0).label("total_voice_count"),
             func.coalesce(usage_totals.c.total_minutes_used, 0.0).label("total_minutes_used"),
+            func.coalesce(usage_totals.c.total_llm_output_tokens, 0).label("total_llm_output_tokens"),
+            func.coalesce(usage_totals.c.total_stt_seconds, 0.0).label("total_stt_seconds"),
+            func.coalesce(usage_totals.c.total_tts_seconds, 0.0).label("total_tts_seconds"),
         )
         .outerjoin(usage_totals, usage_totals.c.user_id == User.id)
         .outerjoin(last_activity, last_activity.c.user_id == User.id)
@@ -202,6 +214,9 @@ def get_user_detail_for_admin(db: Session, user_id: str) -> dict | None:
             "chat_count": int(usage.chat_count or 0),
             "voice_count": int(usage.voice_count or 0),
             "minutes_used": float(usage.minutes_used or 0.0),
+            "llm_output_tokens": int(getattr(usage, "llm_output_tokens", 0) or 0),
+            "stt_seconds": float(getattr(usage, "stt_seconds", 0.0) or 0.0),
+            "tts_seconds": float(getattr(usage, "tts_seconds", 0.0) or 0.0),
         }
         for usage in reversed(usage_history_rows)
     ]
@@ -289,12 +304,18 @@ def get_user_detail_for_admin(db: Session, user_id: str) -> dict | None:
                 "chat_count": int(getattr(today_usage, "chat_count", 0) or 0),
                 "voice_count": int(getattr(today_usage, "voice_count", 0) or 0),
                 "minutes_used": float(getattr(today_usage, "minutes_used", 0.0) or 0.0),
+                "llm_output_tokens": int(getattr(today_usage, "llm_output_tokens", 0) or 0),
+                "stt_seconds": float(getattr(today_usage, "stt_seconds", 0.0) or 0.0),
+                "tts_seconds": float(getattr(today_usage, "tts_seconds", 0.0) or 0.0),
             },
             "totals": {
                 "request_count": int(row.total_request_count or 0),
                 "chat_count": int(row.total_chat_count or 0),
                 "voice_count": int(row.total_voice_count or 0),
                 "minutes_used": float(row.total_minutes_used or 0.0),
+                "llm_output_tokens": int(row.total_llm_output_tokens or 0),
+                "stt_seconds": float(row.total_stt_seconds or 0.0),
+                "tts_seconds": float(row.total_tts_seconds or 0.0),
             },
             "last_activity_at": row.last_activity_at,
         },

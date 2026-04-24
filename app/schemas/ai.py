@@ -30,6 +30,10 @@ class TextChatRequest(BaseModel):
         None,
         description="Optional ISO 639-1 code for translated display text. Falls back to the user's native language when omitted.",
     )
+    include_audio_stream: bool = Field(
+        True,
+        description="When false, stream only text/metadata and skip eager TTS generation for this turn.",
+    )
     voice_draft_id: Optional[str] = Field(
         None,
         description="Optional one-time voice draft id created by POST /voice-drafts/finalize.",
@@ -99,3 +103,26 @@ class TTSStreamRequest(BaseModel):
     """Request schema for TTS streaming endpoint."""
     text: str = Field(..., min_length=1, max_length=5000, description="Text to synthesize")
     response_language: str = Field(default="en", description="Language code (en, hi, ml, ta, etc.)")
+
+
+class MessageAudioRequest(BaseModel):
+    """Request schema for lazily generated message audio."""
+
+    segment: Literal["reply", "translation", "explanation", "example"] = Field(
+        ...,
+        description="Which message section to synthesize or reuse stored audio for.",
+    )
+
+
+class MessageAudioResponse(BaseModel):
+    """Response schema for lazily generated message audio."""
+
+    audio_url: str = Field(..., description="Fresh playback URL for the requested audio")
+    segment: Literal["reply", "translation", "explanation", "example"] = Field(
+        ...,
+        description="Requested section",
+    )
+    generated: bool = Field(
+        ...,
+        description="True when audio was generated on this request, false when stored audio was reused.",
+    )

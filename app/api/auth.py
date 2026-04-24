@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.dependencies.auth import get_current_user, limiter
+from app.models.billing import BillingSubscription
 from app.models.user import User
 from app.schemas.auth import (
     AccessTokenResponse,
@@ -30,6 +31,7 @@ from app.core.security import (
     verify_token,
 )
 from app.services.auth_service import get_or_create_user, verify_google_token, verify_apple_token
+from app.services.billing_service import get_subscription_for_status, serialize_subscription_summary
 from app.services.subscription_service import resolve_user_plan
 from app.utils.language import normalize_language_code
 
@@ -38,9 +40,22 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
-def _build_user_response(user: User) -> UserResponse:
+def _build_user_response(user: User, db: Session) -> UserResponse:
     """Serialize a user with safe defaults for optional/mock attributes."""
     plan = resolve_user_plan(user)
+    summary = {
+        "billing_phase": "free",
+        "billing_status": None,
+        "active_plan_code": None,
+        "current_period_end": None,
+        "coupon_code": None,
+    }
+    try:
+        billing_row = get_subscription_for_status(db, user.id)
+        if isinstance(billing_row, BillingSubscription):
+            summary = serialize_subscription_summary(billing_row, user=user)
+    except Exception:
+        logger.warning("Billing summary unavailable for auth response: user_id=%s", user.id, exc_info=True)
     return UserResponse(
         id=user.id,
         email=user.email,
@@ -50,8 +65,13 @@ def _build_user_response(user: User) -> UserResponse:
         onboarding_completed=bool(getattr(user, "onboarding_completed", False) or False),
         onboarding_step=int(getattr(user, "onboarding_step", 0) or 0),
         plan=plan,
+        billing_phase=summary["billing_phase"],
         trial_expires_at=getattr(user, "trial_expires_at", None),
         subscription_expires_at=getattr(user, "subscription_expires_at", None),
+        billing_status=summary["billing_status"],
+        active_plan_code=summary["active_plan_code"],
+        current_period_end=summary["current_period_end"],
+        coupon_code=summary["coupon_code"],
     )
 
 
@@ -87,7 +107,7 @@ async def oauth_login(
         access_token=access_token,
         refresh_token=refresh_token,
         token_type="bearer",
-        user=_build_user_response(user),
+        user=_build_user_response(user, db),
     )
 
 
@@ -114,9 +134,10 @@ async def refresh(
 async def me(
     request: Request,
     current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
 ) -> UserResponse:
     """Return the current authenticated user (requires Bearer token)."""
-    return _build_user_response(current_user)
+    return _build_user_response(current_user, db)
 
 
 @router.post("/logout")

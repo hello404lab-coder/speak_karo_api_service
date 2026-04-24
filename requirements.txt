@@ -35,3 +35,4 @@ resemble-perth
 
 soundfile==0.13.1
 torch==2.10.0
+asyncpg

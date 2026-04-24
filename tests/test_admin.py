@@ -18,6 +18,7 @@ from app.core.security import (
 from app.database import get_db
 from app.main import app
 from app.models.admin import Admin
+from app.models.billing import BillingCoupon, BillingCouponRedemption, BillingSubscription
 from app.models.usage import Base, Conversation, Message, Usage
 from app.models.user import User
 from app.services.admin_auth_service import bootstrap_admin_account
@@ -227,8 +228,28 @@ def test_admin_users_list_supports_pagination_search_filters_sorting_and_aggrega
     db_session.add_all(
         [
             Usage(user_id=free_user.id, date=date.today() - timedelta(days=1), request_count=1, chat_count=1, voice_count=0, minutes_used=0.5),
-            Usage(user_id=free_user.id, date=date.today(), request_count=2, chat_count=1, voice_count=1, minutes_used=1.0),
-            Usage(user_id=premium_user.id, date=date.today(), request_count=10, chat_count=8, voice_count=2, minutes_used=6.0),
+            Usage(
+                user_id=free_user.id,
+                date=date.today(),
+                request_count=2,
+                chat_count=1,
+                voice_count=1,
+                minutes_used=1.0,
+                llm_output_tokens=140,
+                stt_seconds=3.0,
+                tts_seconds=6.0,
+            ),
+            Usage(
+                user_id=premium_user.id,
+                date=date.today(),
+                request_count=10,
+                chat_count=8,
+                voice_count=2,
+                minutes_used=6.0,
+                llm_output_tokens=900,
+                stt_seconds=12.0,
+                tts_seconds=40.0,
+            ),
         ]
     )
     db_session.add_all(
@@ -254,6 +275,7 @@ def test_admin_users_list_supports_pagination_search_filters_sorting_and_aggrega
     assert len(data["items"]) == 1
     assert data["items"][0]["email"] == "premium@example.com"
     assert data["items"][0]["total_request_count"] == 10
+    assert data["items"][0]["total_llm_output_tokens"] == 900
     assert data["items"][0]["last_activity_at"] is not None
 
     sorted_response = client.get(
@@ -315,6 +337,9 @@ def test_admin_user_detail_returns_profile_usage_history_recent_activity_and_404
                 chat_count=1,
                 voice_count=1,
                 minutes_used=1.25,
+                llm_output_tokens=120,
+                stt_seconds=3.0,
+                tts_seconds=4.0,
             ),
             Usage(
                 user_id=user.id,
@@ -323,6 +348,9 @@ def test_admin_user_detail_returns_profile_usage_history_recent_activity_and_404
                 chat_count=2,
                 voice_count=1,
                 minutes_used=2.5,
+                llm_output_tokens=150,
+                stt_seconds=4.0,
+                tts_seconds=7.0,
             ),
         ]
     )
@@ -335,9 +363,13 @@ def test_admin_user_detail_returns_profile_usage_history_recent_activity_and_404
     data = response.json()
     assert data["email"] == "learner@example.com"
     assert data["usage_summary"]["today"]["request_count"] == 3
+    assert data["usage_summary"]["today"]["llm_output_tokens"] == 150
     assert data["usage_summary"]["totals"]["request_count"] == 5
+    assert data["usage_summary"]["totals"]["llm_output_tokens"] == 270
+    assert data["usage_summary"]["totals"]["tts_seconds"] == 11.0
     assert len(data["usage_history"]) == 2
     assert data["usage_history"][0]["date"] == (date.today() - timedelta(days=1)).isoformat()
+    assert data["usage_history"][0]["stt_seconds"] == 3.0
     assert len(data["recent_activity"]) == 1
     assert data["recent_activity"][0]["title"] == "Interview practice"
     assert data["recent_activity"][0]["message_count"] == 1
@@ -346,3 +378,91 @@ def test_admin_user_detail_returns_profile_usage_history_recent_activity_and_404
 
     missing_response = client.get("/api/v1/admin/users/missing-user", headers=_auth_header(token))
     assert missing_response.status_code == 404
+
+
+def test_admin_coupon_crud_and_redemptions(db_session):
+    admin = _make_admin(db_session)
+    token = create_access_token(admin.id, principal_type=ADMIN_PRINCIPAL_TYPE)
+
+    create_response = client.post(
+        "/api/v1/admin/coupons",
+        headers=_auth_header(token),
+        json={
+            "code": "VUVL20",
+            "name": "Two Months Free",
+            "mode": "trial_extension",
+            "applies_to_plan_code": "vuvl_plus",
+            "status": "enabled",
+            "free_cycles": 2,
+            "max_redemptions_total": 20,
+            "max_redemptions_per_user": 1,
+            "metadata_json": {"campaign": "launch"},
+        },
+    )
+    assert create_response.status_code == 201
+    coupon = create_response.json()
+    assert coupon["code"] == "VUVL20"
+    assert coupon["free_cycles"] == 2
+    assert coupon["total_redemptions"] == 0
+
+    list_response = client.get("/api/v1/admin/coupons", headers=_auth_header(token))
+    assert list_response.status_code == 200
+    assert list_response.json()["items"][0]["code"] == "VUVL20"
+
+    detail_response = client.get(f"/api/v1/admin/coupons/{coupon['id']}", headers=_auth_header(token))
+    assert detail_response.status_code == 200
+    assert detail_response.json()["name"] == "Two Months Free"
+
+    patch_response = client.patch(
+        f"/api/v1/admin/coupons/{coupon['id']}",
+        headers=_auth_header(token),
+        json={"name": "Two Free Months", "max_redemptions_total": 25},
+    )
+    assert patch_response.status_code == 200
+    assert patch_response.json()["name"] == "Two Free Months"
+    assert patch_response.json()["max_redemptions_total"] == 25
+
+    user = _make_user(db_session, email="coupon-user@example.com", onboarding_completed=True)
+    subscription = BillingSubscription(
+        user_id=user.id,
+        provider="razorpay",
+        plan_code="vuvl_plus",
+        provider_plan_id="plan_plus_test",
+        provider_subscription_id="sub_coupon_admin_1",
+        status="authenticated",
+        billing_phase="trial",
+        coupon_id=coupon["id"],
+        coupon_code_snapshot="VUVL20",
+        trial_access_until=datetime.utcnow() + timedelta(days=30),
+    )
+    db_session.add(subscription)
+    db_session.flush()
+    redemption = BillingCouponRedemption(
+        coupon_id=coupon["id"],
+        user_id=user.id,
+        billing_subscription_id=subscription.id,
+        status="consumed",
+        coupon_code_snapshot="VUVL20",
+        effect_snapshot={"applied_mode": "coupon_trial_extension", "free_cycles": 2},
+        verified_at=datetime.utcnow(),
+        consumed_at=datetime.utcnow(),
+    )
+    db_session.add(redemption)
+    db_session.commit()
+
+    redemptions_response = client.get(
+        f"/api/v1/admin/coupons/{coupon['id']}/redemptions",
+        headers=_auth_header(token),
+    )
+    assert redemptions_response.status_code == 200
+    items = redemptions_response.json()["items"]
+    assert len(items) == 1
+    assert items[0]["coupon_code_snapshot"] == "VUVL20"
+    assert items[0]["user_email"] == "coupon-user@example.com"
+
+    disable_response = client.post(
+        f"/api/v1/admin/coupons/{coupon['id']}/disable",
+        headers=_auth_header(token),
+    )
+    assert disable_response.status_code == 200
+    assert disable_response.json()["status"] == "disabled"

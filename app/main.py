@@ -131,6 +131,9 @@ async def startup_event():
             chirp_status = chirp_runtime_status()
         except Exception as e:
             chirp_status = {"available": False, "reason": str(e)}
+    elif cloud_tts_provider == "smallest":
+        # Chirp status not needed; Smallest uses API key only (checked at request / init_tts_models)
+        pass
     # Log TTS configuration (English -> Chatterbox-Turbo or configured cloud provider; Indic -> IndicF5 optional then configured cloud provider)
     if getattr(settings, "tts_chatterbox_enabled", True):
         audio_prompt_info = f"voice cloning: {settings.tts_audio_prompt_path}" if settings.tts_audio_prompt_path else "not set (required for Turbo)"
@@ -148,6 +151,17 @@ async def startup_event():
                 logger.warning(
                     "TTS: English Chirp 3 HD configured but unavailable (%s); requests will fall back to Gemini",
                     chirp_status["reason"] or "unknown reason",
+                )
+        elif cloud_tts_provider == "smallest":
+            if getattr(settings, "smallest_api_key", None):
+                logger.info(
+                    "TTS: English -> Smallest Lightning (model: %s, default voice: %s)",
+                    getattr(settings, "tts_smallest_model", "lightning-v3.1"),
+                    getattr(settings, "tts_smallest_voice", "magnus"),
+                )
+            else:
+                logger.warning(
+                    "TTS: Smallest configured but SMALLEST_API_KEY not set; will fall back to Chirp 3 HD or Gemini"
                 )
         else:
             logger.info(
@@ -185,6 +199,16 @@ async def startup_event():
                 logger.warning(
                     "TTS: Indic Chirp 3 HD configured but unavailable (%s); requests will fall back to Gemini",
                     chirp_status["reason"] or "unknown reason",
+                )
+        elif cloud_tts_provider == "smallest":
+            if getattr(settings, "smallest_api_key", None):
+                logger.info(
+                    "TTS: Indic (Smallest: hi/ta when supported; ml and others -> Chirp 3 HD or Gemini). Voice map: %s",
+                    getattr(settings, "tts_smallest_voice_per_lang") or "(default voices)",
+                )
+            else:
+                logger.warning(
+                    "TTS: Indic: SMALLEST_API_KEY not set; will use Chirp 3 HD or Gemini where configured"
                 )
         else:
             logger.info(

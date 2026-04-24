@@ -94,6 +94,9 @@ def resolve_user_plan(user: User) -> str:
     if user.subscription_expires_at and user.subscription_expires_at > now:
         return normalize_paid_plan_code(getattr(user, "plan", None))
     if user.trial_expires_at and user.trial_expires_at > now:
+        normalized_trial_plan = normalize_plan_code(getattr(user, "plan", None))
+        if normalized_trial_plan in PAID_PLAN_CODES:
+            return normalized_trial_plan
         return TRIAL_PLAN
     return FREE_PLAN
 
@@ -111,6 +114,9 @@ def get_or_create_today_usage(user_id: str, db: Session) -> Usage:
             user_id=user_id,
             date=today,
             minutes_used=0.0,
+            llm_output_tokens=0,
+            stt_seconds=0.0,
+            tts_seconds=0.0,
             request_count=0,
             chat_count=0,
             voice_count=0,
@@ -187,31 +193,52 @@ def update_usage_stats(
     db: Session,
     duration_seconds: float = 0.0,
     usage_type: Literal["chat", "voice"] = "chat",
+    llm_output_tokens: int = 0,
+    stt_seconds: float = 0.0,
+    tts_seconds: float = 0.0,
+    request_delta: int = 1,
+    commit: bool = True,
 ) -> None:
     """Increment daily usage: request_count and either chat_count or voice_count."""
-    today = date.today()
-    usage = (
-        db.query(Usage)
-        .filter(Usage.user_id == user_id, Usage.date == today)
-        .first()
+    apply_usage_delta(
+        user_id,
+        db,
+        minutes_delta=duration_seconds / 60.0,
+        llm_output_tokens_delta=llm_output_tokens,
+        stt_seconds_delta=stt_seconds,
+        tts_seconds_delta=tts_seconds,
+        request_delta=request_delta,
+        chat_delta=1 if usage_type == "chat" else 0,
+        voice_delta=1 if usage_type == "voice" else 0,
+        commit=commit,
     )
-    if not usage:
-        usage = Usage(
-            user_id=user_id,
-            date=today,
-            minutes_used=0.0,
-            request_count=0,
-            chat_count=0,
-            voice_count=0,
-        )
-        db.add(usage)
-    usage.request_count += 1
-    usage.minutes_used += duration_seconds / 60.0
-    if usage_type == "chat":
-        usage.chat_count += 1
-    else:
-        usage.voice_count += 1
-    db.commit()
+
+
+def apply_usage_delta(
+    user_id: str,
+    db: Session,
+    *,
+    minutes_delta: float = 0.0,
+    llm_output_tokens_delta: int = 0,
+    stt_seconds_delta: float = 0.0,
+    tts_seconds_delta: float = 0.0,
+    request_delta: int = 0,
+    chat_delta: int = 0,
+    voice_delta: int = 0,
+    commit: bool = True,
+) -> Usage:
+    """Apply a usage delta to today's usage row."""
+    usage = get_or_create_today_usage(user_id, db)
+    usage.minutes_used = float(usage.minutes_used or 0.0) + max(0.0, float(minutes_delta))
+    usage.llm_output_tokens = int(getattr(usage, "llm_output_tokens", 0) or 0) + max(0, int(llm_output_tokens_delta))
+    usage.stt_seconds = float(getattr(usage, "stt_seconds", 0.0) or 0.0) + max(0.0, float(stt_seconds_delta))
+    usage.tts_seconds = float(getattr(usage, "tts_seconds", 0.0) or 0.0) + max(0.0, float(tts_seconds_delta))
+    usage.request_count = int(getattr(usage, "request_count", 0) or 0) + int(request_delta)
+    usage.chat_count = int(getattr(usage, "chat_count", 0) or 0) + int(chat_delta)
+    usage.voice_count = int(getattr(usage, "voice_count", 0) or 0) + int(voice_delta)
+    if commit:
+        db.commit()
+    return usage
 
 
 def finalize_live_session_usage(
@@ -225,9 +252,11 @@ def finalize_live_session_usage(
     Record a completed Gemini Live session on today's Usage row: add minutes and one voice_count.
     Does not increment chat_count. request_count is optional (default off to avoid inflating vs REST).
     """
-    usage = get_or_create_today_usage(user_id, db)
-    usage.minutes_used += max(0.0, float(duration_seconds)) / 60.0
-    usage.voice_count += 1
-    if increment_request_count:
-        usage.request_count += 1
-    db.commit()
+    apply_usage_delta(
+        user_id,
+        db,
+        minutes_delta=max(0.0, float(duration_seconds)) / 60.0,
+        request_delta=1 if increment_request_count else 0,
+        voice_delta=1,
+        commit=True,
+    )

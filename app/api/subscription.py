@@ -1,10 +1,9 @@
-"""Subscription API: catalog, checkout, verification, status, and trial."""
+"""Subscription API: catalog, checkout, verification, status, coupons, and webhooks."""
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
-from datetime import datetime, timedelta
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from sqlalchemy.orm import Session
@@ -14,8 +13,9 @@ from app.database import get_db
 from app.dependencies.auth import get_current_user, limiter
 from app.models.user import User
 from app.schemas.subscription import (
+    CouponValidateRequest,
+    CouponValidateResponse,
     RazorpayWebhookResponse,
-    StartTrialRequest,
     SubscriptionCancelResponse,
     SubscriptionCatalogItemResponse,
     SubscriptionCatalogResponse,
@@ -33,20 +33,26 @@ from app.services.billing_service import (
     build_checkout_payload,
     build_checkout_prefill,
     get_active_paid_subscription,
-    get_latest_paid_subscription,
     get_manageable_subscription,
     get_reusable_checkout_subscription,
+    get_subscription_for_status,
     process_razorpay_webhook,
     serialize_subscription_summary,
     sync_subscription_from_razorpay,
     verify_razorpay_checkout_signature,
     verify_razorpay_webhook_signature,
 )
+from app.services.coupon_service import (
+    CHECKOUT_MODE_INTRO_TRIAL,
+    reserve_coupon_redemption,
+    resolve_checkout_strategy,
+    serialize_coupon_validation,
+    validate_coupon_for_user,
+)
 from app.services.razorpay_client import RazorpayAPIError, get_razorpay_client
 from app.services.subscription_service import (
     FREE_MAX_CHATS_PER_DAY,
     FREE_MAX_VOICE_PER_DAY,
-    PAID_PLAN_CODES,
     get_usage_today_for_display,
     resolve_user_plan,
 )
@@ -112,51 +118,58 @@ async def subscription_status(
 ) -> SubscriptionStatusResponse:
     """Return current plan, billing summary, and today's usage."""
     del request
-    billing_row = get_active_paid_subscription(db, current_user.id) or get_latest_paid_subscription(db, current_user.id)
-    summary = serialize_subscription_summary(billing_row)
+    billing_row = get_subscription_for_status(db, current_user.id)
+    summary = serialize_subscription_summary(billing_row, user=current_user)
     return SubscriptionStatusResponse(
         plan=resolve_user_plan(current_user),
         trial_expires_at=current_user.trial_expires_at,
         subscription_expires_at=current_user.subscription_expires_at,
+        billing_phase=summary["billing_phase"],
         usage=_build_usage_response(current_user, db),
         billing_status=summary["billing_status"],
         active_subscription_id=summary["active_subscription_id"],
         active_plan_code=summary["active_plan_code"],
         current_period_end=summary["current_period_end"],
         cancel_at_cycle_end=summary["cancel_at_cycle_end"],
+        coupon_code=summary["coupon_code"],
         manage_actions=SubscriptionManageActions.model_validate(summary["manage_actions"]),
     )
 
 
-@router.post("/start-trial")
-@limiter.limit("10/minute")
-async def start_trial(
+@router.post("/coupons/validate", response_model=CouponValidateResponse)
+@limiter.limit("20/minute")
+async def validate_coupon(
     request: Request,
-    body: StartTrialRequest,
+    body: CouponValidateRequest,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
-) -> dict[str, str]:
-    """Activate trial after payment verification. Trial is 3 days; one per user."""
+) -> CouponValidateResponse:
+    """Validate a coupon and preview the checkout effect."""
     del request
-    if resolve_user_plan(current_user) in PAID_PLAN_CODES:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Paid users cannot start a trial")
-    if not body.payment_verified:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Payment must be verified to start trial",
+    validation = validate_coupon_for_user(
+        db,
+        user=current_user,
+        plan_code=body.plan_code,
+        coupon_code=body.coupon_code,
+    )
+    return CouponValidateResponse.model_validate(
+        serialize_coupon_validation(
+            plan_code=body.plan_code,
+            coupon_code=body.coupon_code,
+            validation=validation,
         )
-    if current_user.is_trial_used:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Trial already used",
-        )
-    current_user.plan = "trial"
-    current_user.trial_expires_at = datetime.utcnow() + timedelta(days=3)
-    current_user.is_trial_used = True
-    db.commit()
-    db.refresh(current_user)
-    logger.info("User %s started trial", current_user.id)
-    return {"message": "Trial started", "plan": "trial"}
+    )
+
+
+@router.post("/start-trial", deprecated=True)
+@limiter.limit("10/minute")
+async def start_trial_deprecated(request: Request) -> dict[str, str]:
+    """Legacy endpoint removed in favor of checkout-backed trials."""
+    del request
+    raise HTTPException(
+        status_code=status.HTTP_410_GONE,
+        detail="This endpoint is deprecated. Start trial access through /api/v1/subscription/checkout.",
+    )
 
 
 @router.post("/checkout", response_model=SubscriptionCheckoutResponse)
@@ -178,19 +191,45 @@ async def create_subscription_checkout(
             detail="User already has an active paid subscription",
         )
 
-    reusable = get_reusable_checkout_subscription(db, current_user.id, body.plan_code)
+    try:
+        checkout_strategy = resolve_checkout_strategy(
+            db,
+            user=current_user,
+            plan_code=body.plan_code,
+            coupon_code=body.coupon_code,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+    reusable = get_reusable_checkout_subscription(
+        db,
+        current_user.id,
+        body.plan_code,
+        coupon_code=checkout_strategy["coupon_code"],
+        checkout_mode=checkout_strategy["applied_mode"],
+    )
     if reusable:
         return SubscriptionCheckoutResponse(
             key_id=settings.razorpay_key_id or "",
             subscription_id=reusable.provider_subscription_id,
             plan_code=body.plan_code,
             status=reusable.status,
+            applied_mode=checkout_strategy["applied_mode"],
+            coupon_code=checkout_strategy["coupon_code"],
+            trial_ends_at=reusable.trial_access_until,
             short_url=reusable.short_url,
             prefill=SubscriptionCheckoutPrefillResponse.model_validate(build_checkout_prefill(current_user)),
             reuse_existing=True,
         )
 
-    payload = build_checkout_payload(current_user, body.plan_code)
+    payload = build_checkout_payload(
+        current_user,
+        body.plan_code,
+        checkout_mode=checkout_strategy["applied_mode"],
+        trial_ends_at=checkout_strategy["trial_ends_at"],
+        razorpay_offer_id=checkout_strategy["razorpay_offer_id"],
+        coupon_code=checkout_strategy["coupon_code"],
+    )
     client = get_razorpay_client()
     try:
         remote_subscription = await asyncio.to_thread(client.create_subscription, payload)
@@ -206,11 +245,24 @@ async def create_subscription_checkout(
         expected_user_id=current_user.id,
         raw_payload=remote_subscription,
     )
+    reserve_coupon_redemption(
+        db,
+        user=current_user,
+        coupon=checkout_strategy.get("coupon"),
+        billing_subscription=local,
+        effect=checkout_strategy,
+    )
+    db.commit()
+    db.refresh(local)
+
     return SubscriptionCheckoutResponse(
         key_id=settings.razorpay_key_id or "",
         subscription_id=local.provider_subscription_id,
         plan_code=body.plan_code,
         status=local.status,
+        applied_mode=checkout_strategy["applied_mode"],
+        coupon_code=checkout_strategy["coupon_code"],
+        trial_ends_at=local.trial_access_until,
         short_url=local.short_url,
         prefill=SubscriptionCheckoutPrefillResponse.model_validate(build_checkout_prefill(current_user)),
         reuse_existing=False,
@@ -251,12 +303,21 @@ async def verify_subscription_checkout(
         payment_id=body.razorpay_payment_id,
         raw_payload=remote_subscription,
     )
+    notes = remote_subscription.get("notes") or {}
+    if notes.get("checkout_mode") == CHECKOUT_MODE_INTRO_TRIAL and not current_user.is_trial_used:
+        current_user.is_trial_used = True
+        db.add(current_user)
+        db.commit()
+    db.refresh(current_user)
     return SubscriptionVerifyResponse(
         message="Subscription verified",
         plan=resolve_user_plan(current_user),
+        billing_phase=local.billing_phase,
         billing_status=local.status,
         active_subscription_id=local.provider_subscription_id,
+        coupon_code=local.coupon_code_snapshot,
         subscription_expires_at=current_user.subscription_expires_at,
+        trial_expires_at=current_user.trial_expires_at,
     )
 
 
@@ -278,6 +339,7 @@ async def cancel_subscription(
         return SubscriptionCancelResponse(
             message="Cancellation already scheduled",
             plan=resolve_user_plan(current_user),
+            billing_phase=billing_row.billing_phase,
             billing_status=billing_row.status,
             cancel_at_cycle_end=True,
             current_period_end=billing_row.current_end_at,
@@ -302,9 +364,11 @@ async def cancel_subscription(
         expected_user_id=current_user.id,
         raw_payload=remote_subscription,
     )
+    db.refresh(current_user)
     return SubscriptionCancelResponse(
         message="Cancellation scheduled",
         plan=resolve_user_plan(current_user),
+        billing_phase=updated.billing_phase,
         billing_status=updated.status,
         cancel_at_cycle_end=updated.cancel_at_cycle_end,
         current_period_end=updated.current_end_at,
@@ -326,10 +390,22 @@ async def razorpay_webhook(
     except json.JSONDecodeError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid webhook JSON") from exc
 
+    client = get_razorpay_client() if settings.razorpay_enabled else None
+    fetch_subscription_fn = client.fetch_subscription if client else None
     try:
-        _, duplicate = process_razorpay_webhook(db, raw_body=raw_body, payload=payload)
+        _, duplicate = process_razorpay_webhook(
+            db,
+            raw_body=raw_body,
+            payload=payload,
+            fetch_subscription_fn=fetch_subscription_fn,
+        )
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    except RazorpayAPIError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Failed to sync Razorpay webhook subscription state",
+        ) from exc
 
     return RazorpayWebhookResponse(status="ok", duplicate=duplicate)
 
