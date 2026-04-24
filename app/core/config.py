@@ -103,6 +103,15 @@ class Settings(BaseSettings):
     app_name: str = "AI English Practice Backend"
     app_version: str = "1.0.0"
     debug: bool = False
+    # CORS: allow_origins=* with allow_credentials=True is invalid in browsers; use explicit origins.
+    cors_allowed_origins: str = Field(
+        default="",
+        description="CORS_ALLOW_ORIGINS: comma-separated browser origins. Required when APP_ENV=prod.",
+    )
+    cors_allow_credentials: bool = Field(
+        default=True,
+        description="CORS_ALLOW_CREDENTIALS: set false if the client does not use credentialed cross-origin requests",
+    )
     
     # Audio Storage
     # IMPORTANT: Keep this outside `backend/` so `uvicorn --reload` doesn't restart
@@ -397,6 +406,25 @@ class Settings(BaseSettings):
     @property
     def is_prod(self) -> bool:
         return self.app_env == "prod"
+
+    @property
+    def cors_origins(self) -> list[str]:
+        """Allowed Origin values for CORSMiddleware: explicit env, else dev-friendly localhost defaults."""
+        raw = (self.cors_allowed_origins or "").strip()
+        if raw:
+            return [o.rstrip("/") for o in (x.strip() for x in raw.split(",")) if o.strip()]
+        if self.is_prod:
+            return []
+        return [
+            "http://localhost:3000",
+            "http://127.0.0.1:3000",
+            "http://localhost:5173",
+            "http://127.0.0.1:5173",
+            "http://localhost:8080",
+            "http://127.0.0.1:8080",
+            "http://localhost:8000",
+            "http://127.0.0.1:8000",
+        ]
 
     @property
     def razorpay_live_mode(self) -> bool:

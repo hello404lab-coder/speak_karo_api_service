@@ -55,11 +55,16 @@ async def http_exception_handler(request, exc: HTTPException):
         return JSONResponse(status_code=exc.status_code, content=exc.detail)
     return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
 
-# CORS middleware
+# CORS: explicit origins for credentialed browser clients; * + credentials is invalid in browsers.
+_cors_origins = list(settings.cors_origins)
+_cors_credentials = settings.cors_allow_credentials
+if _cors_credentials and _cors_origins == ["*"]:
+    logger.warning("CORS: wildcard origin is incompatible with credentials; using allow_credentials=False")
+    _cors_credentials = False
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Configure appropriately for production
-    allow_credentials=True,
+    allow_origins=_cors_origins,
+    allow_credentials=_cors_credentials,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -82,6 +87,17 @@ async def startup_event():
     """Initialize services on startup."""
     logger.info("Starting up AI English Practice Backend...")
     logger.info(f"APP_ENV={settings.app_env} (is_prod={settings.is_prod})")
+
+    if settings.is_prod and not settings.cors_origins:
+        raise RuntimeError(
+            "CORS_ALLOW_ORIGINS is required when APP_ENV=prod. "
+            "Set comma-separated browser origins (e.g. https://app.example.com)."
+        )
+    logger.info(
+        "CORS: %d allowed origin(s), allow_credentials=%s",
+        len(settings.cors_origins),
+        _cors_credentials,
+    )
     
     # Prod: require Gemini API key (fail fast)
     if settings.is_prod and not settings.gemini_api_key:
