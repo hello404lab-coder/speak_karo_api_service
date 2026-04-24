@@ -2,10 +2,7 @@
 from datetime import datetime, timedelta
 from unittest.mock import patch
 
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
-
-from app.models.usage import Base, VoiceInputDraft
+from app.models.usage import VoiceInputDraft
 from app.services.voice_drafts import (
     VOICE_DRAFT_SOURCE_BACKEND_FINAL,
     VOICE_DRAFT_STATUS_DISCARDED,
@@ -18,15 +15,8 @@ from app.services.voice_drafts import (
 )
 
 
-def _make_db():
-    engine = create_engine("sqlite:///:memory:")
-    Base.metadata.create_all(bind=engine)
-    session = sessionmaker(bind=engine, autocommit=False, autoflush=False)
-    return session()
-
-
-def test_create_voice_input_draft_defaults_to_pending():
-    db = _make_db()
+def test_create_voice_input_draft_defaults_to_pending(db_session):
+    db = db_session
     try:
         draft = create_voice_input_draft(
             db,
@@ -46,8 +36,8 @@ def test_create_voice_input_draft_defaults_to_pending():
         db.close()
 
 
-def test_cleanup_expired_voice_drafts_marks_and_deletes_audio():
-    db = _make_db()
+def test_cleanup_expired_voice_drafts_marks_and_deletes_audio(db_session):
+    db = db_session
     try:
         draft = VoiceInputDraft(
             user_id="user-1",
@@ -74,8 +64,8 @@ def test_cleanup_expired_voice_drafts_marks_and_deletes_audio():
         db.close()
 
 
-def test_discard_voice_input_draft_marks_row_discarded():
-    db = _make_db()
+def test_discard_voice_input_draft_marks_row_discarded(db_session):
+    db = db_session
     try:
         draft = create_voice_input_draft(
             db,
@@ -100,8 +90,8 @@ def test_discard_voice_input_draft_marks_row_discarded():
         db.close()
 
 
-def test_get_pending_voice_input_draft_expires_stale_row():
-    db = _make_db()
+def test_get_pending_voice_input_draft_expires_stale_row(db_session):
+    db = db_session
     try:
         draft = create_voice_input_draft(
             db,

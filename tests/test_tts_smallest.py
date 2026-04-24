@@ -143,35 +143,29 @@ async def test_feed_smallest_stream_to_queue_emits_wav_and_raw_pcm(monkeypatch):
     assert items[-1] == (None, None)
 
 
-def test_tts_stream_endpoint_uses_smallest_path(monkeypatch):
+def test_tts_stream_endpoint_uses_smallest_path(monkeypatch, test_engine):
     pytest.importorskip("slowapi")
     from fastapi.testclient import TestClient
-    from sqlalchemy import create_engine
     from sqlalchemy.orm import Session, sessionmaker
-    from sqlalchemy.pool import StaticPool
 
     from app.database import get_db
     from app.dependencies.subscription import require_active_plan
     from app.main import app
     from app.models.live_session import LiveSession  # noqa: F401
     from app.models.social_session import SocialSession  # noqa: F401
-    from app.models.usage import Base
     from app.models.user import User
 
-    def _make_memory_db() -> Session:
-        engine = create_engine(
-            "sqlite:///:memory:",
-            connect_args={"check_same_thread": False},
-            poolclass=StaticPool,
-        )
-        Base.metadata.create_all(bind=engine)
+    def _make_memory_db() -> tuple[Session, object, object]:
+        connection = test_engine.connect()
+        transaction = connection.begin()
         SessionLocal = sessionmaker(
+            bind=connection,
             autocommit=False,
             autoflush=False,
-            bind=engine,
             expire_on_commit=False,
+            join_transaction_mode="create_savepoint",
         )
-        return SessionLocal()
+        return SessionLocal(), transaction, connection
 
     def _install_overrides(memory_db: Session, user: User) -> None:
         def _db():
@@ -184,7 +178,7 @@ def test_tts_stream_endpoint_uses_smallest_path(monkeypatch):
         app.dependency_overrides[require_active_plan] = _active_plan
 
     client = TestClient(app)
-    memory_db = _make_memory_db()
+    memory_db, _trans, _conn = _make_memory_db()
     user = User(
         id="small-user-1",
         email="s@example.com",
@@ -219,3 +213,6 @@ def test_tts_stream_endpoint_uses_smallest_path(monkeypatch):
     finally:
         app.dependency_overrides.clear()
         memory_db.close()
+        if _trans.is_active:
+            _trans.rollback()
+        _conn.close()

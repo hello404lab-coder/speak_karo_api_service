@@ -2,9 +2,7 @@ from datetime import datetime
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
-from sqlalchemy.pool import StaticPool
 
 pytest.importorskip("slowapi")
 
@@ -14,7 +12,7 @@ from app.dependencies.subscription import require_active_plan
 from app.main import app
 from app.models.live_session import LiveSession  # noqa: F401
 from app.models.social_session import SocialSession  # noqa: F401
-from app.models.usage import Base, Conversation, Message
+from app.models.usage import Conversation, Message
 from app.models.user import User
 from app.services.llm import stream_gemini_tokens
 from app.services.tts import StoredAudioRecord
@@ -22,20 +20,45 @@ from app.services.tts import StoredAudioRecord
 client = TestClient(app)
 
 
-def _make_memory_db() -> Session:
-  engine = create_engine(
-      "sqlite:///:memory:",
-      connect_args={"check_same_thread": False},
-      poolclass=StaticPool,
-  )
-  Base.metadata.create_all(bind=engine)
-  SessionLocal = sessionmaker(
-      autocommit=False,
-      autoflush=False,
-      bind=engine,
-      expire_on_commit=False,
-  )
-  return SessionLocal()
+@pytest.fixture
+def memory_db_factory(test_engine):
+  """Provide a factory that creates transactional PG sessions rolled back at teardown.
+
+  Several tests in this module instantiate multiple independent sessions, so we
+  expose a factory rather than a single fixture. All sessions share the
+  session-scoped engine from ``conftest.py`` and are cleaned up atomically.
+  """
+  created: list[tuple] = []
+
+  def _factory() -> Session:
+      connection = test_engine.connect()
+      transaction = connection.begin()
+      SessionLocal = sessionmaker(
+          bind=connection,
+          autocommit=False,
+          autoflush=False,
+          expire_on_commit=False,
+          join_transaction_mode="create_savepoint",
+      )
+      session = SessionLocal()
+      created.append((session, transaction, connection))
+      return session
+
+  try:
+      yield _factory
+  finally:
+      for session, transaction, connection in created:
+          try:
+              session.close()
+          except Exception:
+              pass
+          if transaction.is_active:
+              transaction.rollback()
+          connection.close()
+
+
+def _make_memory_db(memory_db_factory) -> Session:
+  return memory_db_factory()
 
 
 def _install_overrides(memory_db: Session, user: User) -> None:
@@ -90,8 +113,8 @@ def test_build_stream_metadata_payload_preserves_null_feedback():
   assert payload["example"] is None
 
 
-def test_chat_stream_emits_turn_ack_before_text_chunk(monkeypatch):
-  memory_db = _make_memory_db()
+def test_chat_stream_emits_turn_ack_before_text_chunk(monkeypatch, memory_db_factory):
+  memory_db = _make_memory_db(memory_db_factory)
   user = User(
       id="ux-user-1",
       email="ux@example.com",
@@ -138,8 +161,8 @@ def test_chat_stream_emits_turn_ack_before_text_chunk(monkeypatch):
       memory_db.close()
 
 
-def test_list_messages_returns_client_turn_id_for_both_rows():
-  memory_db = _make_memory_db()
+def test_list_messages_returns_client_turn_id_for_both_rows(memory_db_factory):
+  memory_db = _make_memory_db(memory_db_factory)
   user = User(
       id="ux-user-2",
       email="history@example.com",
@@ -183,8 +206,8 @@ def test_list_messages_returns_client_turn_id_for_both_rows():
       memory_db.close()
 
 
-def test_chat_stream_skips_audio_events_when_include_audio_stream_is_false(monkeypatch):
-  memory_db = _make_memory_db()
+def test_chat_stream_skips_audio_events_when_include_audio_stream_is_false(monkeypatch, memory_db_factory):
+  memory_db = _make_memory_db(memory_db_factory)
   user = User(
       id="ux-user-3",
       email="noaudio@example.com",
@@ -236,8 +259,8 @@ def test_chat_stream_skips_audio_events_when_include_audio_stream_is_false(monke
       memory_db.close()
 
 
-def test_message_audio_endpoint_reuses_stored_audio(monkeypatch):
-  memory_db = _make_memory_db()
+def test_message_audio_endpoint_reuses_stored_audio(monkeypatch, memory_db_factory):
+  memory_db = _make_memory_db(memory_db_factory)
   user = User(
       id="ux-user-4",
       email="reuse@example.com",
@@ -287,8 +310,8 @@ def test_message_audio_endpoint_reuses_stored_audio(monkeypatch):
       memory_db.close()
 
 
-def test_message_audio_endpoint_generates_and_persists_audio(monkeypatch):
-  memory_db = _make_memory_db()
+def test_message_audio_endpoint_generates_and_persists_audio(monkeypatch, memory_db_factory):
+  memory_db = _make_memory_db(memory_db_factory)
   user = User(
       id="ux-user-5",
       email="generate@example.com",
@@ -343,8 +366,8 @@ def test_message_audio_endpoint_generates_and_persists_audio(monkeypatch):
       memory_db.close()
 
 
-def test_persist_message_audio_storage_ref_updates_exchange_row():
-  memory_db = _make_memory_db()
+def test_persist_message_audio_storage_ref_updates_exchange_row(memory_db_factory):
+  memory_db = _make_memory_db(memory_db_factory)
   user = User(
       id="ux-user-6",
       email="persist@example.com",

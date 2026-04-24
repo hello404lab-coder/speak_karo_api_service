@@ -16,7 +16,6 @@ from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 
 from app.core.config import settings
-from app.database import init_db
 from app.api.ai import router as ai_router
 from app.api.live import router as live_router
 from app.api.auth import router as auth_router
@@ -216,13 +215,6 @@ async def startup_event():
                 indic_gemini,
             )
     
-    # Initialize database
-    try:
-        init_db()
-        logger.info("Database initialized")
-    except Exception as e:
-        logger.error(f"Database initialization failed: {e}")
-
     try:
         from app.database import SessionLocal
         from app.services.admin_auth_service import bootstrap_admin_account

@@ -4,9 +4,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
-from sqlalchemy.pool import StaticPool
 
 from fastapi import HTTPException, status
 
@@ -22,7 +20,7 @@ from app.services.subscription_service import (
     resolve_user_plan,
 )
 from app.models.live_session import LiveSession
-from app.models.usage import Base, Conversation
+from app.models.usage import Conversation
 from app.models.user import User
 
 client = TestClient(app)
@@ -36,24 +34,21 @@ def _clear_dependency_overrides(monkeypatch):
 
 
 @pytest.fixture
-def memory_db():
-    """SQLite :memory: with users + conversations + live_sessions tables."""
-    # Register all models on Base.metadata before create_all
-    from app.models import user as _user  # noqa: F401
-    from app.models import live_session as _ls  # noqa: F401
-    from app.models import social_session as _ss  # noqa: F401
+def memory_db(test_engine):
+    """Transactional PG session seeded with a Live-eligible user.
 
-    engine = create_engine(
-        "sqlite:///:memory:",
-        connect_args={"check_same_thread": False},
-        poolclass=StaticPool,
-    )
-    Base.metadata.create_all(bind=engine)
+    Named ``memory_db`` to avoid churn in existing test parameters; the
+    underlying engine is the shared session-scoped PostgreSQL engine from
+    ``conftest.py``.
+    """
+    connection = test_engine.connect()
+    transaction = connection.begin()
     SessionLocal = sessionmaker(
+        bind=connection,
         autocommit=False,
         autoflush=False,
-        bind=engine,
         expire_on_commit=False,
+        join_transaction_mode="create_savepoint",
     )
     db = SessionLocal()
     try:
@@ -70,7 +65,9 @@ def memory_db():
         yield db
     finally:
         db.close()
-        engine.dispose()
+        if transaction.is_active:
+            transaction.rollback()
+        connection.close()
 
 
 def _auth_headers(user_id: str = "live-user-1"):

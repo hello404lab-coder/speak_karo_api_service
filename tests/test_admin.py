@@ -3,9 +3,7 @@ from datetime import date, datetime, timedelta
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
-from sqlalchemy.pool import StaticPool
 
 from app.core.config import settings
 from app.core.security import (
@@ -19,7 +17,7 @@ from app.database import get_db
 from app.main import app
 from app.models.admin import Admin
 from app.models.billing import BillingCoupon, BillingCouponRedemption, BillingSubscription
-from app.models.usage import Base, Conversation, Message, Usage
+from app.models.usage import Conversation, Message, Usage
 from app.models.user import User
 from app.services.admin_auth_service import bootstrap_admin_account
 
@@ -27,15 +25,21 @@ client = TestClient(app)
 
 
 @pytest.fixture()
-def db_session():
-    """Provide an isolated in-memory DB and override FastAPI's get_db dependency."""
-    engine = create_engine(
-        "sqlite://",
-        connect_args={"check_same_thread": False},
-        poolclass=StaticPool,
+def db_session(test_engine):
+    """Per-test transactional PG session bound to FastAPI's ``get_db`` dependency.
+
+    Overrides the plain ``db_session`` fixture from ``conftest.py`` so the
+    TestClient shares the same connection (and sees uncommitted writes) as the
+    test body.
+    """
+    connection = test_engine.connect()
+    transaction = connection.begin()
+    TestingSessionLocal = sessionmaker(
+        bind=connection,
+        autocommit=False,
+        autoflush=False,
+        join_transaction_mode="create_savepoint",
     )
-    TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-    Base.metadata.create_all(bind=engine)
     session = TestingSessionLocal()
 
     def override_get_db():
@@ -48,10 +52,11 @@ def db_session():
     try:
         yield session
     finally:
-        app.dependency_overrides.clear()
+        app.dependency_overrides.pop(get_db, None)
         session.close()
-        Base.metadata.drop_all(bind=engine)
-        engine.dispose()
+        if transaction.is_active:
+            transaction.rollback()
+        connection.close()
 
 
 def _make_admin(db_session, *, email="admin@example.com", password="secret123", is_active=True) -> Admin:

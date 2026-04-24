@@ -30,7 +30,7 @@ class User(Base):
     goal = Column(String(64), nullable=True)
     english_level = Column(String(32), nullable=True)
     onboarding_step = Column(Integer, nullable=False, server_default=text("0"), default=0)
-    onboarding_completed = Column(Boolean, nullable=False, server_default=text("0"), default=False)
+    onboarding_completed = Column(Boolean, nullable=False, server_default=sa.false(), default=False)
 
     # Subscription: free | trial | vuvl_plus | vuvl_pro
     plan = Column(String(32), nullable=False, server_default=text("'free'"), default="free")
