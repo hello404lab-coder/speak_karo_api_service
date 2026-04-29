@@ -2,7 +2,7 @@
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, EmailStr, Field
 
 
 class OAuthLoginRequest(BaseModel):
@@ -60,3 +60,18 @@ class AccessTokenResponse(BaseModel):
 
     access_token: str = Field(..., description="New JWT access token")
     token_type: str = Field(default="bearer", description="Token type")
+
+
+class EmailRegisterRequest(BaseModel):
+    """Request body for email/password registration."""
+
+    email: EmailStr = Field(..., description="User email")
+    password: str = Field(..., min_length=6, max_length=128, description="Password (min 6 chars)")
+    name: str | None = Field(None, max_length=255, description="Display name (optional)")
+
+
+class EmailLoginRequest(BaseModel):
+    """Request body for email/password login."""
+
+    email: EmailStr = Field(..., description="User email")
+    password: str = Field(..., min_length=1, description="Password")

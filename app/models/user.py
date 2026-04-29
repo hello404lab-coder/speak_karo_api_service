@@ -16,8 +16,9 @@ class User(Base):
     id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     email = Column(String(255), unique=True, nullable=False, index=True)
     name = Column(String(255), nullable=True)
-    provider = Column(String(32), nullable=False)  # "google" | "apple"
+    provider = Column(String(32), nullable=False)  # "google" | "apple" | "email"
     provider_id = Column(String(255), nullable=False, index=True)
+    hashed_password = Column(String(255), nullable=True)  # only for provider="email"
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
 

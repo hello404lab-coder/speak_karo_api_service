@@ -105,7 +105,7 @@ class Settings(BaseSettings):
     debug: bool = False
     # CORS: allow_origins=* with allow_credentials=True is invalid in browsers; use explicit origins.
     cors_allowed_origins: str = Field(
-        default="",
+        default="https://luna.404lab.tech,https://vuvl.in,http://localhost:8080",
         description="CORS_ALLOW_ORIGINS: comma-separated browser origins. Required when APP_ENV=prod.",
     )
     cors_allow_credentials: bool = Field(
@@ -127,6 +127,10 @@ class Settings(BaseSettings):
     llm_context_token_budget: int = 16384
     # DB layer: max exchanges to load from conversation (actual context length controlled by token budget)
     llm_history_max_exchanges: int = 10
+    gemini_service_tier: Literal["standard", "flex", "priority"] = Field(
+        default="priority",
+        description="GEMINI_SERVICE_TIER: GenerateContent service_tier (priority = Google Priority inference; needs eligible billing tier)",
+    )
 
     # Translation Settings - Google Cloud Translation Advanced v3
     translation_provider: Literal["google_cloud", "disabled"] = Field(
