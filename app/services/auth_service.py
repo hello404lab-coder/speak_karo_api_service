@@ -1,5 +1,6 @@
 """OAuth ID token verification and user resolution."""
 import logging
+import uuid
 from typing import Any
 
 import requests
@@ -10,6 +11,7 @@ from jose import jwk
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
+from app.core.security import hash_password, verify_password
 from app.models.user import User
 
 logger = logging.getLogger(__name__)
@@ -152,4 +154,58 @@ def get_or_create_user(
     db.commit()
     db.refresh(user)
     logger.info("Created new user: id=%s provider=%s email=%s", user.id, provider, user.email)
+    return user
+
+
+def register_with_email(
+    db: Session,
+    email: str,
+    password: str,
+    name: str | None = None,
+) -> User:
+    """Create new user with email/password auth. Raises ValueError on conflict."""
+    email = email.strip().lower()
+    if not email:
+        raise ValueError("Email is required")
+
+    existing = db.query(User).filter(User.email == email).first()
+    if existing:
+        if existing.provider == "email":
+            raise ValueError("An account with this email already exists")
+        provider_label = existing.provider.capitalize()
+        raise ValueError(
+            f"This email is linked to a {provider_label} account. Please sign in with {provider_label}."
+        )
+
+    user = User(
+        email=email,
+        name=name,
+        provider="email",
+        provider_id=str(uuid.uuid4()),
+        hashed_password=hash_password(password),
+    )
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    logger.info("Created new email user: id=%s email=%s", user.id, user.email)
+    return user
+
+
+def authenticate_with_email(db: Session, email: str, password: str) -> User | None:
+    """Authenticate user by email and password. Returns User or None."""
+    email = email.strip().lower()
+    if not email:
+        return None
+
+    user = db.query(User).filter(
+        User.email == email,
+        User.provider == "email",
+    ).first()
+
+    if not user or not user.hashed_password:
+        return None
+
+    if not verify_password(password, user.hashed_password):
+        return None
+
     return user

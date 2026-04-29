@@ -1,4 +1,6 @@
 """LLM service for generating AI replies using Gemini."""
+from __future__ import annotations
+
 import hashlib
 import json
 import logging
@@ -47,6 +49,28 @@ def _get_gemini_client():
             _gemini_client = genai.Client(api_key=settings.gemini_api_key)
         logger.info("Gemini client initialized for LLM (timeout=%ss)", settings.llm_timeout_seconds)
     return _gemini_client
+
+
+def _generate_content_service_tier_kwargs() -> dict[str, Any]:
+    """
+    service_tier for GenerateContentConfig. Older google-genai lacks ServiceTier enum;
+    API still accepts string (e.g. 'priority'). Omit key if SDK config has no field.
+    """
+    cfg_fields = getattr(types.GenerateContentConfig, "model_fields", None) or getattr(
+        types.GenerateContentConfig, "__fields__", None
+    )
+    if cfg_fields is not None and "service_tier" not in cfg_fields:
+        return {}
+    tier_enum = getattr(types, "ServiceTier", None)
+    raw = settings.gemini_service_tier
+    if tier_enum is not None:
+        try:
+            value: Any = tier_enum(raw)
+        except (ValueError, TypeError):
+            value = raw
+    else:
+        value = raw
+    return {"service_tier": value}
 
 
 def _extract_exception_status_code(exc: Exception) -> Optional[int]:
@@ -122,6 +146,7 @@ def generate_conversation_title(excerpt: str) -> str:
             system_instruction=TITLE_SYSTEM_INSTRUCTION,
             max_output_tokens=50,
             temperature=0.3,
+            **_generate_content_service_tier_kwargs(),
         )
         response = client.models.generate_content(
             model=settings.llm_model,
@@ -348,6 +373,7 @@ def _repair_user_analysis(
         response_json_schema=LearnerAnalysisSchema.model_json_schema(),
         max_output_tokens=min(settings.llm_max_tokens, 160),
         temperature=0.1,
+        **_generate_content_service_tier_kwargs(),
     )
     response = client.models.generate_content(
         model=settings.llm_model,
@@ -474,6 +500,7 @@ def stream_gemini_tokens(
             "response_json_schema": LLMReplySchema.model_json_schema(),
             "max_output_tokens": settings.llm_max_tokens,
             "temperature": settings.llm_temperature,
+            **_generate_content_service_tier_kwargs(),
         }
         if safety_settings is not None:
             config_dict["safety_settings"] = safety_settings
@@ -578,6 +605,7 @@ def generate_reply_with_usage(
             "response_json_schema": LLMReplySchema.model_json_schema(),
             "max_output_tokens": settings.llm_max_tokens,
             "temperature": settings.llm_temperature,
+            **_generate_content_service_tier_kwargs(),
         }
         if safety_settings is not None:
             config_dict["safety_settings"] = safety_settings

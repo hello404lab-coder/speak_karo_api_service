@@ -10,6 +10,8 @@ from app.models.billing import BillingSubscription
 from app.models.user import User
 from app.schemas.auth import (
     AccessTokenResponse,
+    EmailLoginRequest,
+    EmailRegisterRequest,
     OAuthLoginRequest,
     RefreshTokenRequest,
     TokenResponse,
@@ -30,7 +32,13 @@ from app.core.security import (
     create_refresh_token,
     verify_token,
 )
-from app.services.auth_service import get_or_create_user, verify_google_token, verify_apple_token
+from app.services.auth_service import (
+    authenticate_with_email,
+    get_or_create_user,
+    register_with_email,
+    verify_apple_token,
+    verify_google_token,
+)
 from app.services.billing_service import get_subscription_for_status, serialize_subscription_summary
 from app.services.subscription_service import resolve_user_plan
 from app.utils.language import normalize_language_code
@@ -103,6 +111,59 @@ async def oauth_login(
     refresh_token = create_refresh_token(subject=user.id, principal_type=USER_PRINCIPAL_TYPE)
 
     logger.info("Login success: user_id=%s provider=%s", user.id, body.provider)
+    return TokenResponse(
+        access_token=access_token,
+        refresh_token=refresh_token,
+        token_type="bearer",
+        user=_build_user_response(user, db),
+    )
+
+
+@router.post("/register", response_model=TokenResponse)
+@limiter.limit("10/minute")
+async def email_register(
+    request: Request,
+    body: EmailRegisterRequest,
+    db: Session = Depends(get_db),
+) -> TokenResponse:
+    """Register a new account with email and password."""
+    try:
+        user = register_with_email(db, body.email, body.password, body.name)
+    except ValueError as e:
+        status_code = status.HTTP_409_CONFLICT if "already exists" in str(e) else status.HTTP_400_BAD_REQUEST
+        raise HTTPException(status_code=status_code, detail=str(e)) from e
+
+    access_token = create_access_token(subject=user.id, principal_type=USER_PRINCIPAL_TYPE)
+    refresh_token = create_refresh_token(subject=user.id, principal_type=USER_PRINCIPAL_TYPE)
+
+    logger.info("Email register success: user_id=%s email=%s", user.id, user.email)
+    return TokenResponse(
+        access_token=access_token,
+        refresh_token=refresh_token,
+        token_type="bearer",
+        user=_build_user_response(user, db),
+    )
+
+
+@router.post("/login", response_model=TokenResponse)
+@limiter.limit("10/minute")
+async def email_login(
+    request: Request,
+    body: EmailLoginRequest,
+    db: Session = Depends(get_db),
+) -> TokenResponse:
+    """Sign in with email and password."""
+    user = authenticate_with_email(db, body.email, body.password)
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid email or password",
+        )
+
+    access_token = create_access_token(subject=user.id, principal_type=USER_PRINCIPAL_TYPE)
+    refresh_token = create_refresh_token(subject=user.id, principal_type=USER_PRINCIPAL_TYPE)
+
+    logger.info("Email login success: user_id=%s", user.id)
     return TokenResponse(
         access_token=access_token,
         refresh_token=refresh_token,
